@@ -11,7 +11,7 @@
 #     is cudagraph-incompatible.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
-async_chunk: true
+async_chunk: false
 
 connectors:
   connector_of_shared_memory:
@@ -36,11 +36,15 @@ stages:
       max_tokens: 2048
       seed: 42
       repetition_penalty: 1.05
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /home/zhongyu/project/vllm-omni-team/benchmarks/workload_generation/output/vllm_profile
+      torch_profiler_use_gzip: true
 
   - stage_id: 1
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.6
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "4"
@@ -52,11 +56,15 @@ stages:
       max_tokens: 4096
       seed: 42
       repetition_penalty: 1.05
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /home/zhongyu/project/vllm-omni-team/benchmarks/workload_generation/output/vllm_profile
+      torch_profiler_use_gzip: true
 
   - stage_id: 2
     max_num_batched_tokens: 51200
     max_num_seqs: 64
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.1
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
@@ -71,6 +79,20 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /home/zhongyu/project/vllm-omni-team/benchmarks/workload_generation/output/vllm_profile
+      torch_profiler_use_gzip: true
+      torch_profiler_record_shapes: true
+      torch_profiler_with_stack: true
+      torch_profiler_with_memory: true
+      torch_profiler_with_flops: false
+      torch_profiler_dump_cuda_time_total: false
+      delay_iterations: 0
+      max_iterations: 0
+      wait_iterations: 1
+      warmup_iterations: 1
+      active_iterations: 3
 
 platforms:
   npu:

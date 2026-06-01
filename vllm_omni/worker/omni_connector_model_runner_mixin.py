@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.profiling.nvtx import nvtx_range
 from vllm_omni.worker.payload_span import (
     THINKER_DECODE_EMBEDDINGS_KEY,
     THINKER_DECODE_TOKEN_END_KEY,
@@ -994,13 +995,14 @@ class OmniConnectorModelRunnerMixin:
         """
         if self._kv_transfer_manager is None:
             return list(finished_reqs.keys()) if finished_reqs else []
-        result = self._kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=finished_reqs,
-            kv_caches=kv_caches,
-            block_size=block_size,
-            cache_dtype=cache_dtype,
-            request_id_resolver=request_id_resolver,
-        )
+        with nvtx_range("omni:send_kv_cache"):
+            result = self._kv_transfer_manager.handle_finished_requests_kv_transfer(
+                finished_reqs=finished_reqs,
+                kv_caches=kv_caches,
+                block_size=block_size,
+                cache_dtype=cache_dtype,
+                request_id_resolver=request_id_resolver,
+            )
         if result:
             self._kv_sent_req_ids.extend(result)
         return result
@@ -1016,10 +1018,11 @@ class OmniConnectorModelRunnerMixin:
         """
         if self._kv_transfer_manager is None:
             return None, 0
-        return self._kv_transfer_manager.receive_kv_cache_for_request(
-            request_id=request_id,
-            target_device=target_device,
-        )
+        with nvtx_range("omni:recv_kv_cache"):
+            return self._kv_transfer_manager.receive_kv_cache_for_request(
+                request_id=request_id,
+                target_device=target_device,
+            )
 
     def receive_cfg_companion_kv_payloads(
         self,

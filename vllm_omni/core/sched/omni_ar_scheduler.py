@@ -25,6 +25,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 
 logger = init_logger(__name__)
 
