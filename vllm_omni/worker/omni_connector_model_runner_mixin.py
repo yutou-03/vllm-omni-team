@@ -27,7 +27,7 @@ from vllm.logger import init_logger
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.outputs import OmniConnectorOutput
-from vllm_omni.profiling.nvtx import nvtx_range
+from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.worker.payload_span import (
     THINKER_DECODE_EMBEDDINGS_KEY,
     THINKER_DECODE_TOKEN_END_KEY,
@@ -936,11 +936,13 @@ class OmniConnectorModelRunnerMixin:
             self._request_ids_mapping.setdefault(raw_req_id, request_id)
         chunk_id = self._put_req_chunk[request_id]
 
-        payload_data = self._build_custom_process_payload(
-            request_id=request_id,
-            request=request,
-            pooling_output=pooling_output,
-        )
+        short_req_id = str(request_id)[-8:]
+        with nvtx_range(f"s{self._stage_id}_build_payload:req={short_req_id}:chunk={chunk_id}", color="brown"):
+            payload_data = self._build_custom_process_payload(
+                request_id=request_id,
+                request=request,
+                pooling_output=pooling_output,
+            )
         if payload_data is None:
             if chunk_id == 0:
                 logger.warning(
@@ -955,6 +957,7 @@ class OmniConnectorModelRunnerMixin:
         self._put_req_chunk[request_id] += 1
         next_stage_id = self._next_stage_id
         connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
+        nvtx_mark(f"s{self._stage_id}_send_enqueue:req={short_req_id}:chunk={chunk_id}")
 
         if chunk_id == 0:
             logger.info(
@@ -995,7 +998,7 @@ class OmniConnectorModelRunnerMixin:
         """
         if self._kv_transfer_manager is None:
             return list(finished_reqs.keys()) if finished_reqs else []
-        with nvtx_range("omni:send_kv_cache"):
+        with nvtx_range("omni:send_kv_cache", color="gray"):
             result = self._kv_transfer_manager.handle_finished_requests_kv_transfer(
                 finished_reqs=finished_reqs,
                 kv_caches=kv_caches,
@@ -1018,7 +1021,7 @@ class OmniConnectorModelRunnerMixin:
         """
         if self._kv_transfer_manager is None:
             return None, 0
-        with nvtx_range("omni:recv_kv_cache"):
+        with nvtx_range("omni:recv_kv_cache", color="gray"):
             return self._kv_transfer_manager.receive_kv_cache_for_request(
                 request_id=request_id,
                 target_device=target_device,
@@ -1490,7 +1493,7 @@ class OmniConnectorModelRunnerMixin:
                 if self._stop_event.is_set():
                     break
                 try:
-                    with nvtx_range("omni:recv_loop"):
+                    with nvtx_range("omni:recv_loop", color="teal"):
                         made_progress = self._poll_single_request(req_id) or made_progress
                 except Exception:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
@@ -1518,7 +1521,7 @@ class OmniConnectorModelRunnerMixin:
             if task is not None:
                 success = False
                 try:
-                    with nvtx_range("omni:save_loop"):
+                    with nvtx_range("omni:save_loop", color="brown"):
                         success = self._send_single_request(task)
                 except Exception:
                     logger.error(
@@ -1527,7 +1530,7 @@ class OmniConnectorModelRunnerMixin:
                         exc_info=True,
                     )
                 if not success:
-                    with nvtx_range("omni:save_requeue"):
+                    with nvtx_range("omni:save_requeue", color="red"):
                         self._requeue_or_drop_failed_send(task)
                 continue
 
@@ -1587,20 +1590,22 @@ class OmniConnectorModelRunnerMixin:
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
-        if self._async_chunk:
-            result = self._recv_async_chunk_result(
-                connector,
-                str(target_stage_id),
-                str(self._stage_id),
-                connector_get_key,
-            )
-        else:
-            result = self._recv_full_payload_result(
-                connector,
-                str(target_stage_id),
-                str(self._stage_id),
-                connector_get_key,
-            )
+        short_req_id = str(external_req_id)[-8:]
+        with nvtx_range(f"s{self._stage_id}_connector_get:req={short_req_id}:chunk={chunk_id}", color="teal"):
+            if self._async_chunk:
+                result = self._recv_async_chunk_result(
+                    connector,
+                    str(target_stage_id),
+                    str(self._stage_id),
+                    connector_get_key,
+                )
+            else:
+                result = self._recv_full_payload_result(
+                    connector,
+                    str(target_stage_id),
+                    str(self._stage_id),
+                    connector_get_key,
+                )
 
         if result is None:
             return False
@@ -1654,6 +1659,10 @@ class OmniConnectorModelRunnerMixin:
                 # flush/finish even when the last recv carries no new
                 # consumable chunk bytes.
                 if payload_consumable or is_finished:
+                    nvtx_mark(
+                        f"s{self._stage_id}_chunk_ready:req={str(req_id)[-8:]}:"
+                        f"chunk={chunk_id}:finished={int(bool(is_finished))}"
+                    )
                     self._finished_load_reqs.add(req_id)
                 if is_finished and not payload_consumable:
                     logger.debug(
@@ -1791,12 +1800,15 @@ class OmniConnectorModelRunnerMixin:
             )
         put_key = task.get("put_key")
 
-        success, _size, _metadata = connector.put(
-            from_stage=str(task["stage_id"]),
-            to_stage=str(task["next_stage_id"]),
-            put_key=put_key,
-            data=payload_data,
-        )
+        short_req_id = str(request_id)[-8:]
+        stage_id = task["stage_id"]
+        with nvtx_range(f"s{stage_id}_connector_put:req={short_req_id}:key={put_key}", color="brown"):
+            success, _size, _metadata = connector.put(
+                from_stage=str(task["stage_id"]),
+                to_stage=str(task["next_stage_id"]),
+                put_key=put_key,
+                data=payload_data,
+            )
         logger.info(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],

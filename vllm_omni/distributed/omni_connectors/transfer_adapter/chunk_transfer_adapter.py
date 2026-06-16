@@ -9,6 +9,7 @@ import torch
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
@@ -121,6 +122,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "request": request,
             "is_finished": request.is_finished(),
         }
+        if request is not None:
+            req_id = getattr(request, "external_req_id", getattr(request, "request_id", ""))
+            chunk_id = self.put_req_chunk[req_id]
+            nvtx_mark(f"s{self.connector.stage_id}_save_async:req={str(req_id)[-8:]}:chunk={chunk_id}")
         self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
@@ -135,11 +140,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # Use timeout=0 for non-blocking poll
         try:
-            result = self.connector.get(
-                str(target_stage_id),
-                str(stage_id),
-                connector_get_key,
-            )
+            with nvtx_range(f"s{stage_id}_connector_get:req={str(external_req_id)[-8:]}:chunk={chunk_id}"):
+                result = self.connector.get(
+                    str(target_stage_id),
+                    str(stage_id),
+                    connector_get_key,
+                )
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
             return False
@@ -187,6 +193,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     return True
 
             # Mark as finished for consumption
+            nvtx_mark(
+                f"s{stage_id}_chunk_ready:req={str(req_id)[-8:]}:"
+                f"chunk={chunk_id}:finished={int(bool(meta.get('finished')))}"
+            )
             self._finished_load_reqs.add(req_id)
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
@@ -235,12 +245,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data = None
         if self.custom_process_next_stage_input_func:
             try:
-                payload_data = self.custom_process_next_stage_input_func(
-                    transfer_manager=self,
-                    pooling_output=pooling_output,
-                    request=request,
-                    is_finished=is_finished,
-                )
+                with nvtx_range(f"s{stage_id}_build_payload:req={str(external_req_id)[-8:]}:chunk={chunk_id}"):
+                    payload_data = self.custom_process_next_stage_input_func(
+                        transfer_manager=self,
+                        pooling_output=pooling_output,
+                        request=request,
+                        is_finished=is_finished,
+                    )
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
@@ -248,12 +259,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not payload_data:
             return
 
-        success, size, metadata = self.connector.put(
-            from_stage=str(stage_id),
-            to_stage=str(next_stage_id),
-            put_key=connector_put_key,
-            data=payload_data,
-        )
+        nvtx_mark(f"s{stage_id}_send_enqueue:req={str(external_req_id)[-8:]}:chunk={chunk_id}")
+        with nvtx_range(f"s{stage_id}_connector_put:req={str(external_req_id)[-8:]}:key={connector_put_key}"):
+            success, size, metadata = self.connector.put(
+                from_stage=str(stage_id),
+                to_stage=str(next_stage_id),
+                put_key=connector_put_key,
+                data=payload_data,
+            )
 
         if success:
             self.put_req_chunk[external_req_id] += 1

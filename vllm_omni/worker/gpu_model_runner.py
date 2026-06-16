@@ -1322,9 +1322,15 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # call the custom process function
                 req_infos["request_id"] = req_id
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
-                )
+                phase = "decode" if span_len == 1 else "prefill"
+                stage_id = getattr(self.model_config, "stage_id", "?")
+                with nvtx_range(
+                    f"s{stage_id}_talker_preprocess_{phase}:"
+                    f"req={str(req_id)[-8:]}:tokens={span_len}"
+                ):
+                    req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                        input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),

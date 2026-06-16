@@ -38,6 +38,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -102,7 +103,16 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        stage_id = getattr(self.model_config, "stage_id", "?")
         with (
+            stage_trace_span(
+                "stage_preprocess",
+                stage_id=stage_id,
+                nvtx_name=f"s{stage_id}_preprocess",
+                nvtx_color="cyan",
+                batch_num_tokens=int(num_scheduled_tokens),
+                batch_num_seqs=len(getattr(scheduler_output, "num_scheduled_tokens", {}) or {}),
+            ),
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
@@ -272,6 +282,19 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        first_forward_seen = getattr(self, "_omni_stage_queue_first_forward_seen", set())
+        for req_id in req_ids[:num_reqs]:
+            if req_id in first_forward_seen:
+                continue
+            first_forward_seen.add(req_id)
+            emit_stage_event(
+                "stage_first_forward",
+                stage_id=stage_id,
+                request_id=req_id,
+                batch_num_tokens=int(num_tokens_unpadded),
+                batch_num_seqs=int(num_reqs),
+            )
+        self._omni_stage_queue_first_forward_seen = first_forward_seen
         with (
             set_forward_context(
                 attn_metadata,
@@ -282,6 +305,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
+            ),
+            stage_trace_span(
+                "stage_forward",
+                stage_id=stage_id,
+                nvtx_name=f"s{stage_id}_forward",
+                nvtx_color="blue",
+                batch_num_tokens=int(num_tokens_unpadded),
+                batch_num_seqs=int(num_reqs),
+                num_tokens_padded=int(num_tokens_padded),
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
@@ -359,6 +391,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             slot_mappings,  # OMNI: unpack slot_mappings for upstream v1 API compatibility
         ) = self.execute_model_state
         self.execute_model_state = None
+        stage_id = getattr(self.model_config, "stage_id", "?")
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward.
@@ -366,40 +399,48 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             self.finalize_kv_connector()
 
         pooler_output: list[object] = []
-        if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
-            )
-            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
-            for i in range(self.input_batch.num_reqs):
-                pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
-        elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
-            )
-            for out in multimodal_outputs:
-                pooler_output.append(
-                    {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
+        with stage_trace_span(
+            "stage_sample",
+            stage_id=stage_id,
+            nvtx_name=f"s{stage_id}_sample",
+            nvtx_color="yellow",
+            batch_num_tokens=int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0),
+            batch_num_seqs=len(getattr(scheduler_output, "num_scheduled_tokens", {}) or {}),
+        ):
+            if isinstance(multimodal_outputs, torch.Tensor):
+                assert multimodal_outputs.shape[0] == 1, (
+                    "model should return a single tensor, to return multiple tensors, use a dict"
                 )
-        elif isinstance(multimodal_outputs, dict):
-            num_reqs = self.input_batch.num_reqs
-            for i in range(num_reqs):
-                mm_payload = {}
-                for key, out in multimodal_outputs.items():
-                    if isinstance(out, list):
-                        if len(out) != num_reqs:
-                            raise ValueError(
-                                f"Multimodal output list for key '{key}' has length {len(out)} "
-                                f"but expected {num_reqs} (one entry per request)."
-                            )
-                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
-                    elif isinstance(out, torch.Tensor):
-                        mm_payload[key] = out.detach().to("cpu").contiguous()
-                    else:
-                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                pooler_output.append(mm_payload)
-        else:
-            raise RuntimeError("Unsupported diffusion output type")
+                assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
+                for i in range(self.input_batch.num_reqs):
+                    pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
+            elif isinstance(multimodal_outputs, list):
+                assert len(multimodal_outputs) == 1, (
+                    "model should return a single list, to return multiple lists, use a dict"
+                )
+                for out in multimodal_outputs:
+                    pooler_output.append(
+                        {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
+                    )
+            elif isinstance(multimodal_outputs, dict):
+                num_reqs = self.input_batch.num_reqs
+                for i in range(num_reqs):
+                    mm_payload = {}
+                    for key, out in multimodal_outputs.items():
+                        if isinstance(out, list):
+                            if len(out) != num_reqs:
+                                raise ValueError(
+                                    f"Multimodal output list for key '{key}' has length {len(out)} "
+                                    f"but expected {num_reqs} (one entry per request)."
+                                )
+                            mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                        elif isinstance(out, torch.Tensor):
+                            mm_payload[key] = out.detach().to("cpu").contiguous()
+                        else:
+                            logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
+                    pooler_output.append(mm_payload)
+            else:
+                raise RuntimeError("Unsupported diffusion output type")
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()

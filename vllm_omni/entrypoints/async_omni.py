@@ -35,6 +35,11 @@ from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.profiling.nvtx import (
+    nvtx_end_keyed_range,
+    nvtx_mark,
+    nvtx_start_keyed_range,
+)
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
@@ -345,6 +350,10 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                 )
             submit_ts = time.time()
+            nvtx_end_keyed_range(
+                f"audio_stream_to_s0_submit:{request_id}",
+                color="cyan",
+            )
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
 
@@ -519,6 +528,17 @@ class AsyncOmni(EngineClient, OmniBase):
             result = await req_state.queue.get()
 
             stage_id = result.get("stage_id", 0)
+            if stage_id == 2 and not getattr(req_state, "_omni_nvtx_s2_generator_queue_seen", False):
+                nvtx_end_keyed_range(
+                    f"s2_frontend_dispatch_to_generator:{request_id}",
+                    f"TTFP:s2_frontend_dispatch_to_generator:req={request_id[-8:]}",
+                    color="blue",
+                )
+                nvtx_mark(
+                    f"TTFP:s2_generator_queue_get:req={request_id[-8:]}",
+                    color="blue",
+                )
+                req_state._omni_nvtx_s2_generator_queue_seen = True
 
             if result.get("type") == "error" and result.get("fatal"):
                 raise OmniEngineDeadError(
@@ -549,6 +569,21 @@ class AsyncOmni(EngineClient, OmniBase):
             )
 
             if output_to_yield:
+                if (
+                    stage_id == 2
+                    and getattr(output_to_yield, "final_output_type", None) == "audio"
+                    and not getattr(req_state, "_omni_nvtx_s2_generator_to_serving_started", False)
+                ):
+                    nvtx_mark(
+                        f"TTFP:s2_async_yield_audio:req={request_id[-8:]}",
+                        color="purple",
+                    )
+                    nvtx_start_keyed_range(
+                        f"s2_generator_to_serving_audio:{request_id}",
+                        f"TTFP:s2_generator_to_serving_audio:req={request_id[-8:]}",
+                        color="purple",
+                    )
+                    req_state._omni_nvtx_s2_generator_to_serving_started = True
                 logger.debug(
                     "[AsyncOmni] req=%s stage-%s yielding final_output_type=%s",
                     request_id,
@@ -599,11 +634,28 @@ class AsyncOmni(EngineClient, OmniBase):
                         await self.event_resolver.resolve(msg)
                         continue
 
-                    should_continue, _, stage_id, req_state = self._handle_output_message(msg)
+                    should_continue, req_id, stage_id, req_state = self._handle_output_message(msg)
                     if should_continue:
                         continue
 
                     req_state.stage_id = stage_id
+                    req_id = str(req_id)
+                    if stage_id == 2 and not getattr(req_state, "_omni_nvtx_s2_frontend_dispatch_seen", False):
+                        nvtx_end_keyed_range(
+                            f"s2_route_to_frontend_dispatch:{req_id}",
+                            f"TTFP:s2_route_to_frontend_dispatch:req={req_id[-8:]}",
+                            color="blue",
+                        )
+                        nvtx_mark(
+                            f"TTFP:s2_frontend_dispatch:req={req_id[-8:]}",
+                            color="blue",
+                        )
+                        nvtx_start_keyed_range(
+                            f"s2_frontend_dispatch_to_generator:{req_id}",
+                            f"TTFP:s2_frontend_dispatch_to_generator:req={req_id[-8:]}",
+                            color="blue",
+                        )
+                        req_state._omni_nvtx_s2_frontend_dispatch_seen = True
 
                     # Route to the per-request queue
                     await req_state.queue.put(msg)

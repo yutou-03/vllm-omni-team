@@ -16,6 +16,13 @@ from pydantic import TypeAdapter
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.metrics.modality import observe_audio_first_packet
+from vllm_omni.profiling.nvtx import (
+    nvtx_end_keyed_range,
+    nvtx_mark,
+    nvtx_range,
+    nvtx_start_keyed_range,
+)
+from vllm_omni.profiling.stage_queue_trace import emit_stage_event
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -852,6 +859,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             harmony_parsers = [get_streamable_parser_for_assistant() for _ in range(num_choices)]
             harmony_tools_streamed = [False] * num_choices
         tools_streamed = [False] * num_choices
+        audio_ttfp_total_key = f"audio_ttfp_total:{request_id}"
+        audio_stream_to_s0_submit_key = f"audio_stream_to_s0_submit:{request_id}"
+        audio_ttfp_total_open = False
+        if "audio" in first_iteration_dict:
+            nvtx_start_keyed_range(
+                audio_ttfp_total_key,
+                f"TTFP:audio_ttfp_total:req={request_id[-8:]}",
+                color="red",
+            )
+            nvtx_start_keyed_range(
+                audio_stream_to_s0_submit_key,
+                f"TTFP:audio_stream_to_s0_submit:req={request_id[-8:]}",
+                color="cyan",
+            )
+            audio_ttfp_total_open = True
 
         if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
             tool_choice_function_name = request.tool_choice.function.name
@@ -1473,6 +1495,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if req_state is not None and req_state.first_audio_ts is None:
                         now_ts = time.time()
                         req_state.first_audio_ts = now_ts
+                        nvtx_end_keyed_range(
+                            f"s2_generator_to_serving_audio:{request_id}",
+                            f"TTFP:s2_generator_to_serving_audio:req={request_id[-8:]}",
+                            color="purple",
+                        )
+                        nvtx_mark(
+                            f"TTFP:s2_serving_audio_received:req={request_id[-8:]}:stage={omni_res.stage_id}",
+                            color="purple",
+                        )
                         stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
                         replica_id = (
                             stage_pools[omni_res.stage_id].get_bound_replica_id(request_id)
@@ -1486,24 +1517,65 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             arrival_ts=req_state.request_arrival_ts,
                             now_ts=now_ts,
                         )
+                        emit_stage_event(
+                            "audio_first_packet",
+                            stage_id=omni_res.stage_id,
+                            request_id=request_id,
+                            replica_id=replica_id,
+                            arrival_ts=req_state.request_arrival_ts,
+                            audio_ttfp_ms=(now_ts - req_state.request_arrival_ts) * 1000.0,
+                        )
+                        nvtx_mark(
+                            f"TTFP:audio_first_packet:req={request_id[-8:]}:stage={omni_res.stage_id}",
+                            color="red",
+                        )
+                        nvtx_end_keyed_range(
+                            audio_stream_to_s0_submit_key,
+                            color="cyan",
+                        )
+                        nvtx_end_keyed_range(
+                            f"s2_first_output_to_audio_first_packet:{request_id}",
+                            f"TTFP:s2_first_output_to_audio_first_packet:req={request_id[-8:]}",
+                            color="purple",
+                        )
+                        if audio_ttfp_total_open:
+                            nvtx_end_keyed_range(
+                                audio_ttfp_total_key,
+                                f"TTFP:audio_ttfp_total:req={request_id[-8:]}",
+                                color="red",
+                            )
+                            audio_ttfp_total_open = False
 
-                    role = self.get_chat_request_role(request)
-                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
-                    chunk = OmniChatCompletionStreamResponse(
-                        id=request_id,
-                        object=chunk_object_type,
-                        created=created_time,
-                        choices=choices_data,
-                        model=model_name,
-                        modality=final_output_type,
+                    with nvtx_range(
+                        f"serving_audio_packet_build:req={request_id[-8:]}:stage={omni_res.stage_id}",
+                        color="green",
+                    ):
+                        role = self.get_chat_request_role(request)
+                        choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                        chunk = OmniChatCompletionStreamResponse(
+                            id=request_id,
+                            object=chunk_object_type,
+                            created=created_time,
+                            choices=choices_data,
+                            model=model_name,
+                            modality=final_output_type,
+                        )
+                        chunk.usage = UsageInfo(
+                            prompt_tokens=num_prompt_tokens,
+                            completion_tokens=0,
+                            total_tokens=num_prompt_tokens,
+                        )
+                        data = chunk.model_dump_json(exclude_unset=True)
+                    nvtx_mark(
+                        f"serving_audio_packet_yield_before:req={request_id[-8:]}",
+                        color="green",
                     )
-                    chunk.usage = UsageInfo(
-                        prompt_tokens=num_prompt_tokens,
-                        completion_tokens=0,
-                        total_tokens=num_prompt_tokens,
+                    with nvtx_range(f"serving_audio_packet_yield:req={request_id[-8:]}", color="green"):
+                        yield f"data: {data}\n\n"
+                    nvtx_mark(
+                        f"serving_audio_packet_yield_after:req={request_id[-8:]}",
+                        color="green",
                     )
-                    data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
 
                 else:
                     logger.warning(f"Unsupported streaming final output type: {final_output_type}")
@@ -1578,6 +1650,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        if audio_ttfp_total_open:
+            nvtx_end_keyed_range(
+                audio_stream_to_s0_submit_key,
+                color="cyan",
+            )
+            nvtx_end_keyed_range(
+                audio_ttfp_total_key,
+                f"TTFP:audio_ttfp_total_abort:req={request_id[-8:]}",
+                color="red",
+            )
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 

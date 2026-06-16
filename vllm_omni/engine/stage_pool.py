@@ -14,6 +14,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
+from vllm_omni.profiling.stage_queue_trace import stage_trace_span
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
@@ -278,11 +279,19 @@ class StagePool:
         """Run the shared LLM output processor on one raw poll result."""
         client = self.clients[replica_id]
         processor = self.output_processor
-        processed = processor.process_outputs(
-            raw_outputs.outputs,
-            raw_outputs.timestamp,
-            iteration_stats,
-        )
+        with stage_trace_span(
+            "stage_output_process",
+            stage_id=self.stage_id,
+            nvtx_name=f"s{self.stage_id}_output_process",
+            nvtx_color="green",
+            replica_id=replica_id,
+            num_outputs=len(raw_outputs.outputs),
+        ):
+            processed = processor.process_outputs(
+                raw_outputs.outputs,
+                raw_outputs.timestamp,
+                iteration_stats,
+            )
 
         if processed.reqs_to_abort:
             await client.abort_requests_async(processed.reqs_to_abort)

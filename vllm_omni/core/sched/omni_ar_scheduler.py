@@ -25,7 +25,8 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
+from vllm_omni.profiling.nvtx import nvtx_end_keyed_range, nvtx_mark, nvtx_range, nvtx_start_keyed_range
+from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 
 logger = init_logger(__name__)
 
@@ -192,6 +193,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
         nvtx_mark("omni_ar:schedule_start")
+        iteration_id = self._omni_next_iteration_id()
+        stage_id = self._omni_stage_id_for_trace()
+        schedule_start = time()
+        num_running_before = len(self.running)
+        num_waiting_before = len(self.waiting)
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
             # Reset queue-time tracking for pre-warmed requests that just
@@ -211,8 +217,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request._omni_first_real_chunk_handled = True
 
         try:
-            with nvtx_range("omni:base_schedule"):
+            with (
+                stage_trace_span(
+                    "stage_schedule_base",
+                    stage_id=stage_id,
+                    nvtx_name=f"s{stage_id}_schedule_base",
+                    nvtx_color="gray",
+                    queue_len=num_waiting_before,
+                    active_reqs=num_running_before,
+                ),
+                nvtx_range("omni:base_schedule"),
+            ):
                 scheduler_output = super().schedule()
+            for rid, ntok in scheduler_output.num_scheduled_tokens.items():
+                nvtx_mark(f"scheduler_scheduled:req={str(rid)[-8:]}:ntok={ntok}")
+            self._trace_scheduler_output(
+                scheduler_output,
+                iteration_id=iteration_id,
+                timestamp_start=schedule_start,
+                timestamp_end=time(),
+                num_running_before=num_running_before,
+                num_waiting_before=num_waiting_before,
+            )
         finally:
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
@@ -268,7 +294,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        with nvtx_range("omni_ar:update_from_output"):
+        stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
+        with (
+            stage_trace_span(
+                "stage_update_from_output",
+                stage_id=stage_id,
+                nvtx_name=f"s{stage_id}_update_from_output",
+                nvtx_color="teal",
+                batch_num_tokens=int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0),
+                batch_num_seqs=len(getattr(scheduler_output, "num_scheduled_tokens", {}) or {}),
+            ),
+            nvtx_range("omni_ar:update_from_output"),
+        ):
             sampled_token_ids = model_runner_output.sampled_token_ids
             logprobs = model_runner_output.logprobs
             prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -438,6 +475,48 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Get prompt logprobs for this request.
                 prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
                 if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+                    output_token_ids = getattr(request, "output_token_ids", None)
+                    if output_token_ids is None:
+                        output_token_ids = getattr(request, "_output_token_ids", [])
+                    output_len = len(output_token_ids)
+                    if new_token_ids:
+                        for token_id in new_token_ids:
+                            emit_stage_event(
+                                "stage_token_output",
+                                stage_id=self.vllm_config.model_config.stage_id,
+                                request_id=req_id,
+                                token_id=token_id,
+                                num_new_tokens=len(new_token_ids),
+                                output_len=output_len,
+                            )
+                        if not getattr(request, "_omni_stage_queue_first_output_emitted", False):
+                            stage_id = self.vllm_config.model_config.stage_id
+                            if str(stage_id) == "2":
+                                nvtx_end_keyed_range(
+                                    f"s2_first_schedule_to_first_output:{req_id}",
+                                    f"TTFP:s2_first_schedule_to_first_output:req={str(req_id)[-8:]}",
+                                    color="orange",
+                                )
+                                nvtx_start_keyed_range(
+                                    f"s2_first_output_to_audio_first_packet:{req_id}",
+                                    f"TTFP:s2_first_output_to_audio_first_packet:req={str(req_id)[-8:]}",
+                                    color="purple",
+                                )
+                            emit_stage_event(
+                                "stage_first_output",
+                                stage_id=stage_id,
+                                request_id=req_id,
+                                output_len=output_len,
+                            )
+                            request._omni_stage_queue_first_output_emitted = True
+                    if stopped:
+                        emit_stage_event(
+                            "stage_done",
+                            stage_id=self.vllm_config.model_config.stage_id,
+                            request_id=req_id,
+                            output_len=output_len,
+                            finish_reason=finish_reason,
+                        )
                     # Add EngineCoreOutput for this Request.
                     outputs[request.client_index].append(
                         EngineCoreOutput(

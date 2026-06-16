@@ -20,6 +20,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_speaker_from_prompt,
     extract_speaker_from_request,
 )
+from vllm_omni.profiling.nvtx import nvtx_mark
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +289,10 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
+    nvtx_mark(
+        f"s0_payload_start:req={str(request_id)[-8:]}:"
+        f"chunk={chunk_id}:finished={int(bool(is_finished))}"
+    )
     if not isinstance(pooling_output, dict):
         logger.debug("thinker2talker_async_chunk: skip non-dict pooling_output for req=%s", request_id)
         return None
@@ -339,6 +344,7 @@ def thinker2talker_async_chunk(
             talker_additional_info["language"] = language
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
+                nvtx_mark(f"s0_payload_buffer:req={str(request_id)[-8:]}:chunk={chunk_id}")
                 transfer_manager.request_payload[request_id] = talker_additional_info
                 return None
         else:
@@ -357,6 +363,7 @@ def thinker2talker_async_chunk(
                 ),
                 dim=0,
             )
+        nvtx_mark(f"s0_payload_ready:req={str(request_id)[-8:]}:chunk={chunk_id}:kind=prefill")
     else:
         output_token_ids = request.output_token_ids
         # Convert ConstantList to regular list for OmniSerializer serialization
@@ -380,6 +387,7 @@ def thinker2talker_async_chunk(
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
             talker_additional_info["embed"] = {"prefill": thinker_emb.detach().cpu()}
             talker_additional_info["hidden_states"] = {"output": thinker_hid.detach().cpu()}
+        nvtx_mark(f"s0_payload_ready:req={str(request_id)[-8:]}:chunk={chunk_id}:kind=decode")
     return talker_additional_info
 
 

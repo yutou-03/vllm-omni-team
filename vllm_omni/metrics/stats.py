@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
+from vllm_omni.profiling.stage_queue_trace import emit_connector_event, emit_stage_event
 
 if TYPE_CHECKING:
     from vllm_omni.metrics.transfer import OmniTransferMetrics
@@ -203,6 +204,15 @@ class OrchestratorAggregator:
             evt.size_bytes += int(size_bytes)
             evt.tx_time_ms += float(tx_time_ms)
             evt.used_shm = evt.used_shm or bool(used_shm)
+            emit_connector_event(
+                "transfer_tx",
+                from_stage=int(from_stage),
+                to_stage=int(to_stage),
+                request_id=request_id,
+                size_bytes=int(size_bytes),
+                tx_time_ms=float(tx_time_ms),
+                used_shm=bool(used_shm),
+            )
             # Phase 4 G3: emit per-physical-transfer Histogram observations.
             self._emit_transfer_tx(
                 from_stage=int(from_stage),
@@ -232,6 +242,15 @@ class OrchestratorAggregator:
                 evt.size_bytes = int(stats.rx_transfer_bytes)
             evt.rx_decode_time_ms += float(stats.rx_decode_time_ms)
             evt.in_flight_time_ms += float(stats.rx_in_flight_time_ms)
+            emit_connector_event(
+                "transfer_rx",
+                from_stage=from_stage,
+                to_stage=to_stage,
+                request_id=rid_key,
+                size_bytes=int(stats.rx_transfer_bytes),
+                rx_decode_time_ms=float(stats.rx_decode_time_ms),
+                in_flight_time_ms=float(stats.rx_in_flight_time_ms),
+            )
             # Phase 4 G3: emit per-physical-receive Histogram observations.
             self._emit_transfer_rx(
                 from_stage=from_stage,
@@ -432,6 +451,22 @@ class OrchestratorAggregator:
         final_output_type: str | None = None,
     ) -> None:
         stats = self._as_stage_request_stats(stage_id, req_id, metrics, final_output_type)
+        emit_stage_event(
+            "stage_done_metrics",
+            stage_id=stage_id,
+            request_id=req_id,
+            num_tokens_in=int(stats.num_tokens_in),
+            num_tokens_out=int(stats.num_tokens_out),
+            batch_id=int(stats.batch_id),
+            batch_size=int(stats.batch_size),
+            stage_gen_time_ms=float(stats.stage_gen_time_ms),
+            rx_transfer_bytes=int(stats.rx_transfer_bytes),
+            rx_decode_time_ms=float(stats.rx_decode_time_ms),
+            rx_in_flight_time_ms=float(stats.rx_in_flight_time_ms),
+            final_output_type=stats.final_output_type,
+            postprocess_time_ms=float(stats.postprocess_time_ms),
+            audio_generated_frames=int(stats.audio_generated_frames),
+        )
         self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_out)
         if stats.stage_id == 0:
             self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_in)
@@ -498,6 +533,14 @@ class OrchestratorAggregator:
         # Mark first input time for the destination stage if not set
         if self.stage_first_ts[to_stage] is None:
             self.stage_first_ts[to_stage] = time.time()
+        emit_connector_event(
+            "transfer_start",
+            from_stage=from_stage,
+            to_stage=to_stage,
+            request_id=req_id,
+            size_bytes=int(size_bytes),
+            used_shm=bool(used_shm),
+        )
         self.record_transfer_tx(
             from_stage=from_stage,
             to_stage=to_stage,

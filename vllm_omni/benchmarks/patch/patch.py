@@ -5,6 +5,7 @@ import json
 import os
 import random
 import ssl
+import subprocess
 import sys
 import time
 import traceback
@@ -812,8 +813,24 @@ async def benchmark(
 
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
 
-    async def limited_request_func(request_func_input, session, pbar):
+    async def limited_request_func(request_func_input, session, pbar, start_nsys: bool):
         async with semaphore:
+            if start_nsys:
+                subprocess.run(
+                    [
+                        "/usr/local/cuda/bin/nsys",
+                        "start",
+                        "--gpu-metrics-devices",
+                        "all",
+                        "--output",
+                        "/home/zhongyu/project/motivation/stage_queue/bench_scripts/nsys_split_ttfp/outputs",
+                        "--force-overwrite",
+                        "true",
+                        "--session",
+                        "zhongyu",
+                    ],
+                    check=False,
+                )
             return await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
 
     benchmark_start_time = time.perf_counter()
@@ -864,10 +881,18 @@ async def benchmark(
             request_id=request_id,
             )
             tasks.append(
-                asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input,
+                        session=session,
+                        pbar=pbar,
+                        start_nsys=False,
+                    )
+                )
             )
             # logger.info(f"Send Request at {current_request_rate}")
     else: 
+        cnt=0
         async for request, current_request_rate in get_request(
             input_requests,
             request_rate,
@@ -876,6 +901,7 @@ async def benchmark(
             ramp_up_start_rps,
             ramp_up_end_rps,
         ):
+            cnt+=1
             if ramp_up_strategy is not None:
                 current_int_rps = int(current_request_rate)
                 if current_int_rps > last_int_rps:
@@ -912,7 +938,14 @@ async def benchmark(
             _attach_daily_omni_to_request_func_input(request, request_func_input)
             _attach_seed_tts_to_request_func_input(request, request_func_input)
             tasks.append(
-                asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input,
+                        session=session,
+                        pbar=pbar,
+                        start_nsys=cnt == 3,
+                    )
+                )
             )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
 

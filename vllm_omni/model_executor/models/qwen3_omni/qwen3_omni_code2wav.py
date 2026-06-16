@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import (  # type: ignore
 )
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+from vllm_omni.profiling.nvtx import nvtx_range
 
 logger = init_logger(__name__)
 
@@ -188,30 +189,40 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layers of codes, got {codes.shape[1]}")
 
+        shape_suffix = f"b={codes.shape[0]}:q={codes.shape[1]}:t={codes.shape[-1]}"
+
         # Stage 1: Code Embedding
         # Add offset to separate layer vocabularies, then embed and average
-        hidden = self.code_embedding(codes + self.code_offset).mean(1)
+        with nvtx_range(f"code2wav:code_embedding:{shape_suffix}", color="magenta"):
+            hidden = self.code_embedding(codes + self.code_offset).mean(1)
         # Shape: [batch, seq_len, hidden_size]
 
         # Stage 2: Pre-Transformer (add temporal context)
-        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
+        with nvtx_range(f"code2wav:pre_transformer:{shape_suffix}", color="blue"):
+            hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
         # Shape: [batch, seq_len, hidden_size]
 
         # Stage 3: Upsampling
-        hidden = hidden.permute(0, 2, 1)  # [batch, hidden_size, seq_len]
-        for blocks in self.upsample:
-            for block in blocks:
-                hidden = block(hidden)
+        with nvtx_range(f"code2wav:upsample:{shape_suffix}", color="orange"):
+            hidden = hidden.permute(0, 2, 1)  # [batch, hidden_size, seq_len]
+            for block_group_idx, blocks in enumerate(self.upsample):
+                with nvtx_range(f"code2wav:upsample_group:{block_group_idx}", color="orange"):
+                    for block_idx, block in enumerate(blocks):
+                        with nvtx_range(f"code2wav:upsample_block:{block_group_idx}.{block_idx}", color="orange"):
+                            hidden = block(hidden)
         # Shape: [batch, hidden_size, seq_len * upsample_factor]
 
         # Stage 4: Decoder (progressive upsampling to waveform)
-        wav = hidden
-        for block in self.decoder:
-            wav = block(wav)
+        with nvtx_range(f"code2wav:decoder:{shape_suffix}", color="red"):
+            wav = hidden
+            for block_idx, block in enumerate(self.decoder):
+                with nvtx_range(f"code2wav:decoder_block:{block_idx}", color="red"):
+                    wav = block(wav)
         # Shape: [batch, 1, waveform_len]
 
         # Clamp to valid audio range
-        return wav.clamp(min=-1.0, max=1.0)
+        with nvtx_range(f"code2wav:clamp:{shape_suffix}", color="green"):
+            return wav.clamp(min=-1.0, max=1.0)
 
     def chunked_decode(
         self,
@@ -240,7 +251,15 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         """
         # Use CUDA graph wrapper for chunk-level decode when available
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
-            batch_wav = self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
+            with nvtx_range(
+                f"code2wav:chunked_decode_cudagraph:t={codes.shape[-1]}:chunk={chunk_size}:ctx={left_context_size}",
+                color="red",
+            ):
+                batch_wav = self._cudagraph_wrapper.chunked_decode_with_cudagraph(
+                    codes,
+                    chunk_size,
+                    left_context_size,
+                )
         else:
             wavs = []
             start_index = 0
@@ -250,17 +269,30 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 context_size = left_context_size if start_index >= left_context_size else start_index
 
                 # Extract chunk with left context
-                codes_chunk = codes[..., start_index - context_size : end_index]
+                with nvtx_range(
+                    f"code2wav:chunk_slice:start={start_index}:end={end_index}:ctx={context_size}",
+                    color="magenta",
+                ):
+                    codes_chunk = codes[..., start_index - context_size : end_index]
 
                 # Decode chunk
-                wav_chunk = self(codes_chunk)
+                with nvtx_range(
+                    f"code2wav:chunk_forward:start={start_index}:end={end_index}:ctx={context_size}",
+                    color="red",
+                ):
+                    wav_chunk = self(codes_chunk)
 
                 # Remove context from output (context_size * total_upsample samples)
-                wavs.append(wav_chunk[..., context_size * self.total_upsample :])
+                with nvtx_range(
+                    f"code2wav:chunk_trim:start={start_index}:ctx={context_size}",
+                    color="green",
+                ):
+                    wavs.append(wav_chunk[..., context_size * self.total_upsample :])
 
                 start_index = end_index
 
-            batch_wav = torch.cat(wavs, dim=-1)
+            with nvtx_range(f"code2wav:chunk_concat:n={len(wavs)}", color="green"):
+                batch_wav = torch.cat(wavs, dim=-1)
 
         if seq_token_counts is not None:
             code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in seq_token_counts]
@@ -268,9 +300,10 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             # Fallback: assume all batch elements share the same sequence length.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
         result = []
-        for idx, code_seq_len in enumerate(code_seq_lens):
-            wav_chunk = batch_wav[idx, :, : code_seq_len * self.total_upsample]
-            result.append(wav_chunk)
+        with nvtx_range(f"code2wav:batch_trim:n={len(code_seq_lens)}", color="green"):
+            for idx, code_seq_len in enumerate(code_seq_lens):
+                wav_chunk = batch_wav[idx, :, : code_seq_len * self.total_upsample]
+                result.append(wav_chunk)
         return result
 
     def chunked_decode_streaming(
@@ -305,20 +338,23 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         # Decode chunk
         wavs = []
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
-            batch_wav = self._cudagraph_wrapper.decode(codes)
+            with nvtx_range(f"code2wav:streaming_cudagraph_decode:t={codes.shape[-1]}", color="red"):
+                batch_wav = self._cudagraph_wrapper.decode(codes)
         else:
-            batch_wav = self(codes)
+            with nvtx_range(f"code2wav:streaming_forward:t={codes.shape[-1]}", color="red"):
+                batch_wav = self(codes)
         if seq_token_counts is not None:
             code_seq_lens = [n // self.config.num_quantizers for n in seq_token_counts]
         else:
             # Fallback: assume all batch elements share the same sequence length.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
-        for idx, code_seq_len in enumerate(code_seq_lens):
-            # Remove context from output (left_context_size * total_upsample samples)
-            wav_chunk = batch_wav[
-                idx, :, left_context_size[idx] * self.total_upsample : code_seq_len * self.total_upsample
-            ]
-            wavs.append(wav_chunk)
+        with nvtx_range(f"code2wav:streaming_batch_trim:n={len(code_seq_lens)}", color="green"):
+            for idx, code_seq_len in enumerate(code_seq_lens):
+                # Remove context from output (left_context_size * total_upsample samples)
+                wav_chunk = batch_wav[
+                    idx, :, left_context_size[idx] * self.total_upsample : code_seq_len * self.total_upsample
+                ]
+                wavs.append(wav_chunk)
         return wavs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

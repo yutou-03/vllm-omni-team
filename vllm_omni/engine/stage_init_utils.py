@@ -654,6 +654,7 @@ def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_conf
         tokenizer=tokenizer,
         log_stats=True,
         engine_core_output_type=metadata.engine_output_type,
+        engine_core_stage_id=metadata.stage_id,
     )
 
 

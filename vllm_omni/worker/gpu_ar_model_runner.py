@@ -42,6 +42,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
+from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -353,7 +354,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        stage_id = getattr(self.model_config, "stage_id", "?")
         with (
+            stage_trace_span(
+                "stage_preprocess",
+                stage_id=stage_id,
+                nvtx_name=f"s{stage_id}_preprocess",
+                nvtx_color="cyan",
+                batch_num_tokens=int(num_scheduled_tokens),
+                batch_num_seqs=len(getattr(scheduler_output, "num_scheduled_tokens", {}) or {}),
+            ),
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
@@ -537,6 +547,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        first_forward_seen = getattr(self, "_omni_stage_queue_first_forward_seen", set())
+        for req_id in req_ids[:num_reqs]:
+            if req_id in first_forward_seen:
+                continue
+            first_forward_seen.add(req_id)
+            emit_stage_event(
+                "stage_first_forward",
+                stage_id=stage_id,
+                request_id=req_id,
+                batch_num_tokens=int(num_tokens_unpadded),
+                batch_num_seqs=int(num_reqs),
+            )
+        self._omni_stage_queue_first_forward_seen = first_forward_seen
         with (
             nullcontext(),
             set_forward_context(
@@ -548,6 +571,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
+            ),
+            stage_trace_span(
+                "stage_forward",
+                stage_id=stage_id,
+                nvtx_name=f"s{stage_id}_forward",
+                nvtx_color="blue",
+                batch_num_tokens=int(num_tokens_unpadded),
+                batch_num_seqs=int(num_reqs),
+                num_tokens_padded=int(num_tokens_padded),
             ),
             nvtx_range("omni_ar:forward"),
             record_function_or_nullcontext("gpu_model_runner: forward"),
@@ -768,6 +800,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         ) = self.execute_model_state
         self.execute_model_state = None
         seq_len = hidden_states.shape[0]
+        stage_id = getattr(self.model_config, "stage_id", "?")
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -781,7 +814,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if self.input_batch.vocab_size > logits_vocab:
                     smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        with (
+            stage_trace_span(
+                "stage_sample",
+                stage_id=stage_id,
+                nvtx_name=f"s{stage_id}_sample",
+                nvtx_color="yellow",
+                batch_num_tokens=int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0),
+                batch_num_seqs=len(getattr(scheduler_output, "num_scheduled_tokens", {}) or {}),
+                hidden_tokens=int(seq_len),
+            ),
+            record_function_or_nullcontext("gpu_model_runner: sample"),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)

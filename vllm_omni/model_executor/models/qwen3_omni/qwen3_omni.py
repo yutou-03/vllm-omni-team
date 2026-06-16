@@ -46,6 +46,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+from vllm_omni.profiling.nvtx import nvtx_range
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -397,33 +398,38 @@ class Qwen3OmniMoeForConditionalGeneration(
             seq_token_counts: list[int] | None = kwargs.get("seq_token_counts")
 
             # Extract codec codes from input
-            if input_ids.shape[0] % 16 == 0:
-                if seq_token_counts is not None:
-                    max_seq_len = max(seq_token_counts) // 16
-                    batch_size = len(seq_token_counts)
-                    split_codes = torch.split(input_ids, seq_token_counts, dim=0)
-                    codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
-                    for idx, code in enumerate(split_codes):
-                        seq_len = code.shape[0] // 16
-                        codes[idx, :, :seq_len] = code.reshape(16, seq_len)
+            with nvtx_range(f"code2wav_wrapper:pack_codes:tokens={input_ids.shape[0]}", color="magenta"):
+                if input_ids.shape[0] % 16 == 0:
+                    if seq_token_counts is not None:
+                        max_seq_len = max(seq_token_counts) // 16
+                        batch_size = len(seq_token_counts)
+                        split_codes = torch.split(input_ids, seq_token_counts, dim=0)
+                        codes = torch.zeros(
+                            (batch_size, 16, max_seq_len),
+                            device=input_ids.device,
+                            dtype=input_ids.dtype,
+                        )
+                        for idx, code in enumerate(split_codes):
+                            seq_len = code.shape[0] // 16
+                            codes[idx, :, :seq_len] = code.reshape(16, seq_len)
+                    else:
+                        codes = input_ids.reshape(1, 16, -1)
                 else:
-                    codes = input_ids.reshape(1, 16, -1)
-            else:
-                logger.warning(
-                    (
-                        "Input_ids length: %s is not divisible by 16, padding "
-                        "with zeros. This should only happen in warm up."
-                    ),
-                    input_ids.shape[0],
-                )
-                input_ids_flatten = input_ids.reshape(-1)
-                input_ids_flatten = torch.cat(
-                    [
-                        input_ids_flatten,
-                        torch.zeros(16 - input_ids.shape[0] % 16, dtype=torch.long, device=input_ids.device),
-                    ]
-                )
-                codes = input_ids_flatten.reshape(1, 16, -1)
+                    logger.warning(
+                        (
+                            "Input_ids length: %s is not divisible by 16, padding "
+                            "with zeros. This should only happen in warm up."
+                        ),
+                        input_ids.shape[0],
+                    )
+                    input_ids_flatten = input_ids.reshape(-1)
+                    input_ids_flatten = torch.cat(
+                        [
+                            input_ids_flatten,
+                            torch.zeros(16 - input_ids.shape[0] % 16, dtype=torch.long, device=input_ids.device),
+                        ]
+                    )
+                    codes = input_ids_flatten.reshape(1, 16, -1)
 
             # Generate audio from codec codes
             # Get every request's left_context_size from runtime_additional_information (passed via kwargs)
@@ -435,7 +441,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                         left_context_size.append(meta["left_context_size"])
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
-            audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
+            with nvtx_range(f"code2wav_wrapper:generate_audio:b={codes.shape[0]}:t={codes.shape[-1]}", color="red"):
+                audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
 
             return audio_tensors
 
@@ -534,35 +541,38 @@ class Qwen3OmniMoeForConditionalGeneration(
         code2wav_dev = self._module_device(self.code2wav)
 
         # Convert to tensor if needed
-        if isinstance(code, torch.Tensor):
-            talker_codes = code.to(dtype=torch.long, device=code2wav_dev)
-        else:
-            talker_codes = torch.as_tensor(code, dtype=torch.long, device=code2wav_dev)
+        with nvtx_range("code2wav_wrapper:prepare_talker_codes", color="magenta"):
+            if isinstance(code, torch.Tensor):
+                talker_codes = code.to(dtype=torch.long, device=code2wav_dev)
+            else:
+                talker_codes = torch.as_tensor(code, dtype=torch.long, device=code2wav_dev)
 
-        # Ensure shape is [batch=1, 8, T]
-        if talker_codes.ndim == 2:
-            # [8, T] → [1, 8, T]
-            talker_codes = talker_codes.unsqueeze(0)
-        elif talker_codes.ndim == 1:
-            # [T] → assume single layer, expand to 16 layers
-            talker_codes = talker_codes.unsqueeze(0).unsqueeze(0)
-            talker_codes = talker_codes.expand(1, 16, -1)
+            # Ensure shape is [batch=1, 8, T]
+            if talker_codes.ndim == 2:
+                # [8, T] → [1, 8, T]
+                talker_codes = talker_codes.unsqueeze(0)
+            elif talker_codes.ndim == 1:
+                # [T] → assume single layer, expand to 16 layers
+                talker_codes = talker_codes.unsqueeze(0).unsqueeze(0)
+                talker_codes = talker_codes.expand(1, 16, -1)
 
         if self.vllm_config.model_config.async_chunk:
             # Only use left_context_size from additional information
-            audio_tensors = self.code2wav.chunked_decode_streaming(
-                talker_codes,
-                left_context_size=left_context_size,
-                seq_token_counts=seq_token_counts,
-            )
+            with nvtx_range(f"code2wav_wrapper:chunked_decode_streaming:t={talker_codes.shape[-1]}", color="red"):
+                audio_tensors = self.code2wav.chunked_decode_streaming(
+                    talker_codes,
+                    left_context_size=left_context_size,
+                    seq_token_counts=seq_token_counts,
+                )
         else:
             # Use chunked decode for memory efficiency
-            audio_tensors = self.code2wav.chunked_decode(
-                talker_codes,
-                chunk_size=300,
-                left_context_size=25,
-                seq_token_counts=seq_token_counts,
-            )
+            with nvtx_range(f"code2wav_wrapper:chunked_decode:t={talker_codes.shape[-1]}", color="red"):
+                audio_tensors = self.code2wav.chunked_decode(
+                    talker_codes,
+                    chunk_size=300,
+                    left_context_size=25,
+                    seq_token_counts=seq_token_counts,
+                )
 
         return audio_tensors
 
@@ -706,9 +716,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         # for profiling
         if inputs_embeds.shape[-1] == 2048:
             inputs_embeds = self.text_projection(inputs_embeds)
-        code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
-            input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden
-        )
+        with nvtx_range("talker_mtp_code_predictor"):
+            code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
+                input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden
+            )
         # summed_embeddings is [B, seq_len, H] (3D) while text_step is [B, H] (2D).
         # Flatten to 2D first to avoid wrong broadcasting: [B,1,H]+[B,H] → [B,B,H]
         inputs_embeds = summed_embeddings.reshape(-1, self.talker_config.text_config.hidden_size)

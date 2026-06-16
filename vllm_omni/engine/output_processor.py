@@ -19,6 +19,12 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.profiling.nvtx import (
+    nvtx_end_keyed_range,
+    nvtx_mark,
+    nvtx_start_keyed_range,
+)
+from vllm_omni.profiling.stage_queue_trace import emit_stage_event
 
 logger = init_logger(__name__)
 
@@ -296,6 +302,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         engine_core_output_type: str | None = None,
+        engine_core_stage_id: int | None = None,
     ):
         """Initialize the multimodal output processor.
 
@@ -314,6 +321,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             tracing_enabled=tracing_enabled,
         )
         self.engine_core_output_type = engine_core_output_type
+        self.engine_core_stage_id = engine_core_stage_id
 
     def add_request(
         self,
@@ -387,11 +395,41 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
-            if eco.pooling_output is not None and req_state.detokenizer is not None:
+            if eco.pooling_output is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
-                req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
-                # Force text path in base processor for multimodal outputs.
-                eco.pooling_output = None
+                if not getattr(req_state, "_omni_stage_first_mm_output_emitted", False):
+                    if str(self.engine_core_stage_id) == "2":
+                        req_id = str(eco.request_id)
+                        nvtx_mark(
+                            f"TTFP:s2_output_processor_first_output:req={req_id[-8:]}",
+                            color="purple",
+                        )
+                        nvtx_end_keyed_range(
+                            f"s2_raw_output_to_output_processor:{req_id}",
+                            f"TTFP:s2_raw_output_to_output_processor:req={req_id[-8:]}",
+                            color="purple",
+                        )
+                        nvtx_start_keyed_range(
+                            f"s2_first_output_to_audio_first_packet:{req_id}",
+                            f"TTFP:s2_first_output_to_audio_first_packet:req={req_id[-8:]}",
+                            color="purple",
+                        )
+                        nvtx_start_keyed_range(
+                            f"s2_output_processor_to_route:{req_id}",
+                            f"TTFP:s2_output_processor_to_route:req={req_id[-8:]}",
+                            color="blue",
+                        )
+                    emit_stage_event(
+                        "stage_first_output",
+                        stage_id=self.engine_core_stage_id,
+                        request_id=eco.request_id,
+                        output_type=mm_type or None,
+                    )
+                    req_state._omni_stage_first_mm_output_emitted = True
+                if req_state.detokenizer is not None:
+                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    # Force text path in base processor for multimodal outputs.
+                    eco.pooling_output = None
 
         return super().process_outputs(
             engine_core_outputs,

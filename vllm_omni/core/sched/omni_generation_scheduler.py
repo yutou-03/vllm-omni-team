@@ -28,6 +28,8 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.profiling.nvtx import nvtx_end_keyed_range, nvtx_mark
+from vllm_omni.profiling.stage_queue_trace import emit_stage_duration_event
 
 logger = init_logger(__name__)
 
@@ -51,6 +53,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             token_budget = 0
+        iteration_id = self._omni_next_iteration_id()
+        schedule_start = time.time()
+        num_running_before = len(self.running)
+        num_waiting_before = len(self.waiting)
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
@@ -216,6 +222,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
             else:
                 res = super().schedule()
+                self._trace_scheduler_output(
+                    res,
+                    iteration_id=iteration_id,
+                    timestamp_start=schedule_start,
+                    timestamp_end=time.time(),
+                    num_running_before=num_running_before,
+                    num_waiting_before=num_waiting_before,
+                )
                 return res
 
         # Compute common prefix blocks (aligned with v1)
@@ -297,6 +311,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Update internal state (advance num_computed_tokens, free encoder inputs,
         # etc.)
         self._update_after_schedule(scheduler_output)
+        self._trace_scheduler_output(
+            scheduler_output,
+            iteration_id=iteration_id,
+            timestamp_start=schedule_start,
+            timestamp_end=time.time(),
+            num_running_before=num_running_before,
+            num_waiting_before=num_waiting_before,
+        )
 
         try:
             # Rewrap base NewRequestData entries with OmniNewRequestData,
@@ -376,6 +398,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         This method is modified to stop the request immediately for the diffusion model.
         """
         # logger.info("Updating scheduler from model runner output for %d requests, before processing num_running=%d, num_waiting=%d", len(scheduler_output.num_scheduled_tokens), len(self.running), len(self.waiting))
+        stage_id = getattr(self.vllm_config.model_config, "stage_id", "?")
+        update_timestamp_start = time.time()
+        update_monotonic_start = time.monotonic()
         num_running_before_update = len(self.running)
         num_waiting_before_update = len(self.waiting)
         kv_cache_usage_before_update = self.kv_cache_manager.usage
@@ -518,6 +543,24 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+                is_first_stage_pooler_output = False
+                if pooler_output is not None and not getattr(
+                    request,
+                    "_omni_stage_queue_first_output_emitted",
+                    False,
+                ):
+                    if str(stage_id) == "2":
+                        nvtx_mark(
+                            f"TTFP:s2_first_output_ready:req={str(req_id)[-8:]}",
+                            color="orange",
+                        )
+                        nvtx_end_keyed_range(
+                            f"s2_first_schedule_to_first_output:{req_id}",
+                            f"TTFP:s2_first_schedule_to_first_output:req={str(req_id)[-8:]}",
+                            color="orange",
+                        )
+                    request._omni_stage_queue_first_output_emitted = True
+                    is_first_stage_pooler_output = True
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -535,6 +578,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
+                if is_first_stage_pooler_output and str(stage_id) == "2":
+                    nvtx_mark(
+                        f"TTFP:s2_engine_core_output_created:req={str(req_id)[-8:]}",
+                        color="orange",
+                    )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -587,6 +635,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
         engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
+        if str(stage_id) == "2":
+            for outs in outputs.values():
+                for output in outs:
+                    if getattr(output, "pooling_output", None) is not None:
+                        nvtx_mark(
+                            f"TTFP:s2_engine_core_outputs_built:req={str(output.request_id)[-8:]}",
+                            color="orange",
+                        )
+                        break
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:
@@ -610,6 +667,20 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
         # logger.info("Updating scheduler from model runner output, after processing num_running=%d, num_waiting=%d", len(self.running), len(self.waiting))
+        emit_stage_duration_event(
+            "stage_update_from_output",
+            stage_id=stage_id,
+            timestamp_start=update_timestamp_start,
+            timestamp_end=time.time(),
+            monotonic_start=update_monotonic_start,
+            monotonic_end=time.monotonic(),
+            batch_num_tokens=int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0),
+            batch_num_seqs=len(getattr(scheduler_output, "num_scheduled_tokens", {}) or {}),
+            num_running_reqs_before=num_running_before_update,
+            num_waiting_reqs_before=num_waiting_before_update,
+            num_running_reqs_after=len(self.running),
+            num_waiting_reqs_after=len(self.waiting),
+        )
         return engine_core_outputs
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
