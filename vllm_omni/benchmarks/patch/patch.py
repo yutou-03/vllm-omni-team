@@ -326,7 +326,11 @@ if _serve_mod is not None:
 
 @dataclass
 class MixRequestFuncOutput(RequestFuncOutput):
+    request_id: str | None = None
     audio_ttfp: float = 0.0
+    audio_e2el: float = 0.0
+    audio_itl: list[float] | None = None
+    audio_text_gap: float = 0.0
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
@@ -383,6 +387,7 @@ async def async_request_openai_chat_omni_completions(
     _update_headers_common(headers, request_func_input)
 
     output = MixRequestFuncOutput()
+    output.request_id = request_func_input.request_id
     output.prompt_len = request_func_input.prompt_len
     max_retries = 3
     retry_delay = 0.1
@@ -401,9 +406,13 @@ async def async_request_openai_chat_omni_completions(
         output.generated_text = ""
         output.ttft = 0.0
         output.audio_ttfp = 0.0
+        output.audio_e2el = 0.0
+        output.audio_itl = []
+        output.audio_text_gap = 0.0
         output.audio_duration = 0.0
         output.audio_frames = 0
         output.audio_rtf = 0.0
+        most_recent_audio_ts = st
         output.text_latency = 0.0
         output.output_tokens = 0
         output.error = ""
@@ -454,6 +463,18 @@ async def async_request_openai_chat_omni_completions(
                                     elif modality == "audio":
                                         if output.audio_ttfp == 0.0:
                                             output.audio_ttfp = timestamp - st
+                                            # For speech-only streams there are no text
+                                            # deltas, so output.ttft stays at 0.  Use the
+                                            # first audio packet as TTFT so the generic
+                                            # benchmark metrics report meaningful values.
+                                            if output.ttft == 0.0:
+                                                output.ttft = output.audio_ttfp
+                                            output.audio_text_gap = output.audio_ttfp - output.ttft
+                                        else:
+                                            output.audio_itl.append(timestamp - most_recent_audio_ts)
+                                        audio_generate_time = timestamp - st
+                                        most_recent_audio_ts = timestamp
+                                        output.audio_e2el = timestamp - st
                                         audio_generate_time = timestamp - st
                                         if content:
                                             audio_bytes = base64.b64decode(content)
@@ -559,6 +580,7 @@ async def async_request_openai_audio_speech(
     _update_headers_common(headers, request_func_input)
 
     output = MixRequestFuncOutput()
+    output.request_id = request_func_input.request_id
     output.prompt_len = request_func_input.prompt_len
 
     # PCM format: 16-bit signed, 24 kHz, mono
@@ -580,7 +602,8 @@ async def async_request_openai_audio_speech(
                     timestamp = time.perf_counter()
                     if output.audio_ttfp == 0.0:
                         output.audio_ttfp = timestamp - st
-                        output.ttft = output.audio_ttfp
+                        #output.ttft = output.audio_ttfp
+                        output.audio_text_gap = output.audio_ttfp - output.ttft
                     total_pcm_bytes += len(chunk)
                     if pcm_capture is not None:
                         pcm_capture.extend(chunk)
@@ -827,7 +850,7 @@ async def benchmark(
                         "--force-overwrite",
                         "true",
                         "--session",
-                        "zhongyu",
+                        "zhongyu3",
                     ],
                     check=False,
                 )
@@ -954,6 +977,40 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    def _server_request_id(request_id: str | None) -> str | None:
+        if request_id is None:
+            return None
+        if endpoint_type in ("openai-chat-omni", "daily-omni"):
+            return f"chatcmpl-{request_id}"
+        return request_id
+
+    ttfp_request_records = []
+    for index, output in enumerate(outputs):
+        request_id = getattr(output, "request_id", None)
+        server_request_id = _server_request_id(request_id)
+        audio_ttfp = getattr(output, "audio_ttfp", 0.0)
+        client_start_offset = output.start_time - benchmark_start_time
+        first_audio_offset = client_start_offset + audio_ttfp if audio_ttfp > 0 else None
+        ttfp_request_records.append(
+            {
+                "index": index,
+                "request_id": request_id,
+                "server_request_id": server_request_id,
+                "request_suffix": str(server_request_id or request_id)[-8:] if request_id else None,
+                "success": output.success,
+                "client_start_offset_ms": client_start_offset * 1000,
+                "audio_ttfp_ms": audio_ttfp * 1000,
+                "client_first_audio_offset_ms": first_audio_offset * 1000 if first_audio_offset is not None else None,
+                "ttft_ms": output.ttft * 1000,
+                "latency_ms": output.latency * 1000,
+                "prompt_len": output.prompt_len,
+                "output_tokens": output.output_tokens,
+                "audio_duration_s": getattr(output, "audio_duration", 0.0),
+                "audio_frames": getattr(output, "audio_frames", 0),
+                "error": output.error,
+            }
+        )
+
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
             input_requests=input_requests,
@@ -994,11 +1051,16 @@ async def benchmark(
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],
+            "audio_ttfps": [output.audio_ttfp for output in outputs],
+            "audio_e2els": [output.audio_e2el for output in outputs],
+            "audio_itls": [output.audio_itl for output in outputs],
+            "audio_text_gaps": [output.audio_text_gap for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "rtfx": metrics.rtfx,
+            "ttfp_request_records": ttfp_request_records,
         }
     else:
         result = {
@@ -1009,6 +1071,7 @@ async def benchmark(
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
+            "ttfp_request_records": ttfp_request_records,
         }
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
