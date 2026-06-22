@@ -6,6 +6,7 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import multiprocessing.connection
 import socket
@@ -16,7 +17,7 @@ from urllib.parse import urlparse
 
 import psutil
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -207,6 +208,18 @@ class StageEngineCoreClientBase:
             self.stage_id,
             self.replica_id,
         )
+
+    def get_output_nowait(self) -> EngineCoreOutputs | None:
+        """Return a ready output immediately, or ``None`` when the queue is empty."""
+        self._ensure_output_queue_task()
+        assert self.outputs_queue is not None
+        try:
+            outputs = self.outputs_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        if isinstance(outputs, Exception):
+            raise self._format_exception(outputs) from None
+        return outputs
 
     def _start_proc_monitor(self) -> None:
         """Start a daemon thread that watches the subprocess sentinel.

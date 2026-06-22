@@ -66,6 +66,12 @@ class FakeStageClient:
         except queue.Empty:
             return SimpleNamespace(outputs=[])
 
+    def get_output_nowait(self):
+        try:
+            return self._engine_core_outputs.get_nowait()
+        except queue.Empty:
+            return None
+
     def get_diffusion_output_nowait(self):
         try:
             return self._diffusion_outputs.get_nowait()
@@ -116,12 +122,14 @@ class FakeOutputProcessor:
         self.request_outputs = list(request_outputs or [])
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
+        self.processed_outputs: list[tuple] = []
 
     def add_request(self, *args, **kwargs) -> None:
         self.add_request_calls.append((args, kwargs))
         return None
 
     def process_outputs(self, *_args, **_kwargs):
+        self.processed_outputs.append(_args)
         return SimpleNamespace(
             request_outputs=list(self.request_outputs),
             reqs_to_abort=[],
@@ -461,6 +469,66 @@ def orchestrator_factory():
             fixture.thread.join(timeout=5)
         for q in fixture.queues:
             q.close()
+
+
+def _make_drain_only_orchestrator(pool: StagePool) -> Orchestrator:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._shutdown_event = asyncio.Event()
+    orchestrator.stage_pools = [pool]
+    orchestrator.request_states = {}
+    orchestrator.async_chunk = False
+    orchestrator._stat_logger = None
+    orchestrator._stage_replica_to_engine_idx = {(0, 0): 0}
+    return orchestrator
+
+
+@pytest.mark.asyncio
+async def test_drain_llm_replica_raw_outputs_processes_ready_items_in_one_round() -> None:
+    stage = FakeStageClient(stage_type="llm")
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, [stage], output_processor=processor)
+    orchestrator = _make_drain_only_orchestrator(pool)
+
+    stage.push_engine_core_outputs(_engine_core_outputs("raw-1", 1.0))
+    stage.push_engine_core_outputs(_engine_core_outputs("raw-2", 2.0))
+    stage.push_engine_core_outputs(_engine_core_outputs("raw-3", 3.0))
+
+    assert await orchestrator._drain_llm_replica_raw_outputs(0, 0, pool) is True
+    assert len(processor.processed_outputs) == 3
+    assert await orchestrator._drain_llm_replica_raw_outputs(0, 0, pool) is False
+
+
+@pytest.mark.asyncio
+async def test_drain_llm_replica_raw_outputs_is_bounded_per_round() -> None:
+    stage = FakeStageClient(stage_type="llm")
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, [stage], output_processor=processor)
+    orchestrator = _make_drain_only_orchestrator(pool)
+    over = Orchestrator._MAX_RAW_OUTPUTS_PER_DRAIN + 5
+
+    for idx in range(over):
+        stage.push_engine_core_outputs(_engine_core_outputs(f"raw-{idx}", float(idx)))
+
+    assert await orchestrator._drain_llm_replica_raw_outputs(0, 0, pool) is True
+    assert len(processor.processed_outputs) == Orchestrator._MAX_RAW_OUTPUTS_PER_DRAIN
+    assert stage._engine_core_outputs.qsize() == 5
+
+
+@pytest.mark.asyncio
+async def test_drain_llm_replica_raw_outputs_skips_empty_items_but_keeps_draining() -> None:
+    stage = FakeStageClient(stage_type="llm")
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, [stage], output_processor=processor)
+    orchestrator = _make_drain_only_orchestrator(pool)
+
+    stage.push_engine_core_outputs(
+        SimpleNamespace(outputs=[], timestamp=1.0, scheduler_stats=None)
+    )
+    stage.push_engine_core_outputs(_engine_core_outputs("after-empty", 2.0))
+
+    assert await orchestrator._drain_llm_replica_raw_outputs(0, 0, pool) is True
+    assert len(processor.processed_outputs) == 1
+    assert processor.processed_outputs[0][0] == ["after-empty"]
 
 
 # ---------------------------------------------------------------------------

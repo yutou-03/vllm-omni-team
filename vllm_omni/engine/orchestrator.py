@@ -123,6 +123,8 @@ class StreamingInputState:
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop."""
 
+    _MAX_RAW_OUTPUTS_PER_DRAIN = 16
+
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[dict[str, Any]],
@@ -479,40 +481,10 @@ class Orchestrator:
                     else:
                         try:
                             with nvtx_range("orchestrator:poll_llm_output"):
-                                raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
-                            if raw_outputs is None:
-                                continue
-                            if stage_id == 2:
-                                self._trace_s2_raw_outputs_polled(raw_outputs)
-
-                            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-                            for eco in raw_outputs.outputs:
-                                req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None:
-                                    continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                                req_state.streaming.new_prompt_len_snapshot = getattr(
-                                    eco,
-                                    "new_prompt_len_snapshot",
-                                    None,
-                                )
-                            # now = _time.monotonic()
-                            # record_stats = (
-                            #     self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
-                            # )
-                            record_stats = self._stat_logger is not None
-                            iteration_stats = IterationStats() if record_stats else None
-                            raw_output = await pool.process_llm_raw_outputs(
-                                replica_id,
-                                raw_outputs,
-                                iteration_stats=iteration_stats,
-                            )
-                            if record_stats:
-                                # self._last_stats_ts = now
-                                self._stat_logger.record(
-                                    raw_outputs.scheduler_stats,
-                                    iteration_stats,
-                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                                did_work = await self._drain_llm_replica_raw_outputs(
+                                    stage_id,
+                                    replica_id,
+                                    pool,
                                 )
                         except asyncio.CancelledError:
                             raise
@@ -557,13 +529,68 @@ class Orchestrator:
                             )
                             raise
 
-                        await self._handle_processed_outputs(stage_id, replica_id, raw_output)
-                        idle = False
+                        if did_work:
+                            idle = False
 
             if idle:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
+
+    async def _drain_llm_replica_raw_outputs(
+        self,
+        stage_id: int,
+        replica_id: int,
+        pool: StagePool,
+    ) -> bool:
+        """Drain ready raw outputs from one LLM replica without blocking."""
+        did_work = False
+        for _ in range(self._MAX_RAW_OUTPUTS_PER_DRAIN):
+            if self._shutdown_event.is_set():
+                break
+
+            raw_outputs = pool.poll_llm_raw_output_nowait(replica_id)
+            if raw_outputs is None:
+                break
+            if not raw_outputs.outputs:
+                continue
+            if stage_id == 2:
+                self._trace_s2_raw_outputs_polled(raw_outputs)
+
+            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+            for eco in raw_outputs.outputs:
+                req_state = self.request_states.get(getattr(eco, "request_id", None))
+                if req_state is None:
+                    continue
+                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                req_state.streaming.new_prompt_len_snapshot = getattr(
+                    eco,
+                    "new_prompt_len_snapshot",
+                    None,
+                )
+            # now = _time.monotonic()
+            # record_stats = (
+            #     self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
+            # )
+            record_stats = self._stat_logger is not None
+            iteration_stats = IterationStats() if record_stats else None
+            raw_output = await pool.process_llm_raw_outputs(
+                replica_id,
+                raw_outputs,
+                iteration_stats=iteration_stats,
+            )
+            if record_stats:
+                # self._last_stats_ts = now
+                self._stat_logger.record(
+                    raw_outputs.scheduler_stats,
+                    iteration_stats,
+                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                )
+
+            await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+            did_work = True
+
+        return did_work
 
     async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""

@@ -334,6 +334,11 @@ class StagePool:
             )
             raise
 
+    def poll_llm_raw_output_nowait(self, replica_id: int) -> EngineCoreOutputs | None:
+        """Poll one ready raw LLM output without blocking."""
+        client = self.clients[replica_id]
+        return client.get_output_nowait()
+
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""
         return self.clients[replica_id].get_diffusion_output_nowait()
