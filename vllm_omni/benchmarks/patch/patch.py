@@ -88,6 +88,23 @@ def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: Request
         setattr(rfi, "mm_position", sample.omni_chat_mm_position)
 
 
+def _attach_servegen_to_request_func_input(
+    sample: SampleRequest, rfi: RequestFuncInput
+) -> None:
+    """Apply the per-request path and experiment metadata from a ServeGen trace."""
+
+    if not isinstance(sample, ServeGenSampleRequest):
+        return
+    if sample.output_modalities is not None:
+        rfi.extra_body = _merge_extra_body_mm_kwargs(
+            rfi.extra_body,
+            {"modalities": sample.output_modalities},
+        )
+    setattr(rfi, "servegen_slo_ms", sample.slo_ms)
+    setattr(rfi, "servegen_request_path", sample.request_path)
+    setattr(rfi, "servegen_predicted_stage_ms", sample.predicted_stage_ms)
+
+
 def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
     """Merge Seed-TTS per-row TTS fields into ``extra_body`` and mark for PCM capture.
 
@@ -749,6 +766,7 @@ async def benchmark(
         extra_headers=extra_headers,
         extra_body=extra_body,
     )
+    _attach_servegen_to_request_func_input(input_requests[0], test_input)
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
 
@@ -903,6 +921,7 @@ async def benchmark(
             extra_body=extra_body,
             request_id=request_id,
             )
+            _attach_servegen_to_request_func_input(request, request_func_input)
             tasks.append(
                 asyncio.create_task(
                     limited_request_func(
