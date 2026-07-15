@@ -9,8 +9,13 @@ import numpy as np
 import soundfile as sf
 import torch
 from vllm.benchmarks.datasets import RandomMultiModalDataset, SampleRequest, process_image, process_video
-import pandas as pd
 from vllm.tokenizers import TokenizerLike
+
+from vllm_omni.benchmarks.data_modules.servegen_schema import (
+    load_servegen_jsonl,
+    mm_item_config,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -153,54 +158,43 @@ class OmniRandomMultiModalDataset(RandomMultiModalDataset):
         else:
             raise ValueError(f"Invalid multimodal item configuration: {config}")
 
+
 @dataclass
 class ServeGenSampleRequest(SampleRequest):
-    time_stamp:float=0.0
+    time_stamp: float = 0.0
+    output_modalities: list[str] | None = None
+    slo_ms: float | None = None
+    request_path: str | None = None
+    predicted_stage_ms: dict[str, float] | None = None
+
+
 class ServeGenDataSet(OmniRandomMultiModalDataset):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.disable_shuffle = True
         self.load_data()
+
     def load_data(self) -> None:
         if self.dataset_path is None:
             raise ValueError("dataset_path must be provided for loading data.")
 
-        # self.data will be a list of dictionaries
-        # e.g., [{"prompt": "What is the capital of India?"}, ...]
-        # This will be the standardized format which load_data()
-        # has to convert into depending on the filetype of dataset_path.
-        # sample() will assume this standardized format of self.data
-        self.data = []
-
-        # Load the JSONL file
-        if self.dataset_path.endswith(".jsonl"):
-            jsonl_data = pd.read_json(path_or_buf=self.dataset_path, lines=True)
-
-            # check if the JSONL file has a 'prompt' column
-            # if "prompt" not in jsonl_data.columns:
-            #     raise ValueError("JSONL file must contain a 'prompt' column.")
-
-            # Convert each row to a dictionary and append to self.data
-            # This will convert the DataFrame to a list of dictionaries
-            # where each dictionary corresponds to a row in the DataFrame.
-            # This is the standardized format we want for self.data
-            for _, row in jsonl_data.iterrows():
-                self.data.append(row.to_dict())
-        else:
+        if not self.dataset_path.endswith(".jsonl"):
             raise NotImplementedError(
                 "Only JSONL format is supported for CustomDataset."
             )
+        self.data = load_servegen_jsonl(self.dataset_path)
+
     def sample(
         self,
         tokenizer: TokenizerLike,
-        num_requests: int|None = None,
+        num_requests: int | None = None,
         request_id_prefix: str = "",
         prefix_len: int = 0,
         **kwargs,
     ) -> list[ServeGenSampleRequest]:
         self.num_available_samples = len(self.data)
         if num_requests is None:
-            num_requests=len(self.data)
+            num_requests = len(self.data)
         if num_requests <= 0:
             num_requests = self.num_available_samples
             logger.info(
@@ -209,7 +203,7 @@ class ServeGenDataSet(OmniRandomMultiModalDataset):
                 num_requests,
             )
         logger.info("Need Sampling %d requests from the dataset", num_requests)
-        sample_requests:list[ServeGenSampleRequest] = []
+        sample_requests: list[ServeGenSampleRequest] = []
         prohibited_tokens = list(
             tok_id
             for tok_id, token in tokenizer.added_tokens_decoder.items()
@@ -218,11 +212,12 @@ class ServeGenDataSet(OmniRandomMultiModalDataset):
         vocab_size = tokenizer.vocab_size
         all_tokens = np.arange(vocab_size)
         allowed_tokens = np.array(list(set(all_tokens) - set(prohibited_tokens)))
-        prefix_token_ids=self.get_prefix(tokenizer,allowed_tokens,prefix_len)
-        token_mismatch_total=0
-        for i,item in enumerate(self.data[:num_requests]):
-            input_len=int(self.data[i].get("text_tokens",self.data[i].get("input_tokens",0)))
-            prompt,total_input_len,token_mismatch=self.generate_token_sequence(
+        prefix_token_ids = self.get_prefix(tokenizer, allowed_tokens, prefix_len)
+        token_mismatch_total = 0
+        seen_request_ids: set[str] = set()
+        for i, item in enumerate(self.data[:num_requests]):
+            input_len = int(item.get("text_tokens", item.get("input_tokens", 0)))
+            prompt, total_input_len, token_mismatch = self.generate_token_sequence(
                 tokenizer=tokenizer,
                 prefix_token_ids=prefix_token_ids,
                 prefix_len=prefix_len,
@@ -232,23 +227,26 @@ class ServeGenDataSet(OmniRandomMultiModalDataset):
                 index=i,
                 allowed_tokens=allowed_tokens,
             )
-            token_mismatch_total+=token_mismatch
-            mm_item_list=[]
-            if("mm_items"  in self.data[i]):
-                for mm in self.data[i]["mm_items"]:
-                    if mm["modality"] == "image":
-                        mm_item_list.append(self.generate_mm_item((mm["h"],mm["w"],1)))
-                    elif mm["modality"] == "video":
-                        mm_item_list.append(self.generate_mm_item((mm["h"],mm["w"],int(mm["t"]*mm["fps"]))))
-                    elif mm["modality"] == "audio":
-                        mm_item_list.append(self.generate_mm_item((0,mm["duration_s"],mm["num_channels"])))
-            sample_request=ServeGenSampleRequest(
+            token_mismatch_total += token_mismatch
+            mm_item_list = [
+                self.generate_mm_item(mm_item_config(mm, request_id=item["request_id"]))
+                for mm in item["mm_items"]
+            ]
+            request_id = f"{request_id_prefix}{item['request_id']}"
+            if request_id in seen_request_ids:
+                raise ValueError(f"Duplicate sampled request_id {request_id!r}")
+            seen_request_ids.add(request_id)
+            sample_request = ServeGenSampleRequest(
                 prompt=prompt,
                 prompt_len=total_input_len,
-                expected_output_len=self.data[i]["output_tokens"],
+                expected_output_len=item["output_tokens"],
                 multi_modal_data=mm_item_list,
-                request_id=f"{request_id_prefix}{i}",
-                time_stamp=self.data[i]['timestamp']
+                request_id=request_id,
+                time_stamp=item["timestamp"],
+                output_modalities=item.get("output_modalities"),
+                slo_ms=item.get("slo_ms"),
+                request_path=item.get("request_path"),
+                predicted_stage_ms=item.get("predicted_stage_ms"),
             )
             sample_requests.append(sample_request)
         if token_mismatch_total != 0:
@@ -261,4 +259,4 @@ class ServeGenDataSet(OmniRandomMultiModalDataset):
                 abs(token_mismatch_total),
                 sign,
             )
-        return sample_requests 
+        return sample_requests
