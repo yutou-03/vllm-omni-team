@@ -25,7 +25,10 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -35,8 +38,69 @@ from vllm_omni.profiling.nvtx import (
     nvtx_range,
 )
 from vllm_omni.profiling.stage_queue_trace import stage_trace_span
+from vllm_omni.scheduling.metadata import (
+    extract_scheduling_metadata,
+    merge_scheduling_metadata_into_additional_information,
+    merge_scheduling_metadata_into_prompt,
+)
 
 logger = init_logger(__name__)
+
+
+def extract_scheduling_metadata_from_request_input(
+    request_input: Any,
+) -> dict[str, Any] | None:
+    """Extract canonical scheduling fields from a prompt or core request."""
+
+    if isinstance(request_input, list):
+        for item in request_input:
+            if scheduling := extract_scheduling_metadata_from_request_input(item):
+                return scheduling
+        return None
+    if isinstance(request_input, dict):
+        return extract_scheduling_metadata(
+            request_input.get("additional_information")
+        )
+    wire_payload = getattr(request_input, "additional_information", None)
+    return extract_scheduling_metadata(
+        deserialize_additional_information(wire_payload)
+    )
+
+
+def merge_scheduling_metadata_into_request_input(
+    request_input: Any,
+    scheduling_metadata: dict[str, Any] | None,
+) -> Any:
+    """Preserve scheduling fields when an inter-stage input is rebuilt."""
+
+    if not scheduling_metadata:
+        return request_input
+    if isinstance(request_input, list):
+        return [
+            merge_scheduling_metadata_into_request_input(
+                item,
+                scheduling_metadata,
+            )
+            for item in request_input
+        ]
+    if isinstance(request_input, dict):
+        return merge_scheduling_metadata_into_prompt(
+            request_input,
+            scheduling_metadata,
+        )
+    if not hasattr(request_input, "additional_information"):
+        return request_input
+    decoded = deserialize_additional_information(
+        request_input.additional_information
+    )
+    merged = merge_scheduling_metadata_into_additional_information(
+        decoded,
+        scheduling_metadata,
+    )
+    return OmniEngineCoreRequest.from_request(
+        request_input,
+        additional_information=serialize_additional_information(merged),
+    )
 
 
 def build_engine_core_request_from_tokens(
@@ -99,6 +163,7 @@ class OrchestratorRequestState:
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
     pd_prefill_multimodal_output: dict[str, Any] | None = None
+    scheduling_metadata: dict[str, Any] | None = None
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
@@ -287,6 +352,10 @@ class Orchestrator:
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             mm_features=getattr(prompt, "mm_features", None),
+            scheduling_metadata=(
+                extract_scheduling_metadata_from_request_input(original_prompt)
+                or extract_scheduling_metadata_from_request_input(prompt)
+            ),
         )
         self.request_states[request_id] = req_state
         if self._running_counter is not None:
@@ -331,6 +400,11 @@ class Orchestrator:
         if "sampling_params_list" in msg and msg["sampling_params_list"]:
             req_state.sampling_params_list = msg["sampling_params_list"]
 
+        request = merge_scheduling_metadata_into_request_input(
+            request,
+            req_state.scheduling_metadata,
+        )
+
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
         await self.stage_pools[stage_id].submit_update(
@@ -360,11 +434,17 @@ class Orchestrator:
 
         self._cfg_tracker.register_companion(parent_id, role, companion_id)
 
+        companion_prompt = merge_scheduling_metadata_into_request_input(
+            companion_prompt,
+            parent_state.scheduling_metadata,
+        )
+
         companion_state = OrchestratorRequestState(
             request_id=companion_id,
             prompt=companion_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=0,
+            scheduling_metadata=parent_state.scheduling_metadata,
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
@@ -983,6 +1063,11 @@ class Orchestrator:
             else:
                 diffusion_prompt = req_state.prompt
 
+            diffusion_prompt = merge_scheduling_metadata_into_request_input(
+                diffusion_prompt,
+                req_state.scheduling_metadata,
+            )
+
             if already_submitted:
                 await next_pool.submit_update(req_id, req_state, diffusion_prompt)
             else:
@@ -1043,6 +1128,10 @@ class Orchestrator:
                 decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
 
             for decode_input in decode_inputs:
+                decode_input = merge_scheduling_metadata_into_prompt(
+                    decode_input,
+                    req_state.scheduling_metadata,
+                )
                 request = build_engine_core_request_from_tokens(
                     request_id=req_id,
                     prompt=decode_input,
@@ -1102,6 +1191,10 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
+            next_input = merge_scheduling_metadata_into_request_input(
+                next_input,
+                req_state.scheduling_metadata,
+            )
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(next_client, "model_stage", None)
@@ -1159,10 +1252,14 @@ class Orchestrator:
             req_state.stage_submit_ts[next_stage_id] = _time.time()
 
             if next_pool.stage_type == "diffusion":
+                prewarm_prompt = merge_scheduling_metadata_into_request_input(
+                    req_state.prompt,
+                    req_state.scheduling_metadata,
+                )
                 await next_pool.submit_initial(
                     request_id,
                     req_state,
-                    req_state.prompt,
+                    prewarm_prompt,
                     submit_kwargs={
                         "kv_sender_info": self._build_kv_sender_info(
                             list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
@@ -1189,6 +1286,10 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
+                base_input = merge_scheduling_metadata_into_prompt(
+                    base_input,
+                    req_state.scheduling_metadata,
+                )
 
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,

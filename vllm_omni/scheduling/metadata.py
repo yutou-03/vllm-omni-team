@@ -28,6 +28,20 @@ _CLIENT_FIELDS = frozenset(
     }
 )
 _REQUEST_PATHS = frozenset({"text", "audio"})
+_SERVER_FIELDS = frozenset(
+    {
+        "sched_schema_version",
+        "sched_source_request_id",
+        "sched_ingress_order",
+        "sched_ingress_monotonic_s",
+        "sched_ingress_wall_s",
+        "sched_deadline_monotonic_s",
+        "sched_slo_ms",
+        "sched_request_path",
+        "sched_predicted_stage_ms",
+        "sched_predicted_stage_work_units",
+    }
+)
 
 
 def _finite_number(value: Any, *, field: str, context: str) -> float:
@@ -239,3 +253,121 @@ def build_client_scheduling_metadata(
         }
     )
     return normalize_client_scheduling_metadata(raw_metadata)
+
+
+def build_server_scheduling_metadata(
+    raw_metadata: Mapping[str, Any],
+    *,
+    ingress_monotonic_s: float,
+    ingress_wall_s: float,
+    context: str = CLIENT_SCHEDULING_FIELD,
+) -> dict[str, Any]:
+    """Validate client metadata and add server-owned ingress timestamps.
+
+    Absolute deadlines are deliberately computed from the server's monotonic
+    clock. Clients can specify an SLO duration, but cannot choose the absolute
+    deadline used by the scheduler.
+    """
+
+    normalized = normalize_client_scheduling_metadata(
+        raw_metadata,
+        context=context,
+    )
+    monotonic_s = _finite_number(
+        ingress_monotonic_s,
+        field="ingress_monotonic_s",
+        context=context,
+    )
+    wall_s = _finite_number(
+        ingress_wall_s,
+        field="ingress_wall_s",
+        context=context,
+    )
+    if monotonic_s < 0 or wall_s < 0:
+        raise ValueError(
+            f"{context}: server ingress timestamps must be non-negative"
+        )
+
+    server_metadata: dict[str, Any] = {
+        "sched_schema_version": normalized["schema_version"],
+        "sched_source_request_id": normalized["source_request_id"],
+        "sched_ingress_order": normalized["ingress_order"],
+        "sched_ingress_monotonic_s": monotonic_s,
+        "sched_ingress_wall_s": wall_s,
+    }
+    for field in (
+        "slo_ms",
+        "request_path",
+        "predicted_stage_ms",
+        "predicted_stage_work_units",
+    ):
+        if field in normalized:
+            server_metadata[f"sched_{field}"] = normalized[field]
+
+    slo_ms = normalized.get("slo_ms")
+    if slo_ms is not None:
+        server_metadata["sched_deadline_monotonic_s"] = (
+            monotonic_s + slo_ms / 1000.0
+        )
+    return server_metadata
+
+
+def extract_scheduling_metadata(
+    additional_information: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the scheduling subset from a decoded Omni payload."""
+
+    if not isinstance(additional_information, Mapping):
+        return None
+    meta = additional_information.get("meta")
+    if not isinstance(meta, Mapping):
+        return None
+    scheduling = {
+        str(key): value
+        for key, value in meta.items()
+        if str(key) in _SERVER_FIELDS
+    }
+    return scheduling or None
+
+
+def merge_scheduling_metadata_into_additional_information(
+    additional_information: Mapping[str, Any] | None,
+    scheduling_metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Copy an Omni payload and merge canonical ``sched_*`` meta fields."""
+
+    merged = dict(additional_information or {})
+    if not scheduling_metadata:
+        return merged
+    invalid_fields = [
+        str(field)
+        for field in scheduling_metadata
+        if str(field) not in _SERVER_FIELDS
+    ]
+    if invalid_fields:
+        raise ValueError(
+            "scheduling metadata contains non-canonical fields "
+            f"{sorted(invalid_fields)!r}"
+        )
+    meta = dict(merged.get("meta") or {})
+    meta.update(scheduling_metadata)
+    merged["meta"] = meta
+    return merged
+
+
+def merge_scheduling_metadata_into_prompt(
+    prompt: Any,
+    scheduling_metadata: Mapping[str, Any] | None,
+) -> Any:
+    """Attach scheduling metadata to a prompt without discarding other data."""
+
+    if not scheduling_metadata or not isinstance(prompt, dict):
+        return prompt
+    merged_prompt = dict(prompt)
+    merged_prompt["additional_information"] = (
+        merge_scheduling_metadata_into_additional_information(
+            prompt.get("additional_information"),
+            scheduling_metadata,
+        )
+    )
+    return merged_prompt

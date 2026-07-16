@@ -3,7 +3,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any, Final, cast
@@ -106,8 +106,30 @@ from vllm_omni.entrypoints.openai.utils import (
 )
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.scheduling.metadata import (
+    CLIENT_SCHEDULING_FIELD,
+    build_server_scheduling_metadata,
+    merge_scheduling_metadata_into_prompt,
+)
 
 logger = init_logger(__name__)
+
+
+def _extract_client_scheduling_metadata(request: Any) -> Any | None:
+    """Read the extra scheduling object from either supported client shape."""
+
+    direct = getattr(request, CLIENT_SCHEDULING_FIELD, None)
+    if direct is not None:
+        return direct
+    model_extra = getattr(request, "model_extra", None)
+    if isinstance(model_extra, Mapping):
+        raw_metadata = model_extra.get(CLIENT_SCHEDULING_FIELD)
+        if raw_metadata is not None:
+            return raw_metadata
+    extra_body = getattr(request, "extra_body", None)
+    if isinstance(extra_body, Mapping):
+        return extra_body.get(CLIENT_SCHEDULING_FIELD)
+    return None
 
 
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
@@ -182,6 +204,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if self._diffusion_mode:
             return await self._create_diffusion_chat_completion(request, raw_request)
 
+        ingress_monotonic_s = time.monotonic()
+        ingress_wall_s = time.time()
+
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -192,6 +217,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # success status before we actually start generating text :).
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
+        scheduling_metadata: dict[str, Any] | None = None
+        raw_scheduling_metadata = _extract_client_scheduling_metadata(request)
+        if raw_scheduling_metadata is not None:
+            try:
+                scheduling_metadata = build_server_scheduling_metadata(
+                    raw_scheduling_metadata,
+                    ingress_monotonic_s=ingress_monotonic_s,
+                    ingress_wall_s=ingress_wall_s,
+                )
+            except (TypeError, ValueError) as error:
+                return self.create_error_response(str(error))
 
         try:
             lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
@@ -298,6 +335,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
 
+        if scheduling_metadata is not None:
+            emit_stage_event(
+                "request_ingress",
+                stage_id="frontend",
+                request_id=request_id,
+                **scheduling_metadata,
+            )
+
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
@@ -396,6 +441,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             _image_gen_height = None
             _image_gen_width = None
 
+        if scheduling_metadata is not None:
+            engine_prompts = [
+                merge_scheduling_metadata_into_prompt(
+                    engine_prompt,
+                    scheduling_metadata,
+                )
+                for engine_prompt in engine_prompts
+            ]
+
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
@@ -437,6 +491,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
                     output_modalities=output_modalities,
+                    scheduling_metadata=scheduling_metadata,
                 )
 
                 generators.append(generator)

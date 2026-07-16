@@ -2,6 +2,9 @@ import pytest
 
 from vllm_omni.scheduling.metadata import (
     build_client_scheduling_metadata,
+    build_server_scheduling_metadata,
+    extract_scheduling_metadata,
+    merge_scheduling_metadata_into_additional_information,
     normalize_client_scheduling_metadata,
 )
 
@@ -71,3 +74,46 @@ def test_build_client_scheduling_metadata_normalizes_stage_mapping():
 def test_invalid_client_scheduling_metadata_fails_early(metadata, message):
     with pytest.raises(ValueError, match=message):
         normalize_client_scheduling_metadata(metadata)
+
+
+def test_server_metadata_owns_ingress_and_absolute_deadline():
+    metadata = build_server_scheduling_metadata(
+        {
+            "schema_version": 1,
+            "source_request_id": "request-9",
+            "ingress_order": 9,
+            "slo_ms": 2500,
+            "request_path": "text",
+        },
+        ingress_monotonic_s=100.25,
+        ingress_wall_s=1700000000.5,
+    )
+
+    assert metadata == {
+        "sched_schema_version": 1,
+        "sched_source_request_id": "request-9",
+        "sched_ingress_order": 9,
+        "sched_ingress_monotonic_s": 100.25,
+        "sched_ingress_wall_s": 1700000000.5,
+        "sched_slo_ms": 2500.0,
+        "sched_request_path": "text",
+        "sched_deadline_monotonic_s": 102.75,
+    }
+
+
+def test_scheduling_merge_preserves_existing_payload_fields():
+    scheduling = {
+        "sched_schema_version": 1,
+        "sched_source_request_id": "request-2",
+    }
+    merged = merge_scheduling_metadata_into_additional_information(
+        {
+            "speaker": ["default"],
+            "meta": {"codec_streaming": True},
+        },
+        scheduling,
+    )
+
+    assert merged["speaker"] == ["default"]
+    assert merged["meta"]["codec_streaming"] is True
+    assert extract_scheduling_metadata(merged) == scheduling

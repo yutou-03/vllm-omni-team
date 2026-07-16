@@ -214,6 +214,27 @@ class TestSerializeDeserializePayload:
         assert restored["meta"]["ar_width"] == 4
         assert torch.equal(restored["codes"]["audio"], original["codes"]["audio"])
 
+    def test_scheduling_metadata_round_trip(self):
+        original: OmniPayload = {
+            "meta": {
+                "sched_schema_version": 1,
+                "sched_source_request_id": "request-3",
+                "sched_ingress_order": 3,
+                "sched_ingress_monotonic_s": 12.5,
+                "sched_ingress_wall_s": 1700000000.0,
+                "sched_deadline_monotonic_s": 14.0,
+                "sched_slo_ms": 1500.0,
+                "sched_request_path": "audio",
+                "sched_predicted_stage_ms": [10.0, None, 90.0],
+                "sched_predicted_stage_work_units": [4.0, None, 80.0],
+            }
+        }
+
+        wire = serialize_payload(original)
+        restored = deserialize_payload(wire)
+
+        assert restored == original
+
     def test_hidden_states_layers_round_trip(self):
         original = {
             "hidden_states": {

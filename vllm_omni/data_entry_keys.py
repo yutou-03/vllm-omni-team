@@ -88,6 +88,16 @@ class OmniPayloadMeta(TypedDict, total=False):
     codec_streaming: bool
     ref_code_len: int
     talker_prefill_offset: int
+    sched_schema_version: int
+    sched_source_request_id: str
+    sched_ingress_order: int
+    sched_ingress_monotonic_s: float
+    sched_ingress_wall_s: float
+    sched_deadline_monotonic_s: float
+    sched_slo_ms: float
+    sched_request_path: str
+    sched_predicted_stage_ms: list[float | None]
+    sched_predicted_stage_work_units: list[float | None]
 
 
 class OmniPayload(TypedDict, total=False):

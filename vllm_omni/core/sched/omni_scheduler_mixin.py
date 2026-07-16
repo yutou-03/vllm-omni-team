@@ -1,18 +1,50 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
+from vllm_omni.profiling.nvtx import nvtx_range
 from vllm_omni.profiling.stage_queue_trace import (
     emit_iteration_event,
     emit_stage_event,
 )
-from vllm_omni.profiling.nvtx import nvtx_range
+from vllm_omni.scheduling.metadata import (
+    extract_scheduling_metadata,
+    merge_scheduling_metadata_into_additional_information,
+)
 
 _STATS_INTERVAL_S = 1.0
+
+
+def preserve_streaming_scheduling_metadata(
+    existing_additional_information: Any,
+    incoming_additional_information: Any,
+) -> Any:
+    """Keep server-owned scheduling fields across a streaming replacement."""
+
+    existing = deserialize_additional_information(
+        existing_additional_information
+    )
+    scheduling_metadata = extract_scheduling_metadata(existing)
+    if not scheduling_metadata:
+        return incoming_additional_information or None
+    incoming = deserialize_additional_information(
+        incoming_additional_information
+    )
+    merged = merge_scheduling_metadata_into_additional_information(
+        incoming,
+        scheduling_metadata,
+    )
+    return serialize_additional_information(merged)
+
 
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
@@ -137,7 +169,10 @@ class OmniSchedulerMixin:
         session._all_token_ids.extend(new_prompt)
         session.num_computed_tokens = 0
         session.prompt_token_ids = update.prompt_token_ids or ()
-        session.additional_information = update.additional_information or None
+        session.additional_information = preserve_streaming_scheduling_metadata(
+            session.additional_information,
+            update.additional_information,
+        )
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)

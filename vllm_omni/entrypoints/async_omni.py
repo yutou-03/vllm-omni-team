@@ -39,6 +39,7 @@ from vllm_omni.profiling.nvtx import (
     nvtx_mark,
     nvtx_range,
 )
+from vllm_omni.scheduling.metadata import merge_scheduling_metadata_into_prompt
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
@@ -249,6 +250,7 @@ class AsyncOmni(EngineClient, OmniBase):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
+        scheduling_metadata: Mapping[str, Any] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -325,6 +327,20 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state.request_arrival_ts = wall_start_ts
             self.request_states[request_id] = req_state
 
+            if isinstance(prompt, list):
+                prompt = [
+                    merge_scheduling_metadata_into_prompt(
+                        item,
+                        scheduling_metadata,
+                    )
+                    for item in prompt
+                ]
+            elif not isinstance(prompt, AsyncGenerator):
+                prompt = merge_scheduling_metadata_into_prompt(
+                    prompt,
+                    scheduling_metadata,
+                )
+
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
             pd_pair = self._get_pd_separation_pair()
@@ -344,6 +360,7 @@ class AsyncOmni(EngineClient, OmniBase):
                         input_stream=prompt,
                         sampling_params_list=req_sp_list,
                         final_stage_id=final_stage_id_for_e2e,
+                        scheduling_metadata=scheduling_metadata,
                     )
                 else:
                     await self.engine.add_request_async(
@@ -391,6 +408,7 @@ class AsyncOmni(EngineClient, OmniBase):
         input_stream: AsyncGenerator[StreamingInput, None],
         sampling_params_list: Sequence[OmniSamplingParams],
         final_stage_id: int,
+        scheduling_metadata: Mapping[str, Any] | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -416,7 +434,10 @@ class AsyncOmni(EngineClient, OmniBase):
                     self._validate_streaming_input_sampling_params(chunk_params)
                     chunk_sampling_params_list = list(sampling_params_list)
                     chunk_sampling_params_list[0] = chunk_params
-                    chunk_prompt = chunk.prompt
+                    chunk_prompt = merge_scheduling_metadata_into_prompt(
+                        chunk.prompt,
+                        scheduling_metadata,
+                    )
                     prompt_text, _, _ = extract_prompt_components(self.model_config, chunk_prompt)
 
                     if not has_submitted_first_chunk:
@@ -448,7 +469,10 @@ class AsyncOmni(EngineClient, OmniBase):
                     # finished. Don't send if canceled (session was aborted).
                     final_sampling_params_list = list(sampling_params_list)
                     final_sampling_params_list[0] = stage0_params
-                    final_prompt = TokensPrompt(prompt_token_ids=[0])
+                    final_prompt = merge_scheduling_metadata_into_prompt(
+                        TokensPrompt(prompt_token_ids=[0]),
+                        scheduling_metadata,
+                    )
 
                     if has_submitted_first_chunk:
                         await self.engine.add_streaming_update_async(
