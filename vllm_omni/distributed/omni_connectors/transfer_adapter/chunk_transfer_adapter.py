@@ -9,7 +9,9 @@ import torch
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
+from vllm_omni.scheduling.metadata import preserve_scheduling_metadata
 
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
@@ -155,13 +157,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data, size = result
 
         if payload_data:
+            previous_additional_information = deserialize_additional_information(
+                getattr(request, "additional_information", None)
+            )
             # Update connector state
             self.get_req_chunk[req_id] += 1
 
             meta = payload_data.get("meta", {})
             if self.model_mode == "ar":
                 merged_payload = self._update_request_payload(external_req_id, payload_data)
-                request.additional_information = merged_payload
+                request.additional_information = preserve_scheduling_metadata(
+                    previous_additional_information,
+                    merged_payload,
+                )
                 if meta.get("finished"):
                     self.finished_requests.add(req_id)
             else:
@@ -170,8 +178,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("codes", {}).get("audio", [])
                 request.prompt_token_ids = new_ids
-                prev_info = getattr(request, "additional_information", None)
-                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                info = dict(previous_additional_information)
                 for key, value in payload_data.items():
                     if key == "codes":
                         continue
@@ -185,7 +192,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         info[key] = merged_sub
                         continue
                     info[key] = value
-                request.additional_information = info
+                request.additional_information = preserve_scheduling_metadata(
+                    previous_additional_information,
+                    info,
+                )
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.

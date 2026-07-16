@@ -6,6 +6,7 @@ from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     merge_scheduling_metadata_into_additional_information,
     normalize_client_scheduling_metadata,
+    preserve_scheduling_metadata,
 )
 
 
@@ -117,3 +118,26 @@ def test_scheduling_merge_preserves_existing_payload_fields():
     assert merged["speaker"] == ["default"]
     assert merged["meta"]["codec_streaming"] is True
     assert extract_scheduling_metadata(merged) == scheduling
+
+
+def test_runtime_payload_replacement_preserves_server_scheduling_fields():
+    existing = {
+        "meta": {
+            "sched_source_request_id": "source-1",
+            "sched_deadline_monotonic_s": 123.0,
+        }
+    }
+    incoming = {
+        "codes": {"audio": [1]},
+        "meta": {
+            "finished": True,
+            "sched_deadline_monotonic_s": -1.0,
+        },
+    }
+
+    merged = preserve_scheduling_metadata(existing, incoming)
+
+    assert merged["codes"] == {"audio": [1]}
+    assert merged["meta"]["finished"] is True
+    assert merged["meta"]["sched_source_request_id"] == "source-1"
+    assert merged["meta"]["sched_deadline_monotonic_s"] == 123.0

@@ -355,6 +355,18 @@ def merge_scheduling_metadata_into_additional_information(
     return merged
 
 
+def preserve_scheduling_metadata(
+    existing_additional_information: Mapping[str, Any] | None,
+    incoming_additional_information: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Replace a runtime payload without losing server-owned policy fields."""
+
+    return merge_scheduling_metadata_into_additional_information(
+        incoming_additional_information,
+        extract_scheduling_metadata(existing_additional_information),
+    )
+
+
 def merge_scheduling_metadata_into_prompt(
     prompt: Any,
     scheduling_metadata: Mapping[str, Any] | None,

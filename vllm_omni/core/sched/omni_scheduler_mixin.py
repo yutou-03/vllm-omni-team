@@ -18,7 +18,7 @@ from vllm_omni.profiling.stage_queue_trace import (
 )
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
-    merge_scheduling_metadata_into_additional_information,
+    preserve_scheduling_metadata,
 )
 from vllm_omni.scheduling.policy import (
     BaselineSchedulingPolicy,
@@ -40,16 +40,12 @@ def preserve_streaming_scheduling_metadata(
     existing = deserialize_additional_information(
         existing_additional_information
     )
-    scheduling_metadata = extract_scheduling_metadata(existing)
-    if not scheduling_metadata:
+    if not extract_scheduling_metadata(existing):
         return incoming_additional_information or None
     incoming = deserialize_additional_information(
         incoming_additional_information
     )
-    merged = merge_scheduling_metadata_into_additional_information(
-        incoming,
-        scheduling_metadata,
-    )
+    merged = preserve_scheduling_metadata(existing, incoming)
     return serialize_additional_information(merged)
 
 
