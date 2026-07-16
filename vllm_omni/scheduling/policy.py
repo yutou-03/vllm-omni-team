@@ -184,7 +184,7 @@ def policy_key(
                 request_id=request_id,
             )
         )
-        return deadline, ingress_order, source_request_id
+        return deadline, ingress_order, source_request_id, request_id
 
     if policy is BaselineSchedulingPolicy.SRPF_LOCAL_NP:
         total_ms = _required_stage_value(
@@ -208,6 +208,6 @@ def policy_key(
         ready_time = float(data_ready_time)
         if not math.isfinite(ready_time):
             raise ValueError("data_ready_time must be finite")
-        return remaining_ms, ready_time, source_request_id
+        return remaining_ms, ready_time, source_request_id, request_id
 
     raise AssertionError(f"unhandled baseline policy {policy!r}")

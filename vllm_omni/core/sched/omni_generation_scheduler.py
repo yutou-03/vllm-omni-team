@@ -42,6 +42,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self._initialize_baseline_scheduling()
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -92,6 +93,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.events.clear()
                 request.record_event(EngineCoreEventType.QUEUED)
                 request._omni_first_real_chunk_handled = True
+
+        self._baseline_prepare_schedule()
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
@@ -378,7 +381,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
-        return super().finish_requests(request_ids, finished_status)
+        result = super().finish_requests(request_ids, finished_status)
+        self._baseline_forget_request_ids(request_ids)
+        return result
 
     """
     Scheduler for the diffusion model.

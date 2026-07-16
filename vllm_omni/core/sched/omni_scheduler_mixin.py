@@ -20,6 +20,13 @@ from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     merge_scheduling_metadata_into_additional_information,
 )
+from vllm_omni.scheduling.policy import (
+    BaselineSchedulingPolicy,
+    get_baseline_scheduling_policy,
+    policy_applies_to_stage,
+    policy_key,
+)
+from vllm_omni.scheduling.request_queue import maybe_create_policy_ordered_queue
 
 _STATS_INTERVAL_S = 1.0
 
@@ -58,6 +65,100 @@ def extract_request_scheduling_trace_fields(request: Any) -> dict[str, Any]:
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
+    def _initialize_baseline_scheduling(self) -> None:
+        """Configure optional baseline ordering after the native scheduler init."""
+
+        self._baseline_policy = get_baseline_scheduling_policy()
+        self._baseline_stage_id = int(self._omni_stage_id_for_trace())
+        self._baseline_data_ready_time: dict[str, float] = {}
+
+        if not self._baseline_policy_applies():
+            return
+        if self._baseline_policy is BaselineSchedulingPolicy.SRPF_LOCAL_NP:
+            raise RuntimeError(
+                "srpf_local_np is disabled until a frozen stage predictor "
+                "passes the calibration gate"
+            )
+
+        self.waiting = maybe_create_policy_ordered_queue(
+            self.waiting,
+            policy=self._baseline_policy,
+            stage_id=self._baseline_stage_id,
+            data_ready_time=self._baseline_request_data_ready_time,
+        )
+        self.skipped_waiting = maybe_create_policy_ordered_queue(
+            self.skipped_waiting,
+            policy=self._baseline_policy,
+            stage_id=self._baseline_stage_id,
+            data_ready_time=self._baseline_request_data_ready_time,
+        )
+
+    def _baseline_policy_applies(self) -> bool:
+        policy = getattr(
+            self,
+            "_baseline_policy",
+            BaselineSchedulingPolicy.NATIVE_FCFS,
+        )
+        stage_id = int(
+            getattr(
+                self,
+                "_baseline_stage_id",
+                self._omni_stage_id_for_trace(),
+            )
+        )
+        return policy_applies_to_stage(policy, stage_id)
+
+    def _baseline_request_data_ready_time(self, request: Request) -> float:
+        return self._baseline_data_ready_time.get(request.request_id, float("inf"))
+
+    def _baseline_request_key(self, request: Request):
+        return policy_key(
+            request,
+            policy=self._baseline_policy,
+            stage_id=self._baseline_stage_id,
+            data_ready_time=self._baseline_request_data_ready_time(request),
+            now=time.monotonic(),
+        )
+
+    def _baseline_request_is_ready_on_add(self) -> bool:
+        if self._baseline_stage_id == 0:
+            return True
+        return getattr(self, "chunk_transfer_adapter", None) is None
+
+    def _baseline_validate_and_track_admission(self, request: Request) -> None:
+        if not self._baseline_policy_applies():
+            return
+        if self._baseline_request_is_ready_on_add():
+            self._baseline_data_ready_time.setdefault(
+                request.request_id,
+                time.monotonic(),
+            )
+        self._baseline_request_key(request)
+
+    def _baseline_prepare_schedule(self) -> None:
+        """Refresh data-ready times and order runnable requests in place."""
+
+        if not self._baseline_policy_applies():
+            return
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            ready_time = time.monotonic()
+            for request_id in adapter.requests_with_ready_chunks:
+                self._baseline_data_ready_time.setdefault(request_id, ready_time)
+        self.running.sort(key=self._baseline_request_key)
+
+    def _baseline_forget_request_ids(self, request_ids: Any) -> None:
+        ready_times = getattr(self, "_baseline_data_ready_time", None)
+        if ready_times is None:
+            return
+        if request_ids is None:
+            ready_times.clear()
+            return
+        if isinstance(request_ids, str):
+            request_ids = (request_ids,)
+        for request_id in request_ids:
+            ready_times.pop(request_id, None)
+
     def _omni_stage_id_for_trace(self) -> int | str:
         return getattr(self.vllm_config.model_config, "stage_id", "?")
 
@@ -70,6 +171,7 @@ class OmniSchedulerMixin:
         stage_id = self._omni_stage_id_for_trace()
         request_id = getattr(request, "request_id", None)
         scheduling_fields = extract_request_scheduling_trace_fields(request)
+        self._baseline_validate_and_track_admission(request)
         emit_stage_event(
             "server_receive",
             stage_id=stage_id,
@@ -93,6 +195,25 @@ class OmniSchedulerMixin:
         else:
             result = super().add_request(request, *args, **kwargs)
         return result
+
+    def _select_waiting_queue_for_scheduling(self):
+        if not self._baseline_policy_applies():
+            return super()._select_waiting_queue_for_scheduling()
+        if self.waiting and self.skipped_waiting:
+            waiting_key = self._baseline_request_key(
+                self.waiting.peek_request()
+            )
+            skipped_key = self._baseline_request_key(
+                self.skipped_waiting.peek_request()
+            )
+            return self.waiting if waiting_key <= skipped_key else self.skipped_waiting
+        return self.waiting or self.skipped_waiting or None
+
+    def _free_request(self, request: Request, *args, **kwargs):
+        try:
+            return super()._free_request(request, *args, **kwargs)
+        finally:
+            self._baseline_forget_request_ids(request.request_id)
 
     def _trace_scheduler_output( 
         self,

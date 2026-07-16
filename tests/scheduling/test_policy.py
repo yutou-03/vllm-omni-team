@@ -117,8 +117,8 @@ def test_srpf_remaining_prediction_is_monotonic_and_stage_local():
         now=3.0,
     )
 
-    assert first_key == (50.0, 1.0, "source-a")
-    assert second_key == (20.0, 1.0, "source-a")
+    assert first_key == (50.0, 1.0, "source-a", "engine-a")
+    assert second_key == (20.0, 1.0, "source-a", "engine-a")
     assert second_key < first_key
     assert predict_remaining_ms(
         total_predicted_ms=100,

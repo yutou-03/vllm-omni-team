@@ -80,6 +80,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._initialize_baseline_scheduling()
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -216,6 +217,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.events.clear()
                 request.record_event(EngineCoreEventType.QUEUED)
                 request._omni_first_real_chunk_handled = True
+
+        self._baseline_prepare_schedule()
 
         try:
             with (
@@ -686,7 +689,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
-        return super().finish_requests(request_ids, finished_status)
+        result = super().finish_requests(request_ids, finished_status)
+        self._baseline_forget_request_ids(request_ids)
+        return result
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
@@ -709,6 +714,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         assert request.is_finished()
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+        self._baseline_forget_request_ids(request.request_id)
 
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
