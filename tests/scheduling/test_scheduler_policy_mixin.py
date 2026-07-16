@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from types import SimpleNamespace
 
 import pytest
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.profiling import stage_queue_trace
 from vllm_omni.scheduling.policy import BASELINE_POLICY_ENV
 from vllm_omni.scheduling.request_queue import PolicyOrderedRequestQueue
 
@@ -148,3 +151,54 @@ def test_request_cleanup_removes_data_ready_state(monkeypatch):
 
     scheduler._free_request(request)
     assert request.request_id not in scheduler._baseline_data_ready_time
+
+
+def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "final_deadline_edf_np")
+    monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
+    scheduler = SchedulerHarness(0)
+    scheduler.max_num_running_reqs = 1
+    scheduler.max_num_scheduled_tokens = 1
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.25)
+    later = FakeRequest("later", deadline=20.0, ingress_order=0)
+    earlier = FakeRequest("earlier", deadline=10.0, ingress_order=1)
+    scheduler.add_request(later)
+    scheduler.add_request(earlier)
+
+    scheduler._baseline_prepare_schedule(token_budget_before=1)
+    captured = {}
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_iteration_event",
+        lambda **fields: captured.update(fields),
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"earlier": 1},
+        total_num_scheduled_tokens=1,
+        preempted_req_ids=set(),
+    )
+    scheduler._trace_scheduler_output(
+        scheduler_output,
+        iteration_id=3,
+        timestamp_start=1.0,
+        timestamp_end=1.1,
+        num_running_before=0,
+        num_waiting_before=2,
+    )
+
+    assert captured["policy"] == "final_deadline_edf_np"
+    assert captured["runnable_req_ids"] == ["earlier", "later"]
+    assert captured["policy_keys"]["earlier"][:2] == [10.0, 1]
+    assert captured["selected_req_ids"] == ["earlier"]
+    assert captured["num_scheduled_tokens"] == {"earlier": 1}
+    assert captured["token_budget_before"] == 1
+    assert captured["token_budget_after"] == 0
+    assert captured["sequence_slots_before"] == 1
+    assert captured["ineligible_reasons"] == {}
+    assert captured["policy_activation"] is True
+
+
+def test_conformance_trace_default_path_is_safe_temp_directory():
+    assert stage_queue_trace._DEFAULT_TRACE_DIR.startswith(
+        tempfile.gettempdir() + os.sep
+    )
+    assert "motivation/stage_queue" not in stage_queue_trace._DEFAULT_TRACE_DIR

@@ -13,6 +13,8 @@ from vllm_omni.engine.serialization import (
 )
 from vllm_omni.profiling.nvtx import nvtx_range
 from vllm_omni.profiling.stage_queue_trace import (
+    ConformanceIneligibleReason,
+    conformance_trace_enabled,
     emit_iteration_event,
     emit_stage_event,
 )
@@ -67,6 +69,7 @@ class OmniSchedulerMixin:
         self._baseline_policy = get_baseline_scheduling_policy()
         self._baseline_stage_id = int(self._omni_stage_id_for_trace())
         self._baseline_data_ready_time: dict[str, float] = {}
+        self._baseline_conformance_snapshot: dict[str, Any] | None = None
 
         if not self._baseline_policy_applies():
             return
@@ -131,17 +134,142 @@ class OmniSchedulerMixin:
             )
         self._baseline_request_key(request)
 
-    def _baseline_prepare_schedule(self) -> None:
+    def _baseline_prepare_schedule(
+        self,
+        *,
+        token_budget_before: int | None = None,
+    ) -> None:
         """Refresh data-ready times and order runnable requests in place."""
 
-        if not self._baseline_policy_applies():
+        if self._baseline_policy_applies():
+            adapter = getattr(self, "chunk_transfer_adapter", None)
+            if adapter is not None:
+                ready_time = time.monotonic()
+                for request_id in adapter.requests_with_ready_chunks:
+                    self._baseline_data_ready_time.setdefault(request_id, ready_time)
+            self.running.sort(key=self._baseline_request_key)
+        self._baseline_capture_conformance_snapshot(
+            token_budget_before=token_budget_before,
+        )
+
+    def _baseline_capture_conformance_snapshot(
+        self,
+        *,
+        token_budget_before: int | None,
+    ) -> None:
+        """Freeze scheduler inputs needed to replay one policy decision."""
+
+        if not conformance_trace_enabled():
+            self._baseline_conformance_snapshot = None
             return
+
+        running = list(self.running)
+        waiting = list(self.waiting)
+        skipped_waiting = list(getattr(self, "skipped_waiting", ()))
+        max_running = int(getattr(self, "max_num_running_reqs", len(running)))
+        sequence_slots = max(max_running - len(running), 0)
+        if token_budget_before is None:
+            token_budget_before = int(
+                getattr(self, "max_num_scheduled_tokens", 0)
+            )
+
+        ineligible_reasons: dict[str, str] = {}
+        request_locations: dict[str, str] = {}
+        policy_domains: dict[str, str] = {}
+        ordered_requests: list[Request] = []
+        seen_request_ids: set[str] = set()
+
+        def add_requests(requests: list[Request], location: str) -> None:
+            for request in requests:
+                request_id = str(request.request_id)
+                if request_id in seen_request_ids:
+                    continue
+                seen_request_ids.add(request_id)
+                request_locations[request_id] = location
+                policy_domains[request_id] = (
+                    "running" if location == "running" else "waiting"
+                )
+                status_name = getattr(
+                    getattr(request, "status", None),
+                    "name",
+                    str(getattr(request, "status", "")),
+                ).lower()
+                if "finished" in status_name:
+                    ineligible_reasons[request_id] = (
+                        ConformanceIneligibleReason.FINISHED.value
+                    )
+                    continue
+                if "waiting_for_input" in status_name:
+                    ineligible_reasons[request_id] = (
+                        ConformanceIneligibleReason.WAITING_FOR_INPUT.value
+                    )
+                    continue
+                if "waiting_for_chunk" in status_name:
+                    ineligible_reasons[request_id] = (
+                        ConformanceIneligibleReason.WAITING_FOR_CHUNK.value
+                    )
+                    continue
+                if location != "running" and sequence_slots == 0:
+                    ineligible_reasons[request_id] = (
+                        ConformanceIneligibleReason.NONPREEMPTIVE_RUNNING_CAPACITY.value
+                    )
+                    continue
+                if token_budget_before <= 0:
+                    ineligible_reasons[request_id] = (
+                        ConformanceIneligibleReason.TOKEN_BUDGET_EXHAUSTED.value
+                    )
+                    continue
+                ordered_requests.append(request)
+
+        add_requests(running, "running")
+        add_requests(waiting, "waiting")
+        add_requests(skipped_waiting, "skipped_waiting")
+
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
-            ready_time = time.monotonic()
-            for request_id in adapter.requests_with_ready_chunks:
-                self._baseline_data_ready_time.setdefault(request_id, ready_time)
-        self.running.sort(key=self._baseline_request_key)
+            for attribute in (
+                "waiting_for_chunk_running_requests",
+                "waiting_for_chunk_waiting_requests",
+            ):
+                for request in list(getattr(adapter, attribute, ())):
+                    request_id = str(request.request_id)
+                    ineligible_reasons[request_id] = (
+                        ConformanceIneligibleReason.WAITING_FOR_CHUNK.value
+                    )
+                    request_locations.setdefault(request_id, attribute)
+
+        runnable_req_ids = [str(request.request_id) for request in ordered_requests]
+        policy_keys: dict[str, list[float | int | str]] = {}
+        if self._baseline_policy_applies():
+            for request in ordered_requests:
+                policy_keys[str(request.request_id)] = list(
+                    self._baseline_request_key(request)
+                )
+            policy_key_kind = "baseline_policy_key"
+        else:
+            domain_offsets = {"running": 0, "waiting": 0}
+            for request in ordered_requests:
+                request_id = str(request.request_id)
+                domain = policy_domains[request_id]
+                policy_keys[request_id] = [
+                    domain,
+                    domain_offsets[domain],
+                ]
+                domain_offsets[domain] += 1
+            policy_key_kind = "native_queue_order"
+
+        self._baseline_conformance_snapshot = {
+            "policy": self._baseline_policy.value,
+            "policy_applies_to_stage": self._baseline_policy_applies(),
+            "policy_key_kind": policy_key_kind,
+            "runnable_req_ids": runnable_req_ids,
+            "policy_keys": policy_keys,
+            "policy_domains": policy_domains,
+            "request_locations": request_locations,
+            "ineligible_reasons": ineligible_reasons,
+            "token_budget_before": token_budget_before,
+            "sequence_slots_before": sequence_slots,
+        }
 
     def _baseline_forget_request_ids(self, request_ids: Any) -> None:
         ready_times = getattr(self, "_baseline_data_ready_time", None)
@@ -211,7 +339,7 @@ class OmniSchedulerMixin:
         finally:
             self._baseline_forget_request_ids(request.request_id)
 
-    def _trace_scheduler_output( 
+    def _trace_scheduler_output(
         self,
         scheduler_output,
         *,
@@ -233,6 +361,44 @@ class OmniSchedulerMixin:
             )
             or 0
         )
+        conformance = self._baseline_conformance_snapshot or {}
+        runnable_req_ids = list(conformance.get("runnable_req_ids", ()))
+        runnable_set = set(runnable_req_ids)
+        selected_set = set(scheduled_req_ids) & runnable_set
+        policy_domains = conformance.get("policy_domains", {})
+        policy_activation = False
+        for domain in set(policy_domains.values()):
+            domain_ids = {
+                request_id
+                for request_id in runnable_set
+                if policy_domains.get(request_id) == domain
+            }
+            if (
+                len(domain_ids) >= 2
+                and selected_set & domain_ids
+                and domain_ids - selected_set
+            ):
+                policy_activation = True
+                break
+        token_budget_before = conformance.get("token_budget_before")
+        token_budget_after = (
+            max(int(token_budget_before) - total_num_scheduled_tokens, 0)
+            if token_budget_before is not None
+            else None
+        )
+        max_running = int(getattr(self, "max_num_running_reqs", len(self.running)))
+        conformance_fields = dict(conformance)
+        if conformance:
+            conformance_fields.update(
+                selected_req_ids=scheduled_req_ids,
+                num_scheduled_tokens={
+                    str(request_id): int(num_tokens)
+                    for request_id, num_tokens in num_scheduled_tokens.items()
+                },
+                token_budget_after=token_budget_after,
+                sequence_slots_after=max(max_running - len(self.running), 0),
+                policy_activation=policy_activation,
+            )
         emit_iteration_event(
             stage_id=stage_id,
             iteration_id=iteration_id,
@@ -247,7 +413,9 @@ class OmniSchedulerMixin:
             scheduled_req_ids=scheduled_req_ids,
             preempted_req_ids=list(getattr(scheduler_output, "preempted_req_ids", set()) or []),
             kv_cache_usage=getattr(self.kv_cache_manager, "usage", None),
+            **conformance_fields,
         )
+        self._baseline_conformance_snapshot = None
         emit_stage_event(
             "stage_schedule_done",
             stage_id=stage_id,

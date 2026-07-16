@@ -94,7 +94,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.record_event(EngineCoreEventType.QUEUED)
                 request._omni_first_real_chunk_handled = True
 
-        self._baseline_prepare_schedule()
+        self._baseline_prepare_schedule(token_budget_before=token_budget)
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled

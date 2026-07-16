@@ -2,21 +2,51 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from enum import Enum
 from typing import Any
 
 from vllm_omni.profiling.nvtx import nvtx_range
 
-_DEFAULT_TRACE_DIR = "/home/zhongyu/project/motivation/stage_queue/logs/server_trace"
+_DEFAULT_TRACE_DIR = os.path.join(
+    tempfile.gettempdir(),
+    "vllm_omni_stage_queue_trace",
+)
 _TRACE_DIR = os.environ.get("STAGE_QUEUE_TRACE_DIR", _DEFAULT_TRACE_DIR)
 _RUN_ID = os.environ.get("STAGE_QUEUE_RUN_ID", "server")
 _PID = os.getpid()
 
 
+class ConformanceIneligibleReason(str, Enum):
+    """Closed vocabulary for explaining why a request was not runnable."""
+
+    WAITING_FOR_INPUT = "waiting_for_input"
+    WAITING_FOR_CHUNK = "waiting_for_chunk"
+    FINISHED = "finished"
+    NONPREEMPTIVE_RUNNING_CAPACITY = "nonpreemptive_running_capacity"
+    SEQUENCE_SLOT_LIMIT = "sequence_slot_limit"
+    TOKEN_BUDGET_EXHAUSTED = "token_budget_exhausted"
+    KV_ALLOCATION_FAILED = "kv_allocation_failed"
+    ALREADY_SELECTED = "already_selected"
+    UNKNOWN = "unknown"
+
+
 def _enabled() -> bool:
     return os.environ.get("STAGE_QUEUE_TRACE_DISABLE", "").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def conformance_trace_enabled() -> bool:
+    """Return whether replayable per-iteration policy details are requested."""
+
+    return os.environ.get("VLLM_OMNI_CONFORMANCE_TRACE", "").lower() in (
         "1",
         "true",
         "yes",
