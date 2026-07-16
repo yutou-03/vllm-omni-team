@@ -1,0 +1,10 @@
+{
+  "include": ["vllm_omni"],
+  "extraPaths": [
+    "/home/zhongyu/project/vllm",
+    "/home/zhongyu/project/vllm-omni-team"
+  ],
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "typeCheckingMode": "off"
+}
