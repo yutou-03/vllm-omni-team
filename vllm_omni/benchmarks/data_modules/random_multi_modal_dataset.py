@@ -162,10 +162,13 @@ class OmniRandomMultiModalDataset(RandomMultiModalDataset):
 @dataclass
 class ServeGenSampleRequest(SampleRequest):
     time_stamp: float = 0.0
+    source_request_id: str | None = None
+    ingress_order: int = 0
     output_modalities: list[str] | None = None
     slo_ms: float | None = None
     request_path: str | None = None
-    predicted_stage_ms: dict[str, float] | None = None
+    predicted_stage_ms: list[float | None] | None = None
+    predicted_stage_work_units: list[float | None] | None = None
 
 
 class ServeGenDataSet(OmniRandomMultiModalDataset):
@@ -243,10 +246,15 @@ class ServeGenDataSet(OmniRandomMultiModalDataset):
                 multi_modal_data=mm_item_list,
                 request_id=request_id,
                 time_stamp=item["timestamp"],
+                source_request_id=item["request_id"],
+                ingress_order=item["ingress_order"],
                 output_modalities=item.get("output_modalities"),
                 slo_ms=item.get("slo_ms"),
                 request_path=item.get("request_path"),
                 predicted_stage_ms=item.get("predicted_stage_ms"),
+                predicted_stage_work_units=item.get(
+                    "predicted_stage_work_units"
+                ),
             )
             sample_requests.append(sample_request)
         if token_mismatch_total != 0:

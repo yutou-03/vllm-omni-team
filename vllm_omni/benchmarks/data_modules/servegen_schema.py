@@ -12,6 +12,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from vllm_omni.scheduling.metadata import normalize_stage_vector
+
 
 _VALID_OUTPUT_MODALITIES = {"text", "audio"}
 
@@ -37,6 +39,17 @@ def _positive_int(value: Any, *, field: str, line_number: int) -> int:
         raise ValueError(
             f"ServeGen line {line_number}: {field} must be a positive integer, "
             f"got {value!r}"
+        )
+    return integer
+
+
+def _nonnegative_int(value: Any, *, field: str, line_number: int) -> int:
+    number = _finite_number(value, field=field, line_number=line_number)
+    integer = int(number)
+    if integer != number or integer < 0:
+        raise ValueError(
+            f"ServeGen line {line_number}: {field} must be a non-negative "
+            f"integer, got {value!r}"
         )
     return integer
 
@@ -119,6 +132,14 @@ def normalize_servegen_record(record: dict[str, Any], *, line_number: int) -> di
         record.get("output_modalities"), line_number=line_number
     )
 
+    ingress_order = record.get("ingress_order")
+    if ingress_order is not None:
+        normalized["ingress_order"] = _nonnegative_int(
+            ingress_order,
+            field="ingress_order",
+            line_number=line_number,
+        )
+
     slo_ms = record.get("slo_ms")
     if slo_ms is not None:
         slo_ms = _finite_number(slo_ms, field="slo_ms", line_number=line_number)
@@ -128,28 +149,41 @@ def normalize_servegen_record(record: dict[str, Any], *, line_number: int) -> di
 
     predicted_stage_ms = record.get("predicted_stage_ms")
     if predicted_stage_ms is not None:
-        if not isinstance(predicted_stage_ms, dict):
+        normalized["predicted_stage_ms"] = normalize_stage_vector(
+            predicted_stage_ms,
+            field="predicted_stage_ms",
+            context=f"ServeGen line {line_number}",
+        )
+
+    predicted_stage_work_units = record.get("predicted_stage_work_units")
+    if predicted_stage_work_units is not None:
+        normalized["predicted_stage_work_units"] = normalize_stage_vector(
+            predicted_stage_work_units,
+            field="predicted_stage_work_units",
+            context=f"ServeGen line {line_number}",
+            strictly_positive=True,
+        )
+
+    request_path = record.get("request_path")
+    if request_path is not None:
+        normalized_path = str(request_path).lower()
+        if normalized_path not in {"text", "audio"}:
             raise ValueError(
-                f"ServeGen line {line_number}: predicted_stage_ms must be an object"
+                f"ServeGen line {line_number}: request_path must be text or audio"
             )
-        normalized_stage_ms: dict[str, float] = {}
-        for stage_id, value in predicted_stage_ms.items():
-            stage_key = str(stage_id)
-            if stage_key not in {"0", "1", "2"}:
-                raise ValueError(
-                    f"ServeGen line {line_number}: invalid predicted stage {stage_id!r}"
-                )
-            stage_ms = _finite_number(
-                value,
-                field=f"predicted_stage_ms[{stage_key}]",
-                line_number=line_number,
+        normalized["request_path"] = normalized_path
+
+    if "predicted_stage_ms" in normalized and "predicted_stage_work_units" in normalized:
+        ms_presence = [value is not None for value in normalized["predicted_stage_ms"]]
+        work_presence = [
+            value is not None
+            for value in normalized["predicted_stage_work_units"]
+        ]
+        if ms_presence != work_presence:
+            raise ValueError(
+                f"ServeGen line {line_number}: predicted_stage_ms and "
+                "predicted_stage_work_units must cover the same stages"
             )
-            if stage_ms < 0:
-                raise ValueError(
-                    f"ServeGen line {line_number}: predicted stage time must be non-negative"
-                )
-            normalized_stage_ms[stage_key] = stage_ms
-        normalized["predicted_stage_ms"] = normalized_stage_ms
 
     return normalized
 
@@ -160,6 +194,7 @@ def load_servegen_jsonl(path: str | Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     request_ids: set[str] = set()
     previous_timestamp = -1.0
+    previous_ingress_order = -1
 
     with Path(path).open(encoding="utf-8") as input_file:
         for line_number, line in enumerate(input_file, start=1):
@@ -176,6 +211,8 @@ def load_servegen_jsonl(path: str | Path) -> list[dict[str, Any]]:
                     f"ServeGen line {line_number}: each JSONL row must be an object"
                 )
             record = normalize_servegen_record(raw_record, line_number=line_number)
+            if "ingress_order" not in record:
+                record["ingress_order"] = previous_ingress_order + 1
             request_id = record["request_id"]
             if request_id in request_ids:
                 raise ValueError(
@@ -185,8 +222,14 @@ def load_servegen_jsonl(path: str | Path) -> list[dict[str, Any]]:
                 raise ValueError(
                     f"ServeGen line {line_number}: timestamps must be nondecreasing"
                 )
+            if record["ingress_order"] <= previous_ingress_order:
+                raise ValueError(
+                    f"ServeGen line {line_number}: ingress_order must be "
+                    "strictly increasing"
+                )
             request_ids.add(request_id)
             previous_timestamp = record["timestamp"]
+            previous_ingress_order = record["ingress_order"]
             records.append(record)
 
     if not records:

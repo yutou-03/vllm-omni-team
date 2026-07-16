@@ -20,6 +20,7 @@ def test_normalize_record_preserves_experiment_metadata():
             "slo_ms": 2500,
             "request_path": "audio",
             "predicted_stage_ms": {"0": 120, "1": 80, "2": 400},
+            "predicted_stage_work_units": [96, 240, 1200],
         },
         line_number=1,
     )
@@ -28,11 +29,8 @@ def test_normalize_record_preserves_experiment_metadata():
     assert record["mm_items"] == []
     assert record["output_modalities"] == ["text", "audio"]
     assert record["slo_ms"] == 2500.0
-    assert record["predicted_stage_ms"] == {
-        "0": 120.0,
-        "1": 80.0,
-        "2": 400.0,
-    }
+    assert record["predicted_stage_ms"] == [120.0, 80.0, 400.0]
+    assert record["predicted_stage_work_units"] == [96.0, 240.0, 1200.0]
 
 
 def test_video_frame_count_is_not_multiplied_by_fps():
@@ -72,6 +70,41 @@ def test_jsonl_rejects_unsorted_timestamps(tmp_path):
         load_servegen_jsonl(trace_path)
 
 
+def test_jsonl_assigns_stable_ingress_order_for_legacy_trace(tmp_path):
+    trace_path = tmp_path / "trace.jsonl"
+    records = [
+        {"request_id": "r1", "timestamp": 0.0, "output_tokens": 8},
+        {"request_id": "r2", "timestamp": 0.5, "output_tokens": 8},
+    ]
+    trace_path.write_text("".join(json.dumps(row) + "\n" for row in records))
+
+    loaded = load_servegen_jsonl(trace_path)
+
+    assert [record["ingress_order"] for record in loaded] == [0, 1]
+
+
+def test_jsonl_rejects_nonincreasing_explicit_ingress_order(tmp_path):
+    trace_path = tmp_path / "trace.jsonl"
+    records = [
+        {
+            "request_id": "r1",
+            "timestamp": 0.0,
+            "output_tokens": 8,
+            "ingress_order": 2,
+        },
+        {
+            "request_id": "r2",
+            "timestamp": 0.5,
+            "output_tokens": 8,
+            "ingress_order": 2,
+        },
+    ]
+    trace_path.write_text("".join(json.dumps(row) + "\n" for row in records))
+
+    with pytest.raises(ValueError, match="ingress_order must be strictly increasing"):
+        load_servegen_jsonl(trace_path)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -79,6 +112,12 @@ def test_jsonl_rejects_unsorted_timestamps(tmp_path):
         ("output_tokens", 0, "output_tokens must be a positive integer"),
         ("slo_ms", 0, "slo_ms must be positive"),
         ("output_modalities", ["image"], "unsupported output modalities"),
+        ("request_path", "video", "request_path must be text or audio"),
+        (
+            "predicted_stage_work_units",
+            [1, 0, 2],
+            "predicted_stage_work_units\\[1\\] must be positive",
+        ),
     ],
 )
 def test_invalid_contract_fields_fail_early(field, value, message):

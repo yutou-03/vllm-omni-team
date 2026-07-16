@@ -46,6 +46,10 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextDataset,
 )
+from vllm_omni.scheduling.metadata import (
+    CLIENT_SCHEDULING_FIELD,
+    build_client_scheduling_metadata,
+)
 
 get_samples_old = datasets.get_samples
 
@@ -91,7 +95,7 @@ def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: Request
 def _attach_servegen_to_request_func_input(
     sample: SampleRequest, rfi: RequestFuncInput
 ) -> None:
-    """Apply the per-request path and experiment metadata from a ServeGen trace."""
+    """Apply a ServeGen path and scheduling contract to the HTTP request."""
 
     if not isinstance(sample, ServeGenSampleRequest):
         return
@@ -100,9 +104,18 @@ def _attach_servegen_to_request_func_input(
             rfi.extra_body,
             {"modalities": sample.output_modalities},
         )
-    setattr(rfi, "servegen_slo_ms", sample.slo_ms)
-    setattr(rfi, "servegen_request_path", sample.request_path)
-    setattr(rfi, "servegen_predicted_stage_ms", sample.predicted_stage_ms)
+    scheduling_metadata = build_client_scheduling_metadata(
+        source_request_id=sample.source_request_id or sample.request_id,
+        ingress_order=sample.ingress_order,
+        slo_ms=sample.slo_ms,
+        request_path=sample.request_path,
+        predicted_stage_ms=sample.predicted_stage_ms,
+        predicted_stage_work_units=sample.predicted_stage_work_units,
+    )
+    rfi.extra_body = _merge_extra_body_mm_kwargs(
+        rfi.extra_body,
+        {CLIENT_SCHEDULING_FIELD: scheduling_metadata},
+    )
 
 
 def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:

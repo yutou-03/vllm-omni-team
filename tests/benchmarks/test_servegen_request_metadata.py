@@ -1,4 +1,7 @@
-from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
+from vllm.benchmarks.lib.endpoint_request_func import (
+    RequestFuncInput,
+    _update_payload_common,
+)
 
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import (
     ServeGenSampleRequest,
@@ -8,16 +11,19 @@ from vllm_omni.benchmarks.patch.patch import (
 )
 
 
-def test_servegen_request_overrides_output_path_and_attaches_slo_metadata():
+def test_servegen_request_writes_output_path_and_scheduling_metadata_to_body():
     sample = ServeGenSampleRequest(
         prompt="synthetic",
         prompt_len=16,
         expected_output_len=32,
         request_id="audio-7",
+        source_request_id="trace-audio-7",
+        ingress_order=7,
         output_modalities=["text", "audio"],
         slo_ms=2500.0,
         request_path="audio",
-        predicted_stage_ms={"0": 100.0, "1": 75.0, "2": 350.0},
+        predicted_stage_ms=[100.0, 75.0, 350.0],
+        predicted_stage_work_units=[64.0, 200.0, 1000.0],
     )
     request = RequestFuncInput(
         prompt=sample.prompt,
@@ -35,11 +41,17 @@ def test_servegen_request_overrides_output_path_and_attaches_slo_metadata():
     assert request.extra_body == {
         "modalities": ["text", "audio"],
         "stream": True,
+        "omni_scheduling": {
+            "schema_version": 1,
+            "source_request_id": "trace-audio-7",
+            "ingress_order": 7,
+            "slo_ms": 2500.0,
+            "request_path": "audio",
+            "predicted_stage_ms": [100.0, 75.0, 350.0],
+            "predicted_stage_work_units": [64.0, 200.0, 1000.0],
+        },
     }
-    assert request.servegen_slo_ms == 2500.0
-    assert request.servegen_request_path == "audio"
-    assert request.servegen_predicted_stage_ms == {
-        "0": 100.0,
-        "1": 75.0,
-        "2": 350.0,
-    }
+
+    payload: dict = {}
+    _update_payload_common(payload, request)
+    assert payload["omni_scheduling"] == request.extra_body["omni_scheduling"]
