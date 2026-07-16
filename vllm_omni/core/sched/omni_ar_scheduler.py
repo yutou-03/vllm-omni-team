@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from time import time
 from typing import Any
@@ -25,7 +26,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.profiling.nvtx import nvtx_end_keyed_range, nvtx_mark, nvtx_range, nvtx_start_keyed_range
+from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 
 logger = init_logger(__name__)
@@ -475,6 +476,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Get prompt logprobs for this request.
                 prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
                 if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+                    is_first_s2_output = False
                     output_token_ids = getattr(request, "output_token_ids", None)
                     if output_token_ids is None:
                         output_token_ids = getattr(request, "_output_token_ids", [])
@@ -492,16 +494,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         if not getattr(request, "_omni_stage_queue_first_output_emitted", False):
                             stage_id = self.vllm_config.model_config.stage_id
                             if str(stage_id) == "2":
-                                nvtx_end_keyed_range(
-                                    f"s2_first_schedule_to_first_output:{req_id}",
-                                    f"TTFP:s2_first_schedule_to_first_output:req={str(req_id)[-8:]}",
+                                with nvtx_range(
+                                    f"TTFP:s2_first_output_ready:req={str(req_id)[-8:]}",
                                     color="orange",
-                                )
-                                nvtx_start_keyed_range(
-                                    f"s2_first_output_to_audio_first_packet:{req_id}",
-                                    f"TTFP:s2_first_output_to_audio_first_packet:req={str(req_id)[-8:]}",
-                                    color="purple",
-                                )
+                                ):
+                                    nvtx_mark(
+                                        f"TTFP:s2_first_output_ready:req={str(req_id)[-8:]}",
+                                        color="orange",
+                                    )
+                                is_first_s2_output = True
                             emit_stage_event(
                                 "stage_first_output",
                                 stage_id=stage_id,
@@ -518,25 +519,39 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             finish_reason=finish_reason,
                         )
                     # Add EngineCoreOutput for this Request.
-                    outputs[request.client_index].append(
-                        EngineCoreOutput(
-                            request_id=req_id,
-                            new_token_ids=new_token_ids,
-                            finish_reason=finish_reason,
-                            new_logprobs=new_logprobs,
-                            new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                            pooling_output=pooler_output,
-                            stop_reason=request.stop_reason,
-                            events=request.take_events(),
-                            prefill_stats=request.take_prefill_stats(),
-                            kv_transfer_params=kv_transfer_params,
-                            trace_headers=request.trace_headers,
-                            routed_experts=routed_experts,
-                            num_nans_in_logits=request.num_nans_in_logits,
-                            is_segment_finished=is_segment_finished,
-                            new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
+                    output_context = (
+                        nvtx_range(
+                            f"TTFP:s2_engine_core_output_create:req={str(req_id)[-8:]}",
+                            color="orange",
                         )
+                        if is_first_s2_output
+                        else nullcontext()
                     )
+                    with output_context:
+                        outputs[request.client_index].append(
+                            EngineCoreOutput(
+                                request_id=req_id,
+                                new_token_ids=new_token_ids,
+                                finish_reason=finish_reason,
+                                new_logprobs=new_logprobs,
+                                new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                                pooling_output=pooler_output,
+                                stop_reason=request.stop_reason,
+                                events=request.take_events(),
+                                prefill_stats=request.take_prefill_stats(),
+                                kv_transfer_params=kv_transfer_params,
+                                trace_headers=request.trace_headers,
+                                routed_experts=routed_experts,
+                                num_nans_in_logits=request.num_nans_in_logits,
+                                is_segment_finished=is_segment_finished,
+                                new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
+                            )
+                        )
+                    if is_first_s2_output:
+                        nvtx_mark(
+                            f"TTFP:s2_engine_core_output_created:req={str(req_id)[-8:]}",
+                            color="orange",
+                        )
                     if self.chunk_transfer_adapter is not None:
                         self.chunk_transfer_adapter.save_async(pooler_output, request)
                 else:

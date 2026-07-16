@@ -20,9 +20,8 @@ from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.profiling.nvtx import (
-    nvtx_end_keyed_range,
     nvtx_mark,
-    nvtx_start_keyed_range,
+    nvtx_range,
 )
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event
 
@@ -397,28 +396,19 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 continue
             if eco.pooling_output is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
+                first_s2_mm_output = False
+                ttfp_req_id = str(eco.request_id)
                 if not getattr(req_state, "_omni_stage_first_mm_output_emitted", False):
                     if str(self.engine_core_stage_id) == "2":
-                        req_id = str(eco.request_id)
-                        nvtx_mark(
-                            f"TTFP:s2_output_processor_first_output:req={req_id[-8:]}",
+                        first_s2_mm_output = True
+                        with nvtx_range(
+                            f"TTFP:s2_output_processor_first_output:req={ttfp_req_id[-8:]}",
                             color="purple",
-                        )
-                        nvtx_end_keyed_range(
-                            f"s2_raw_output_to_output_processor:{req_id}",
-                            f"TTFP:s2_raw_output_to_output_processor:req={req_id[-8:]}",
-                            color="purple",
-                        )
-                        nvtx_start_keyed_range(
-                            f"s2_first_output_to_audio_first_packet:{req_id}",
-                            f"TTFP:s2_first_output_to_audio_first_packet:req={req_id[-8:]}",
-                            color="purple",
-                        )
-                        nvtx_start_keyed_range(
-                            f"s2_output_processor_to_route:{req_id}",
-                            f"TTFP:s2_output_processor_to_route:req={req_id[-8:]}",
-                            color="blue",
-                        )
+                        ):
+                            nvtx_mark(
+                                f"TTFP:s2_output_processor_first_output:req={ttfp_req_id[-8:]}",
+                                color="purple",
+                            )
                     emit_stage_event(
                         "stage_first_output",
                         stage_id=self.engine_core_stage_id,
@@ -427,7 +417,14 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     )
                     req_state._omni_stage_first_mm_output_emitted = True
                 if req_state.detokenizer is not None:
-                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    if first_s2_mm_output:
+                        with nvtx_range(
+                            f"TTFP:s2_output_processor_accumulate:req={ttfp_req_id[-8:]}",
+                            color="blue",
+                        ):
+                            req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    else:
+                        req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                     # Force text path in base processor for multimodal outputs.
                     eco.pooling_output = None
 
