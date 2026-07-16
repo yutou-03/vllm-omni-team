@@ -31,10 +31,8 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.profiling.nvtx import (
-    nvtx_end_keyed_range,
     nvtx_mark,
     nvtx_range,
-    nvtx_start_keyed_range,
 )
 from vllm_omni.profiling.stage_queue_trace import stage_trace_span
 
@@ -574,11 +572,22 @@ class Orchestrator:
             # )
             record_stats = self._stat_logger is not None
             iteration_stats = IterationStats() if record_stats else None
-            raw_output = await pool.process_llm_raw_outputs(
-                replica_id,
-                raw_outputs,
-                iteration_stats=iteration_stats,
-            )
+            if stage_id == 2:
+                with nvtx_range(
+                    f"TTFP:s2_raw_output_to_output_processor:replica={replica_id}",
+                    color="purple",
+                ):
+                    raw_output = await pool.process_llm_raw_outputs(
+                        replica_id,
+                        raw_outputs,
+                        iteration_stats=iteration_stats,
+                    )
+            else:
+                raw_output = await pool.process_llm_raw_outputs(
+                    replica_id,
+                    raw_outputs,
+                    iteration_stats=iteration_stats,
+                )
             if record_stats:
                 # self._last_stats_ts = now
                 self._stat_logger.record(
@@ -651,38 +660,24 @@ class Orchestrator:
             await self._abort_request_ids(request_ids)
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
-            self._close_ttfp_stage_submit_ranges(request_id)
             self._pd_kv_params.pop(request_id, None)
             self._omni_nvtx_s2_raw_output_seen.discard(request_id)
             self._omni_nvtx_s2_route_seen.discard(request_id)
             if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
                 self._running_counter.decrement()
 
-    def _mark_ttfp_next_stage_submitted(
+    def _ttfp_submit_range_name(
         self,
         request_id: str,
         next_stage_id: int,
         final_stage_id: int,
-    ) -> None:
+    ) -> str | None:
         short_req_id = str(request_id)[-8:]
-        if next_stage_id == 1:
-            if final_stage_id > next_stage_id:
-                nvtx_start_keyed_range(
-                    f"s1_submit_to_s2_submit:{request_id}",
-                    f"TTFP:s1_submit_to_s2_submit:req={short_req_id}",
-                    color="magenta",
-                )
-        elif next_stage_id == 2:
-            nvtx_end_keyed_range(
-                f"s1_submit_to_s2_submit:{request_id}",
-                color="magenta",
-            )
-
-    def _close_ttfp_stage_submit_ranges(self, request_id: str) -> None:
-        nvtx_end_keyed_range(
-            f"s1_submit_to_s2_submit:{request_id}",
-            color="magenta",
-        )
+        if next_stage_id == 1 and final_stage_id > next_stage_id:
+            return f"TTFP:s1_submit:req={short_req_id}"
+        if next_stage_id == 2:
+            return f"TTFP:s2_submit:req={short_req_id}"
+        return None
 
     def _trace_s2_raw_outputs_polled(self, raw_outputs: EngineCoreOutputs) -> None:
         for eco in getattr(raw_outputs, "outputs", []) or []:
@@ -695,11 +690,6 @@ class Orchestrator:
             short_req_id = req_id[-8:]
             nvtx_mark(
                 f"TTFP:s2_raw_output_polled:req={short_req_id}",
-                color="purple",
-            )
-            nvtx_start_keyed_range(
-                f"s2_raw_output_to_output_processor:{req_id}",
-                f"TTFP:s2_raw_output_to_output_processor:req={short_req_id}",
                 color="purple",
             )
 
@@ -739,35 +729,34 @@ class Orchestrator:
             return
 
         if self.stage_pools[stage_id].final_output:
+            queue_payload = {
+                "type": "output",
+                "request_id": req_id,
+                "stage_id": stage_id,
+                "replica_id": replica_id,
+                "engine_outputs": output,
+                "metrics": stage_metrics,
+                "finished": finished and stage_id == req_state.final_stage_id,
+                "stage_submit_ts": submit_ts,
+            }
             if stage_id == 2 and req_id not in self._omni_nvtx_s2_route_seen:
                 self._omni_nvtx_s2_route_seen.add(req_id)
                 short_req_id = str(req_id)[-8:]
-                nvtx_end_keyed_range(
-                    f"s2_output_processor_to_route:{req_id}",
+                with nvtx_range(
                     f"TTFP:s2_output_processor_to_route:req={short_req_id}",
                     color="blue",
-                )
-                nvtx_mark(
-                    f"TTFP:s2_route_final_output:req={short_req_id}:finished={int(bool(finished))}",
-                    color="blue",
-                )
-                nvtx_start_keyed_range(
-                    f"s2_route_to_frontend_dispatch:{req_id}",
+                ):
+                    nvtx_mark(
+                        f"TTFP:s2_route_final_output:req={short_req_id}:finished={int(bool(finished))}",
+                        color="blue",
+                    )
+                with nvtx_range(
                     f"TTFP:s2_route_to_frontend_dispatch:req={short_req_id}",
                     color="blue",
-                )
-            await self.output_async_queue.put(
-                {
-                    "type": "output",
-                    "request_id": req_id,
-                    "stage_id": stage_id,
-                    "replica_id": replica_id,
-                    "engine_outputs": output,
-                    "metrics": stage_metrics,
-                    "finished": finished and stage_id == req_state.final_stage_id,
-                    "stage_submit_ts": submit_ts,
-                }
-            )
+                ):
+                    await self.output_async_queue.put(queue_payload)
+            else:
+                await self.output_async_queue.put(queue_payload)
         elif stage_metrics is not None:
             await self.output_async_queue.put(
                 {
@@ -997,23 +986,38 @@ class Orchestrator:
             if already_submitted:
                 await next_pool.submit_update(req_id, req_state, diffusion_prompt)
             else:
-                await next_pool.submit_initial(
-                    req_id,
-                    req_state,
-                    diffusion_prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                            request_id=req_id,
-                        )
-                    },
-                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
-                )
-                self._mark_ttfp_next_stage_submitted(
+                ttfp_range_name = self._ttfp_submit_range_name(
                     req_id,
                     next_logical,
                     req_state.final_stage_id,
                 )
+                if ttfp_range_name is not None:
+                    with nvtx_range(ttfp_range_name, color="magenta"):
+                        await next_pool.submit_initial(
+                            req_id,
+                            req_state,
+                            diffusion_prompt,
+                            submit_kwargs={
+                                "kv_sender_info": self._build_kv_sender_info(
+                                    list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
+                                    request_id=req_id,
+                                )
+                            },
+                            params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                        )
+                else:
+                    await next_pool.submit_initial(
+                        req_id,
+                        req_state,
+                        diffusion_prompt,
+                        submit_kwargs={
+                            "kv_sender_info": self._build_kv_sender_info(
+                                list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
+                                request_id=req_id,
+                            )
+                        },
+                        params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    )
             req_state.stage_submit_ts[next_logical] = _time.time()
             return
 
@@ -1051,12 +1055,16 @@ class Orchestrator:
                 if already_submitted:
                     await next_pool.submit_update(req_id, req_state, request)
                 else:
-                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-                    self._mark_ttfp_next_stage_submitted(
+                    ttfp_range_name = self._ttfp_submit_range_name(
                         req_id,
                         next_logical,
                         req_state.final_stage_id,
                     )
+                    if ttfp_range_name is not None:
+                        with nvtx_range(ttfp_range_name, color="magenta"):
+                            await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                    else:
+                        await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
             req_state.stage_submit_ts[next_logical] = _time.time()
             return
@@ -1112,13 +1120,17 @@ class Orchestrator:
                 with nvtx_range("orchestrator:submit_update"):
                     await next_pool.submit_update(req_id, req_state, request)
             else:
-                with nvtx_range("orchestrator:submit_initial"):
-                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-                self._mark_ttfp_next_stage_submitted(
+                ttfp_range_name = self._ttfp_submit_range_name(
                     req_id,
                     next_logical,
                     req_state.final_stage_id,
                 )
+                with nvtx_range("orchestrator:submit_initial"):
+                    if ttfp_range_name is not None:
+                        with nvtx_range(ttfp_range_name, color="magenta"):
+                            await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                    else:
+                        await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
         req_state.stage_submit_ts[next_logical] = _time.time()
 

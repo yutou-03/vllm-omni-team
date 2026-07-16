@@ -352,6 +352,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_frames: int = 0
     audio_rtf: float = 0.0
     text_latency: float = 0.0
+    generated_audio_path: str | None = None
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
@@ -429,6 +430,7 @@ async def async_request_openai_chat_omni_completions(
         output.audio_duration = 0.0
         output.audio_frames = 0
         output.audio_rtf = 0.0
+        output.generated_audio_path = None
         most_recent_audio_ts = st
         output.text_latency = 0.0
         output.output_tokens = 0
@@ -525,6 +527,16 @@ async def async_request_openai_chat_omni_completions(
                         else:
                             output.audio_rtf = 0
                             logger.warning("Audio duration is zero")
+                        if output.request_id is not None:
+                            audio_index = output.request_id.rsplit("-", 1)[-1]
+                            audio_dir = "/home/zhongyu/project/motivation/stage_queue/audio"
+                            os.makedirs(audio_dir, exist_ok=True)
+                            audio_path = os.path.join(audio_dir, f"audio_{audio_index}.wav")
+                            try:
+                                generated_audio.export(audio_path, format="wav")
+                                output.generated_audio_path = audio_path
+                            except Exception as ex:
+                                logger.warning("Failed to save generated audio to %s: %s", audio_path, ex)
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
                             try:
                                 seg = generated_audio.set_frame_rate(24000).set_channels(1).set_sample_width(2)
@@ -854,9 +866,18 @@ async def benchmark(
 
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
 
-    async def limited_request_func(request_func_input, session, pbar, start_nsys: bool):
+    async def limited_request_func(request_func_input, session, pbar, stop_nsys: bool):
         async with semaphore:
-            if start_nsys:
+            if stop_nsys:
+                subprocess.run(
+                    [
+                        "/usr/local/cuda/bin/nsys",
+                        "stop",
+                        "--session",
+                        "zhongyu5",
+                    ],
+                    check=False,
+                )
                 subprocess.run(
                     [
                         "/usr/local/cuda/bin/nsys",
@@ -868,7 +889,7 @@ async def benchmark(
                         "--force-overwrite",
                         "true",
                         "--session",
-                        "zhongyu3",
+                        "zhongyu5",
                     ],
                     check=False,
                 )
@@ -928,7 +949,7 @@ async def benchmark(
                         request_func_input=request_func_input,
                         session=session,
                         pbar=pbar,
-                        start_nsys=False,
+                        stop_nsys=False,
                     )
                 )
             )
@@ -985,7 +1006,7 @@ async def benchmark(
                         request_func_input=request_func_input,
                         session=session,
                         pbar=pbar,
-                        start_nsys=cnt == 3,
+                        stop_nsys=False,#stop_nsys=cnt == 3
                     )
                 )
             )
@@ -1026,6 +1047,7 @@ async def benchmark(
                 "output_tokens": output.output_tokens,
                 "audio_duration_s": getattr(output, "audio_duration", 0.0),
                 "audio_frames": getattr(output, "audio_frames", 0),
+                "audio_path": getattr(output, "generated_audio_path", None),
                 "error": output.error,
             }
         )
@@ -1075,6 +1097,7 @@ async def benchmark(
             "audio_itls": [output.audio_itl for output in outputs],
             "audio_text_gaps": [output.audio_text_gap for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
+            "generated_audio_paths": [getattr(output, "generated_audio_path", None) for output in outputs],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,

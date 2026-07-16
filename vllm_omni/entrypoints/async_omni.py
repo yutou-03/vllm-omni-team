@@ -36,9 +36,8 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiling.nvtx import (
-    nvtx_end_keyed_range,
     nvtx_mark,
-    nvtx_start_keyed_range,
+    nvtx_range,
 )
 
 if TYPE_CHECKING:
@@ -335,25 +334,25 @@ class AsyncOmni(EngineClient, OmniBase):
 
             # Add request(s) to stage 0. For streaming inputs, submit
             # chunks incrementally through streaming_update.
-            if isinstance(prompt, AsyncGenerator):
-                input_stream_task = await self._add_streaming_input_request(
-                    request_id=request_id,
-                    input_stream=prompt,
-                    sampling_params_list=req_sp_list,
-                    final_stage_id=final_stage_id_for_e2e,
-                )
-            else:
-                await self.engine.add_request_async(
-                    request_id=request_id,
-                    prompt=prompt,
-                    sampling_params_list=req_sp_list,
-                    final_stage_id=final_stage_id_for_e2e,
-                )
-            submit_ts = time.time()
-            nvtx_end_keyed_range(
-                f"audio_stream_to_s0_submit:{request_id}",
+            with nvtx_range(
+                f"TTFP:audio_stream_to_s0_submit:req={request_id[-8:]}",
                 color="cyan",
-            )
+            ):
+                if isinstance(prompt, AsyncGenerator):
+                    input_stream_task = await self._add_streaming_input_request(
+                        request_id=request_id,
+                        input_stream=prompt,
+                        sampling_params_list=req_sp_list,
+                        final_stage_id=final_stage_id_for_e2e,
+                    )
+                else:
+                    await self.engine.add_request_async(
+                        request_id=request_id,
+                        prompt=prompt,
+                        sampling_params_list=req_sp_list,
+                        final_stage_id=final_stage_id_for_e2e,
+                    )
+            submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
 
@@ -529,15 +528,14 @@ class AsyncOmni(EngineClient, OmniBase):
 
             stage_id = result.get("stage_id", 0)
             if stage_id == 2 and not getattr(req_state, "_omni_nvtx_s2_generator_queue_seen", False):
-                nvtx_end_keyed_range(
-                    f"s2_frontend_dispatch_to_generator:{request_id}",
+                with nvtx_range(
                     f"TTFP:s2_frontend_dispatch_to_generator:req={request_id[-8:]}",
                     color="blue",
-                )
-                nvtx_mark(
-                    f"TTFP:s2_generator_queue_get:req={request_id[-8:]}",
-                    color="blue",
-                )
+                ):
+                    nvtx_mark(
+                        f"TTFP:s2_generator_queue_get:req={request_id[-8:]}",
+                        color="blue",
+                    )
                 req_state._omni_nvtx_s2_generator_queue_seen = True
 
             if result.get("type") == "error" and result.get("fatal"):
@@ -569,18 +567,14 @@ class AsyncOmni(EngineClient, OmniBase):
             )
 
             if output_to_yield:
-                if (
+                first_s2_audio_output = (
                     stage_id == 2
                     and getattr(output_to_yield, "final_output_type", None) == "audio"
                     and not getattr(req_state, "_omni_nvtx_s2_generator_to_serving_started", False)
-                ):
+                )
+                if first_s2_audio_output:
                     nvtx_mark(
                         f"TTFP:s2_async_yield_audio:req={request_id[-8:]}",
-                        color="purple",
-                    )
-                    nvtx_start_keyed_range(
-                        f"s2_generator_to_serving_audio:{request_id}",
-                        f"TTFP:s2_generator_to_serving_audio:req={request_id[-8:]}",
                         color="purple",
                     )
                     req_state._omni_nvtx_s2_generator_to_serving_started = True
@@ -590,7 +584,14 @@ class AsyncOmni(EngineClient, OmniBase):
                     stage_id,
                     getattr(output_to_yield, "final_output_type", None),
                 )
-                yield output_to_yield
+                if first_s2_audio_output:
+                    with nvtx_range(
+                        f"TTFP:s2_generator_to_serving_audio:req={request_id[-8:]}",
+                        color="purple",
+                    ):
+                        yield output_to_yield
+                else:
+                    yield output_to_yield
 
             # The Orchestrator sets "finished" when the final stage is done
             if result.get("finished"):
@@ -641,24 +642,23 @@ class AsyncOmni(EngineClient, OmniBase):
                     req_state.stage_id = stage_id
                     req_id = str(req_id)
                     if stage_id == 2 and not getattr(req_state, "_omni_nvtx_s2_frontend_dispatch_seen", False):
-                        nvtx_end_keyed_range(
-                            f"s2_route_to_frontend_dispatch:{req_id}",
+                        with nvtx_range(
                             f"TTFP:s2_route_to_frontend_dispatch:req={req_id[-8:]}",
                             color="blue",
-                        )
-                        nvtx_mark(
-                            f"TTFP:s2_frontend_dispatch:req={req_id[-8:]}",
-                            color="blue",
-                        )
-                        nvtx_start_keyed_range(
-                            f"s2_frontend_dispatch_to_generator:{req_id}",
-                            f"TTFP:s2_frontend_dispatch_to_generator:req={req_id[-8:]}",
-                            color="blue",
-                        )
+                        ):
+                            nvtx_mark(
+                                f"TTFP:s2_frontend_dispatch:req={req_id[-8:]}",
+                                color="blue",
+                            )
+                            with nvtx_range(
+                                f"TTFP:s2_frontend_dispatch:req={req_id[-8:]}",
+                                color="blue",
+                            ):
+                                await req_state.queue.put(msg)
                         req_state._omni_nvtx_s2_frontend_dispatch_seen = True
-
-                    # Route to the per-request queue
-                    await req_state.queue.put(msg)
+                    else:
+                        # Route to the per-request queue
+                        await req_state.queue.put(msg)
 
             except asyncio.CancelledError:
                 raise

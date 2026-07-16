@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
@@ -28,7 +29,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.profiling.nvtx import nvtx_end_keyed_range, nvtx_mark
+from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.profiling.stage_queue_trace import emit_stage_duration_event
 
 logger = init_logger(__name__)
@@ -550,34 +551,42 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     False,
                 ):
                     if str(stage_id) == "2":
-                        nvtx_mark(
+                        with nvtx_range(
                             f"TTFP:s2_first_output_ready:req={str(req_id)[-8:]}",
                             color="orange",
-                        )
-                        nvtx_end_keyed_range(
-                            f"s2_first_schedule_to_first_output:{req_id}",
-                            f"TTFP:s2_first_schedule_to_first_output:req={str(req_id)[-8:]}",
-                            color="orange",
-                        )
+                        ):
+                            nvtx_mark(
+                                f"TTFP:s2_first_output_ready:req={str(req_id)[-8:]}",
+                                color="orange",
+                            )
                     request._omni_stage_queue_first_output_emitted = True
                     is_first_stage_pooler_output = True
-                outputs[request.client_index].append(
-                    EngineCoreOutput(
-                        request_id=req_id,
-                        new_token_ids=new_token_ids,
-                        finish_reason=finish_reason,
-                        new_logprobs=new_logprobs,
-                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
-                        stop_reason=request.stop_reason,
-                        events=request.take_events(),
-                        prefill_stats=request.take_prefill_stats(),
-                        kv_transfer_params=kv_transfer_params,
-                        trace_headers=request.trace_headers,
-                        routed_experts=routed_experts,
-                        num_nans_in_logits=request.num_nans_in_logits,
+                output_context = (
+                    nvtx_range(
+                        f"TTFP:s2_engine_core_output_create:req={str(req_id)[-8:]}",
+                        color="orange",
                     )
+                    if is_first_stage_pooler_output and str(stage_id) == "2"
+                    else nullcontext()
                 )
+                with output_context:
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=new_token_ids,
+                            finish_reason=finish_reason,
+                            new_logprobs=new_logprobs,
+                            new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                            pooling_output=pooler_output,
+                            stop_reason=request.stop_reason,
+                            events=request.take_events(),
+                            prefill_stats=request.take_prefill_stats(),
+                            kv_transfer_params=kv_transfer_params,
+                            trace_headers=request.trace_headers,
+                            routed_experts=routed_experts,
+                            num_nans_in_logits=request.num_nans_in_logits,
+                        )
+                    )
                 if is_first_stage_pooler_output and str(stage_id) == "2":
                     nvtx_mark(
                         f"TTFP:s2_engine_core_output_created:req={str(req_id)[-8:]}",

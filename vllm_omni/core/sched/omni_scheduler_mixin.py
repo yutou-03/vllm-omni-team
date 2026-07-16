@@ -10,7 +10,7 @@ from vllm_omni.profiling.stage_queue_trace import (
     emit_iteration_event,
     emit_stage_event,
 )
-from vllm_omni.profiling.nvtx import nvtx_end_keyed_range, nvtx_start_keyed_range
+from vllm_omni.profiling.nvtx import nvtx_range
 
 _STATS_INTERVAL_S = 1.0
 
@@ -42,14 +42,12 @@ class OmniSchedulerMixin:
             queue_len=len(self.waiting),
             active_reqs=len(self.running),
         )
-        result = super().add_request(request, *args, **kwargs)
         if str(stage_id) == "2" and request_id is not None:
             req_id = str(request_id)
-            nvtx_start_keyed_range(
-                f"s2_enqueue_to_first_schedule:{req_id}",
-                f"TTFP:s2_enqueue_to_first_schedule:req={req_id[-8:]}",
-                color="cyan",
-            )
+            with nvtx_range(f"TTFP:s2_enqueue:req={req_id[-8:]}", color="cyan"):
+                result = super().add_request(request, *args, **kwargs)
+        else:
+            result = super().add_request(request, *args, **kwargs)
         return result
 
     def _trace_scheduler_output( 
@@ -124,16 +122,8 @@ class OmniSchedulerMixin:
                 first_schedule_seen = getattr(self, "_omni_nvtx_s2_first_schedule_seen", set())
                 if rid_str not in first_schedule_seen:
                     first_schedule_seen.add(rid_str)
-                    self._omni_nvtx_s2_first_schedule_seen = first_schedule_seen
-                    nvtx_end_keyed_range(
-                        f"s2_enqueue_to_first_schedule:{rid_str}",
-                        color="cyan",
-                    )
-                    nvtx_start_keyed_range(
-                        f"s2_first_schedule_to_first_output:{rid_str}",
-                        f"TTFP:s2_first_schedule_to_first_output:req={rid_str[-8:]}",
-                        color="orange",
-                    )
+                    with nvtx_range(f"TTFP:s2_first_schedule:req={rid_str[-8:]}", color="orange"):
+                        self._omni_nvtx_s2_first_schedule_seen = first_schedule_seen
 
     def _replace_session_with_streaming_update(
         self,
