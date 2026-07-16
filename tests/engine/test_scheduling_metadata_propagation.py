@@ -3,6 +3,7 @@
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.core.sched.omni_scheduler_mixin import (
+    extract_request_scheduling_trace_fields,
     preserve_streaming_scheduling_metadata,
 )
 from vllm_omni.engine.serialization import (
@@ -87,3 +88,23 @@ def test_streaming_replacement_preserves_deadline_and_new_chunk_fields():
         "sched_source_request_id": "stream-1",
         "sched_deadline_monotonic_s": 42.0,
     }
+
+
+def test_stage_admission_trace_decodes_scheduling_fields():
+    scheduling = {
+        "sched_schema_version": 1,
+        "sched_source_request_id": "trace-1",
+        "sched_ingress_order": 1,
+        "sched_deadline_monotonic_s": 101.0,
+    }
+    request = type(
+        "FakeRequest",
+        (),
+        {
+            "additional_information": serialize_additional_information(
+                {"meta": scheduling}
+            )
+        },
+    )()
+
+    assert extract_request_scheduling_trace_fields(request) == scheduling

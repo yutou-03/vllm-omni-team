@@ -46,6 +46,15 @@ def preserve_streaming_scheduling_metadata(
     return serialize_additional_information(merged)
 
 
+def extract_request_scheduling_trace_fields(request: Any) -> dict[str, Any]:
+    """Decode the immutable scheduling fields recorded at stage admission."""
+
+    decoded = deserialize_additional_information(
+        getattr(request, "additional_information", None)
+    )
+    return extract_scheduling_metadata(decoded) or {}
+
+
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
@@ -60,12 +69,14 @@ class OmniSchedulerMixin:
     def add_request(self, request: Request, *args, **kwargs) -> None:
         stage_id = self._omni_stage_id_for_trace()
         request_id = getattr(request, "request_id", None)
+        scheduling_fields = extract_request_scheduling_trace_fields(request)
         emit_stage_event(
             "server_receive",
             stage_id=stage_id,
             request_id=request_id,
             queue_len=len(self.waiting),
             active_reqs=len(self.running),
+            **scheduling_fields,
         )
         emit_stage_event(
             "stage_enqueue",
@@ -73,6 +84,7 @@ class OmniSchedulerMixin:
             request_id=request_id,
             queue_len=len(self.waiting),
             active_reqs=len(self.running),
+            **scheduling_fields,
         )
         if str(stage_id) == "2" and request_id is not None:
             req_id = str(request_id)
