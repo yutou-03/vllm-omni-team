@@ -53,8 +53,10 @@ def test_policy_queue_supports_remove_and_prepend_interface():
 
     queue.remove_request(third)
     assert list(queue) == [second, first]
-    queue.remove_requests([first])
+    queue.remove(first)
     assert list(queue) == [second]
+    queue.remove_requests([second])
+    assert list(queue) == []
 
 
 def test_native_fcfs_factory_returns_exact_original_queue():

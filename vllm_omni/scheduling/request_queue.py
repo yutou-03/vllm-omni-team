@@ -48,6 +48,15 @@ class PolicyOrderedRequestQueue(RequestQueue):
     def remove_request(self, request: Request) -> None:
         self._requests.remove(request)
 
+    def remove(self, request: Request) -> None:
+        """Match the deque-like interface used by chunk transfer adapters.
+
+        vLLM's ``RequestQueue`` protocol calls this operation
+        ``remove_request``, while the Omni chunk/input coordinators also use
+        the waiting queue as a deque and call ``remove`` directly.
+        """
+        self.remove_request(request)
+
     def remove_requests(self, requests: Iterable[Request]) -> None:
         requests_to_remove = set(requests)
         self._requests = [
