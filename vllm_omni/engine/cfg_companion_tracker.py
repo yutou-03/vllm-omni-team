@@ -110,3 +110,18 @@ class CfgCompanionTracker:
                     all_request_ids.append(companion_id)
 
         return all_request_ids
+
+    def get_drain_status(self) -> dict[str, Any]:
+        """Return read-only counters from the orchestrator-owned tracker."""
+
+        counters = {
+            "parents": len(self._companion_map),
+            "companions": len(self._companion_ids),
+            "companion_to_parent": len(self._companion_to_parent),
+            "done_entries": sum(len(done) for done in self._done.values()),
+            "pending_parents": len(self._pending_parents),
+        }
+        return {
+            "counters": counters,
+            "drained": all(value == 0 for value in counters.values()),
+        }

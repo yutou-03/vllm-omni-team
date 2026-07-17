@@ -49,6 +49,108 @@ class StageEngineCoreProc(EngineCoreProc):
     """
 
     @staticmethod
+    def _safe_len(value: Any) -> int:
+        return len(value) if value is not None else 0
+
+    def get_drain_status(self) -> dict[str, Any]:
+        """Snapshot all scheduler work owned by this EngineCore process.
+
+        This method is invoked through ``EngineCoreRequestType.UTILITY`` and
+        therefore runs in the core busy-loop, never by dereferencing scheduler
+        state from the API or orchestrator thread.
+        """
+
+        try:
+            scheduler = self.scheduler
+            finished_by_client = getattr(scheduler, "finished_req_ids_dict", None)
+            finished_by_client_count = (
+                sum(len(request_ids) for request_ids in finished_by_client.values())
+                if finished_by_client is not None
+                else 0
+            )
+            counters = {
+                "scheduler_unfinished_requests": int(
+                    scheduler.get_num_unfinished_requests()
+                ),
+                "scheduler_requests": self._safe_len(
+                    getattr(scheduler, "requests", None)
+                ),
+                "scheduler_running": self._safe_len(
+                    getattr(scheduler, "running", None)
+                ),
+                "scheduler_waiting": self._safe_len(
+                    getattr(scheduler, "waiting", None)
+                ),
+                "scheduler_skipped_waiting": self._safe_len(
+                    getattr(scheduler, "skipped_waiting", None)
+                ),
+                "scheduler_finished_pending": self._safe_len(
+                    getattr(scheduler, "finished_req_ids", None)
+                ),
+                "scheduler_finished_pending_by_client": finished_by_client_count,
+                "scheduler_finished_receiving_kv": self._safe_len(
+                    getattr(scheduler, "finished_recving_kv_req_ids", None)
+                ),
+                "scheduler_failed_receiving_kv": self._safe_len(
+                    getattr(scheduler, "failed_recving_kv_req_ids", None)
+                ),
+                "batch_queue": self._safe_len(self.batch_queue),
+                "core_input_queue": self.input_queue.qsize(),
+                "core_output_queue": self.output_queue.qsize(),
+                "abort_queue": self.aborts_queue.qsize(),
+            }
+            scheduler_has_requests = bool(scheduler.has_requests())
+            transfer_adapter = getattr(scheduler, "chunk_transfer_adapter", None)
+            if transfer_adapter is None:
+                transfer_status: dict[str, Any] = {
+                    "healthy": True,
+                    "drained": True,
+                    "counters": {},
+                }
+            else:
+                get_transfer_status = getattr(transfer_adapter, "get_drain_status", None)
+                if not callable(get_transfer_status):
+                    transfer_status = {
+                        "healthy": False,
+                        "drained": False,
+                        "error": "chunk transfer adapter has no safe drain snapshot",
+                        "counters": {},
+                    }
+                else:
+                    transfer_status = get_transfer_status()
+
+            healthy = (
+                self.shutdown_state == EngineShutdownState.RUNNING
+                and bool(transfer_status.get("healthy"))
+            )
+            drained = (
+                healthy
+                and not scheduler_has_requests
+                and all(value == 0 for value in counters.values())
+                and bool(transfer_status.get("drained"))
+            )
+            return {
+                "schema_version": 1,
+                "healthy": healthy,
+                "drained": drained,
+                "engine_index": self.engine_index,
+                "shutdown_state": self.shutdown_state.name,
+                "scheduler_has_requests": scheduler_has_requests,
+                "counters": counters,
+                "transfer_adapter": transfer_status,
+            }
+        except Exception as error:
+            logger.exception("StageEngineCoreProc drain snapshot failed")
+            return {
+                "schema_version": 1,
+                "healthy": False,
+                "drained": False,
+                "engine_index": getattr(self, "engine_index", None),
+                "error": f"{type(error).__name__}: {error}",
+                "counters": {},
+            }
+
+    @staticmethod
     def run_stage_core(
         *args: Any,
         dp_rank: int = 0,

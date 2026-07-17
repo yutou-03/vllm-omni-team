@@ -410,6 +410,109 @@ class StagePool:
                 "error": str(exc),
             }
 
+    async def get_replica_drain_status(
+        self,
+        replica_id: int,
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Snapshot one replica through its process-local drain RPC."""
+
+        client = self.clients[replica_id]
+        method = getattr(client, "get_drain_status_async", None)
+        if not callable(method):
+            return {
+                "schema_version": 1,
+                "stage_id": self.stage_id,
+                "replica_id": replica_id,
+                "healthy": False,
+                "drained": False,
+                "error": (
+                    f"{client.__class__.__name__} has no strict drain-status RPC"
+                ),
+                "client_counters": {},
+                "core": None,
+            }
+
+        output_queue = getattr(client, "outputs_queue", None)
+        output_queue_before = output_queue.qsize() if output_queue is not None else None
+        try:
+            core_status = await method(timeout=timeout)
+        except Exception as error:
+            return {
+                "schema_version": 1,
+                "stage_id": self.stage_id,
+                "replica_id": replica_id,
+                "healthy": False,
+                "drained": False,
+                "error": f"{type(error).__name__}: {error}",
+                "client_counters": {
+                    "outputs_queue_before_rpc": output_queue_before,
+                },
+                "core": None,
+            }
+
+        output_queue_after = output_queue.qsize() if output_queue is not None else None
+        pending_messages = getattr(client, "pending_messages", ())
+        pending_zmq_sends = sum(
+            1
+            for tracker, _message in pending_messages
+            if not bool(getattr(tracker, "done", False))
+        )
+        client_counters = {
+            "outputs_queue_before_rpc": output_queue_before,
+            "outputs_queue_after_rpc": output_queue_after,
+            "pending_zmq_input_sends": pending_zmq_sends,
+            "pending_utility_calls": len(getattr(client, "utility_results", {})),
+        }
+        counters_known = all(value is not None for value in client_counters.values())
+        client_empty = counters_known and all(
+            int(value) == 0 for value in client_counters.values()
+        )
+        core_contract_valid = (
+            isinstance(core_status, dict)
+            and type(core_status.get("schema_version")) is int
+            and core_status.get("schema_version") == 1
+            and type(core_status.get("healthy")) is bool
+            and type(core_status.get("drained")) is bool
+        )
+        healthy = (
+            core_contract_valid
+            and core_status["healthy"]
+            and counters_known
+        )
+        error = None
+        if not core_contract_valid:
+            error = "EngineCore returned an invalid drain-status schema"
+        return {
+            "schema_version": 1,
+            "stage_id": self.stage_id,
+            "replica_id": replica_id,
+            "healthy": healthy,
+            "drained": healthy
+            and bool(core_status.get("drained"))
+            and client_empty,
+            "client_counters": client_counters,
+            "core": core_status,
+            **({"error": error} if error is not None else {}),
+        }
+
+    def get_local_drain_status(self) -> dict[str, Any]:
+        """Snapshot stage-pool state owned by the orchestrator event loop."""
+
+        processor_states = getattr(self._output_processor, "request_states", None)
+        counters = {
+            "request_bindings": len(self._request_bindings),
+            "output_processor_request_states": (
+                len(processor_states) if processor_states is not None else 0
+            ),
+        }
+        return {
+            "stage_id": self.stage_id,
+            "counters": counters,
+            "drained": all(value == 0 for value in counters.values()),
+        }
+
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""
         client = self.clients[replica_id]

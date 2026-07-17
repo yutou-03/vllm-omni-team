@@ -101,7 +101,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not hasattr(request, "additional_information"):
             request.additional_information = None
         self._cancelled_load_reqs.discard(request.request_id)
-        self._pending_load_reqs.append(request)
+        self._enqueue_load_request(request)
         with self._recv_cond:
             self._recv_cond.notify()
 
@@ -128,7 +128,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             req_id = getattr(request, "external_req_id", getattr(request, "request_id", ""))
             chunk_id = self.put_req_chunk[req_id]
             nvtx_mark(f"s{self.connector.stage_id}_save_async:req={str(req_id)[-8:]}:chunk={chunk_id}")
-        self._pending_save_reqs.append(task)
+        self._enqueue_save_request(task)
         with self._save_cond:
             self._save_cond.notify()
 
@@ -264,7 +264,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     )
 
             except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                raise RuntimeError(
+                    "custom next-stage payload builder failed for "
+                    f"request {external_req_id}: {e}"
+                ) from e
 
         if not payload_data:
             return
@@ -278,20 +281,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 data=payload_data,
             )
 
-        if success:
-            self.put_req_chunk[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
-            finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
-            is_payload_finished = False
-            if isinstance(finished_flag, torch.Tensor):
-                is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
-            elif finished_flag is not None:
-                is_payload_finished = bool(finished_flag)
+        if not success:
+            raise RuntimeError(
+                "connector put returned unsuccessful for "
+                f"key={connector_put_key}, metadata={metadata!r}"
+            )
 
-            # Reclaim per-request async state only after the terminal payload
-            # has been sent successfully. This avoids cleanup->save races.
-            if is_payload_finished:
-                self.cleanup(request.request_id, external_req_id)
+        self.put_req_chunk[external_req_id] += 1
+        logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+        finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
+        is_payload_finished = False
+        if isinstance(finished_flag, torch.Tensor):
+            is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
+        elif finished_flag is not None:
+            is_payload_finished = bool(finished_flag)
+
+        # Reclaim per-request async state only after the terminal payload
+        # has been sent successfully. This avoids cleanup->save races.
+        if is_payload_finished:
+            self.cleanup(request.request_id, external_req_id)
 
         if is_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
@@ -356,6 +364,96 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self.cleanup_receiver(request_id)
         self.cleanup_sender(external_req_id)
+
+    def get_drain_status(self) -> dict[str, Any]:
+        """Return transfer-thread and chunk bookkeeping without mutation."""
+
+        # Keep the barrier held while checking pending/in-flight state and
+        # reading detail.  Both workers must acquire this lock before changing
+        # pending -> in-flight, so an all-zero snapshot cannot race with a
+        # worker starting after the base counters were copied.
+        with self._drain_state_lock:
+            counters = {
+                "pending_load_requests": len(self._pending_load_reqs),
+                "pending_save_requests": len(self._pending_save_reqs),
+                "recv_inflight": self._recv_inflight,
+                "save_inflight": self._save_inflight,
+            }
+            background_active = bool(
+                self._recv_inflight or self._save_inflight
+            )
+            background_fault = self._background_fault
+            if not background_active:
+                cached_ic = getattr(self, "_cached_ic", None)
+                counters.update(
+                    {
+                        "finished_load_requests": len(self._finished_load_reqs),
+                        "finished_save_requests": len(self._finished_save_reqs),
+                        "finished_requests": len(self.finished_requests),
+                        "requests_with_ready_chunks": len(
+                            self.requests_with_ready_chunks
+                        ),
+                        "waiting_for_chunk_waiting_requests": len(
+                            self.waiting_for_chunk_waiting_requests
+                        ),
+                        "waiting_for_chunk_running_requests": len(
+                            self.waiting_for_chunk_running_requests
+                        ),
+                        "put_request_chunks": len(self.put_req_chunk),
+                        "get_request_chunks": len(self.get_req_chunk),
+                        "request_payloads": len(self.request_payload),
+                        "code_prompt_token_ids": len(
+                            self.code_prompt_token_ids
+                        ),
+                        "request_id_mappings": len(self.request_ids_mapping),
+                        "request_origin_statuses": len(
+                            self.requests_origin_status
+                        ),
+                        "cached_intermediate_contexts": (
+                            len(cached_ic) if cached_ic is not None else 0
+                        ),
+                    }
+                )
+
+        workers_alive = {
+            "recv": bool(
+                getattr(self, "recv_thread", None) is not None
+                and self.recv_thread.is_alive()
+            ),
+            "save": bool(
+                getattr(self, "save_thread", None) is not None
+                and self.save_thread.is_alive()
+            ),
+        }
+        healthy = (
+            not self.stop_event.is_set()
+            and all(workers_alive.values())
+            and background_fault is None
+        )
+        stable_detail = not background_active
+        status = {
+            "healthy": healthy,
+            "drained": healthy
+            and stable_detail
+            and all(value == 0 for value in counters.values()),
+            "stable_detail": stable_detail,
+            "workers_alive": workers_alive,
+            "counters": counters,
+        }
+        errors = []
+        if background_fault is not None:
+            errors.append(background_fault)
+        dead_workers = [name for name, alive in workers_alive.items() if not alive]
+        if dead_workers:
+            errors.append(
+                "background transfer worker not alive: "
+                + ", ".join(dead_workers)
+            )
+        if self.stop_event.is_set():
+            errors.append("transfer adapter is stopped")
+        if errors:
+            status["error"] = "; ".join(errors)
+        return status
 
     ########################################################################
     # Schedule Helper

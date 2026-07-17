@@ -1811,6 +1811,99 @@ class AsyncOmniEngine:
         """Async abort API."""
         self.abort(request_ids)
 
+    def get_drain_status(self, timeout: float = 5.0) -> dict[str, Any]:
+        """Get an orchestrator-owned drain snapshot over the control queue.
+
+        This method deliberately does not inspect ``stage_pools`` or stage
+        clients from the caller thread.  The orchestrator and each EngineCore
+        snapshot their own mutable state and return immutable dictionaries.
+        """
+
+        timeout = float(timeout)
+        if not 0 < timeout <= 60:
+            raise ValueError("drain status timeout must be in (0, 60] seconds")
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        if self.rpc_output_queue is None:
+            raise RuntimeError("rpc_output_queue is not initialized")
+        if not self.is_alive():
+            raise RuntimeError("Orchestrator is not alive")
+
+        deadline = time.monotonic() + timeout
+        if not self._rpc_lock.acquire(timeout=timeout):
+            raise TimeoutError(
+                "drain status timed out waiting for the control-RPC lock"
+            )
+        try:
+            remaining_budget = deadline - time.monotonic()
+            if remaining_budget <= 0:
+                raise TimeoutError(
+                    "drain status timed out waiting for the control-RPC lock"
+                )
+            rpc_id = uuid.uuid4().hex
+            # Leave a small fraction of the remaining caller deadline for the
+            # aggregate response to cross Janus after per-core awaits finish.
+            core_timeout = max(0.001, remaining_budget * 0.9)
+            msg = {
+                "type": "drain_status",
+                "rpc_id": rpc_id,
+                "timeout": min(core_timeout, 60.0),
+            }
+            self.request_queue.sync_q.put_nowait(msg)
+            while True:
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    result_msg = self.rpc_output_queue.sync_q.get(
+                        timeout=remaining
+                    )
+                except queue.Empty as error:
+                    raise TimeoutError(
+                        f"drain status timed out after {timeout} seconds"
+                    ) from error
+
+                if result_msg.get("type") == "error":
+                    raise RuntimeError(
+                        result_msg.get(
+                            "error",
+                            "Orchestrator returned an error message",
+                        )
+                    )
+                if result_msg.get("type") != "drain_status_result":
+                    logger.warning(
+                        "[AsyncOmniEngine] Dropping unexpected rpc queue "
+                        "message type=%s while waiting for drain status",
+                        result_msg.get("type"),
+                    )
+                    continue
+                if result_msg.get("rpc_id") != rpc_id:
+                    logger.warning(
+                        "[AsyncOmniEngine] Dropping stale drain result "
+                        "rpc_id=%s expected=%s",
+                        result_msg.get("rpc_id"),
+                        rpc_id,
+                    )
+                    continue
+                if result_msg.get("schema_version") != 1:
+                    raise RuntimeError(
+                        "Unsupported orchestrator drain-status schema: "
+                        f"{result_msg.get('schema_version')!r}"
+                    )
+                return result_msg
+        finally:
+            self._rpc_lock.release()
+
+    async def get_drain_status_async(
+        self,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Async wrapper around :meth:`get_drain_status`."""
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.get_drain_status(timeout=timeout),
+        )
+
     def collective_rpc(
         self,
         method: str,

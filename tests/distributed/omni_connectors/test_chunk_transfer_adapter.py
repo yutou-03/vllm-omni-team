@@ -57,6 +57,10 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             self._cancelled_load_reqs = set()
             self._pending_save_reqs = deque()
             self._finished_save_reqs = set()
+            self._drain_state_lock = threading.Lock()
+            self._recv_inflight = 0
+            self._save_inflight = 0
+            self._background_fault = None
             self.stop_event = threading.Event()
             self._recv_cond = threading.Condition()
             self._save_cond = threading.Condition()

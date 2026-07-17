@@ -188,6 +188,10 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
+        # Mutated only by the frontend event loop.  Drain snapshots compare the
+        # epoch around an awaited orchestrator RPC so a request that arrives and
+        # completes during that await cannot create a false all-empty result.
+        self._drain_frontend_epoch = 0
         self.prom_metrics = OmniPrometheusMetrics(model_name=model)
         self.mod_metrics = OmniModalityMetrics(model_name=model)
         self.transfer_metrics = OmniTransferMetrics(model_name=model)
@@ -288,7 +292,39 @@ class OmniBase(PDDisaggregationMixin):
                 request_id,
             )
         finally:
-            self.request_states.pop(request_id, None)
+            if self.request_states.pop(request_id, None) is not None:
+                self._bump_frontend_drain_epoch()
+
+    def _bump_frontend_drain_epoch(self) -> None:
+        self._drain_frontend_epoch = (
+            getattr(self, "_drain_frontend_epoch", 0) + 1
+        )
+
+    def _frontend_drain_snapshot(self) -> dict[str, Any]:
+        """Snapshot request state owned by the frontend asyncio loop."""
+
+        states = list(self.request_states.values())
+        pending_outputs = 0
+        active_input_streams = 0
+        for state in states:
+            output_queue = getattr(state, "queue", None)
+            if output_queue is not None:
+                pending_outputs += int(output_queue.qsize())
+            input_task = getattr(state, "input_stream_task", None)
+            if input_task is not None and not input_task.done():
+                active_input_streams += 1
+
+        counters = {
+            "request_states": len(states),
+            "per_request_output_queue_items": pending_outputs,
+            "active_input_stream_tasks": active_input_streams,
+        }
+        return {
+            "epoch": getattr(self, "_drain_frontend_epoch", 0),
+            "healthy": True,
+            "drained": all(value == 0 for value in counters.values()),
+            "counters": counters,
+        }
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(

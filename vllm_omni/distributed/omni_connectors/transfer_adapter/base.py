@@ -32,6 +32,19 @@ class OmniTransferAdapterBase:
         # Requests that have successfully saved data
         self._finished_save_reqs = set()
 
+        # Drain snapshots are requested from the EngineCore main thread while
+        # recv/save work runs in these two background threads.  Queue length by
+        # itself is insufficient: a worker can have popped the last item and
+        # still be processing it.  Keep dequeue + in-flight transitions under
+        # one lock so a zero snapshot cannot observe that gap.
+        self._drain_state_lock = threading.Lock()
+        self._recv_inflight = 0
+        self._save_inflight = 0
+        # A save exception loses the dequeued task and is therefore not a
+        # transient poll miss.  Persist the first such fault so later empty
+        # queues cannot be reported as healthy/drained.
+        self._background_fault: str | None = None
+
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
         self._save_cond = threading.Condition()
@@ -54,30 +67,51 @@ class OmniTransferAdapterBase:
         shm_open syscalls (which can burn a full CPU core).
         """
         while not self.stop_event.is_set():
-            n = len(self._pending_load_reqs)
+            with self._drain_state_lock:
+                n = len(self._pending_load_reqs)
             any_success = False
             for _ in range(n):
-                if not self._pending_load_reqs:
-                    break
-                request = self._pending_load_reqs.popleft()
-                request_id = request.request_id
-                if request_id in self._cancelled_load_reqs:
-                    self._cancelled_load_reqs.discard(request_id)
-                    continue
-                self.request_ids_mapping[request_id] = request.external_req_id
+                with self._drain_state_lock:
+                    if not self._pending_load_reqs:
+                        break
+                    request = self._pending_load_reqs.popleft()
+                    self._recv_inflight += 1
                 try:
+                    request_id = request.request_id
+                    if request_id in self._cancelled_load_reqs:
+                        self._cancelled_load_reqs.discard(request_id)
+                        continue
+                    self.request_ids_mapping[request_id] = request.external_req_id
                     is_success = self._poll_single_request(request)
                     if is_success:
                         any_success = True
                     else:
-                        self._pending_load_reqs.append(request)
+                        with self._drain_state_lock:
+                            self._pending_load_reqs.append(request)
                 except Exception as e:
-                    self._pending_load_reqs.append(request)
-                    logger.warning(f"Error receiving data for {request_id}: {e}")
+                    with self._drain_state_lock:
+                        self._pending_load_reqs.append(request)
+                    self._record_background_fault("recv", e)
+                    try:
+                        failed_request_id = getattr(
+                            request, "request_id", "<unknown>"
+                        )
+                    except Exception:
+                        failed_request_id = "<unreadable>"
+                    logger.warning(
+                        "Error receiving data for %s: %s",
+                        failed_request_id,
+                        e,
+                    )
+                finally:
+                    with self._drain_state_lock:
+                        self._recv_inflight -= 1
 
             # Timeout is the fallback for lock-free append/notify races.
             with self._recv_cond:
-                if not self._pending_load_reqs and not self.stop_event.is_set():
+                with self._drain_state_lock:
+                    pending_loads = len(self._pending_load_reqs)
+                if not pending_loads and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.1)
                 elif not any_success and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.001)
@@ -85,16 +119,104 @@ class OmniTransferAdapterBase:
     def save_loop(self):
         """Loop to send outgoing data."""
         while not self.stop_event.is_set():
-            while self._pending_save_reqs:
-                task = self._pending_save_reqs.popleft()
+            while True:
+                with self._drain_state_lock:
+                    if not self._pending_save_reqs:
+                        break
+                    task = self._pending_save_reqs.popleft()
+                    self._save_inflight += 1
                 try:
                     self._send_single_request(task)
                 except Exception as e:
-                    logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
+                    self._record_background_fault("save", e)
+                    try:
+                        request_id = (
+                            task.get("request_id", "<unknown>")
+                            if isinstance(task, dict)
+                            else getattr(task, "request_id", "<unknown>")
+                        )
+                    except Exception:
+                        request_id = "<unreadable>"
+                    logger.warning("Error saving data for %s: %s", request_id, e)
+                finally:
+                    with self._drain_state_lock:
+                        self._save_inflight -= 1
 
             with self._save_cond:
-                if not self._pending_save_reqs and not self.stop_event.is_set():
+                with self._drain_state_lock:
+                    pending_saves = len(self._pending_save_reqs)
+                if not pending_saves and not self.stop_event.is_set():
                     self._save_cond.wait(timeout=0.1)
+
+    def _enqueue_load_request(self, request: Any) -> None:
+        with self._drain_state_lock:
+            self._pending_load_reqs.append(request)
+
+    def _enqueue_save_request(self, task: Any) -> None:
+        with self._drain_state_lock:
+            self._pending_save_reqs.append(task)
+
+    def _record_background_fault(
+        self,
+        worker: str,
+        error: BaseException,
+    ) -> None:
+        summary = f"{worker}: {type(error).__name__}: {error}"
+        with self._drain_state_lock:
+            if self._background_fault is None:
+                self._background_fault = summary
+
+    def get_drain_status(self) -> dict[str, Any]:
+        """Return a read-only background-transfer snapshot.
+
+        The lock makes ``pending == inflight == 0`` a strict boundary: neither
+        background thread can be between dequeue and in-flight accounting.
+        Subclasses may add scheduler-owned bookkeeping, but must not mutate it.
+        """
+
+        with self._drain_state_lock:
+            counters = {
+                "pending_load_requests": len(self._pending_load_reqs),
+                "pending_save_requests": len(self._pending_save_reqs),
+                "recv_inflight": self._recv_inflight,
+                "save_inflight": self._save_inflight,
+            }
+            background_fault = self._background_fault
+        workers_alive = {
+            "recv": bool(
+                getattr(self, "recv_thread", None) is not None
+                and self.recv_thread.is_alive()
+            ),
+            "save": bool(
+                getattr(self, "save_thread", None) is not None
+                and self.save_thread.is_alive()
+            ),
+        }
+        healthy = (
+            not self.stop_event.is_set()
+            and all(workers_alive.values())
+            and background_fault is None
+        )
+        status = {
+            "healthy": healthy,
+            "drained": healthy and all(value == 0 for value in counters.values()),
+            "workers_alive": workers_alive,
+            "counters": counters,
+        }
+        errors = []
+        if background_fault is not None:
+            errors.append(background_fault)
+        dead_workers = [name for name, alive in workers_alive.items() if not alive]
+        if dead_workers:
+            errors.append(
+                "background transfer worker not alive: "
+                + ", ".join(dead_workers)
+            )
+        if self.stop_event.is_set():
+            errors.append("transfer adapter is stopped")
+        if errors:
+            status["error"] = "; ".join(errors)
+        return status
 
     def _poll_single_request(self, *args, **kwargs):
         """Poll connector for a single request task.

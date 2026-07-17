@@ -326,6 +326,7 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state.metrics = metrics
             req_state.request_arrival_ts = wall_start_ts
             self.request_states[request_id] = req_state
+            self._bump_frontend_drain_epoch()
 
             if isinstance(prompt, list):
                 prompt = [
@@ -720,6 +721,217 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== Control Methods ====================
 
+    @staticmethod
+    def _combine_drain_snapshots(
+        frontend_before: dict[str, Any],
+        orchestrator: dict[str, Any],
+        frontend_after: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build the stable public drain-status schema.
+
+        Snapshot churn represents normal traffic, not failed service health.
+        It can only prevent ``drained=True`` for this observation.
+        """
+
+        raw_invalid_reasons = orchestrator.get("invalid_reasons")
+        raw_errors = orchestrator.get("errors")
+        invalid_reasons = (
+            list(raw_invalid_reasons)
+            if isinstance(raw_invalid_reasons, list)
+            else ["orchestrator_invalid_reasons_not_a_list"]
+        )
+        errors = (
+            [str(error) for error in raw_errors]
+            if isinstance(raw_errors, list)
+            else ["Orchestrator errors field is not a list"]
+        )
+        frontend_stable = (
+            frontend_before.get("epoch") == frontend_after.get("epoch")
+        )
+        orchestrator_stable = bool(orchestrator.get("stable"))
+        if not frontend_stable:
+            invalid_reasons.append("frontend_snapshot_changed")
+        if not orchestrator_stable:
+            invalid_reasons.append("orchestrator_snapshot_changed")
+
+        orchestrator_contract_valid = (
+            type(orchestrator.get("schema_version")) is int
+            and orchestrator.get("schema_version") == 1
+            and type(orchestrator.get("healthy")) is bool
+            and type(orchestrator.get("drained")) is bool
+            and type(orchestrator.get("stable")) is bool
+            and isinstance(raw_invalid_reasons, list)
+            and isinstance(raw_errors, list)
+        )
+        if not orchestrator_contract_valid:
+            invalid_reasons.append("orchestrator_schema_invalid")
+            errors.append(
+                "Unsupported orchestrator drain-status schema: "
+                f"{orchestrator.get('schema_version')!r}"
+            )
+
+        raw_stages = orchestrator.get("replicas", [])
+        stages = raw_stages if isinstance(raw_stages, list) else []
+        if not isinstance(raw_stages, list):
+            invalid_reasons.append("stages_not_a_list")
+            errors.append("Orchestrator drain status returned invalid stages")
+        elif not stages:
+            invalid_reasons.append("stages_empty")
+            errors.append("Orchestrator drain status returned no stage replicas")
+
+        stages_healthy = bool(stages)
+        stages_drained = bool(stages)
+        for index, stage in enumerate(stages):
+            if not isinstance(stage, dict):
+                stages_healthy = False
+                stages_drained = False
+                invalid_reasons.append("stage_schema_invalid")
+                errors.append(
+                    f"Stage drain status at index {index} is not an object"
+                )
+                continue
+            stage_contract_valid = (
+                type(stage.get("schema_version")) is int
+                and stage.get("schema_version") == 1
+                and type(stage.get("stage_id")) is int
+                and type(stage.get("replica_id")) is int
+                and type(stage.get("healthy")) is bool
+                and type(stage.get("drained")) is bool
+            )
+            core = stage.get("core")
+            if stage.get("healthy") is True:
+                stage_contract_valid = stage_contract_valid and (
+                    isinstance(core, dict)
+                    and type(core.get("schema_version")) is int
+                    and core.get("schema_version") == 1
+                    and type(core.get("healthy")) is bool
+                    and type(core.get("drained")) is bool
+                )
+                if stage_contract_valid and core["healthy"] is not True:
+                    stage_contract_valid = False
+                if (
+                    stage_contract_valid
+                    and stage.get("drained") is True
+                    and core["drained"] is not True
+                ):
+                    stage_contract_valid = False
+            if stage.get("drained") is True and stage.get("healthy") is not True:
+                stage_contract_valid = False
+            if not stage_contract_valid:
+                stages_healthy = False
+                stages_drained = False
+                invalid_reasons.append("stage_schema_invalid")
+                errors.append(
+                    f"Stage drain status at index {index} has invalid schema"
+                )
+            else:
+                stages_healthy = stages_healthy and stage["healthy"]
+                stages_drained = stages_drained and stage["drained"]
+            if stage.get("healthy"):
+                continue
+            stage_label = (
+                f"stage={stage.get('stage_id')} "
+                f"replica={stage.get('replica_id')}"
+            )
+            detail = stage.get("error")
+            if detail is None and isinstance(core, dict):
+                detail = core.get("error")
+                transfer = core.get("transfer_adapter")
+                if detail is None and isinstance(transfer, dict):
+                    detail = transfer.get("error")
+            errors.append(
+                f"{stage_label}: {detail or 'drain snapshot is unhealthy'}"
+            )
+
+        if not orchestrator.get("healthy") and not errors:
+            local_after = orchestrator.get("after")
+            fatal_error = (
+                local_after.get("fatal_error")
+                if isinstance(local_after, dict)
+                else None
+            )
+            errors.append(
+                str(fatal_error or "Orchestrator drain snapshot is unhealthy")
+            )
+
+        # Preserve first-seen order while keeping the public fields compact.
+        invalid_reasons = list(dict.fromkeys(map(str, invalid_reasons)))
+        errors = list(dict.fromkeys(errors))
+
+        frontend_healthy = bool(frontend_before.get("healthy")) and bool(
+            frontend_after.get("healthy")
+        )
+        frontend_drained = (
+            frontend_stable
+            and bool(frontend_before.get("drained"))
+            and bool(frontend_after.get("drained"))
+        )
+        frontend = {
+            "healthy": frontend_healthy,
+            "drained": frontend_drained,
+            "stable": frontend_stable,
+            "epoch": {
+                "before": frontend_before.get("epoch"),
+                "after": frontend_after.get("epoch"),
+            },
+            "before": frontend_before,
+            "after": frontend_after,
+        }
+        healthy = (
+            orchestrator_contract_valid
+            and frontend_healthy
+            and bool(orchestrator.get("healthy"))
+            and stages_healthy
+            and not errors
+        )
+        drained = (
+            healthy
+            and frontend_drained
+            and orchestrator_stable
+            and bool(orchestrator.get("drained"))
+            and stages_drained
+        )
+        return {
+            "schema_version": 1,
+            "healthy": healthy,
+            "drained": drained,
+            "snapshot_epoch": int(frontend_after.get("epoch", 0)),
+            "frontend": frontend,
+            "orchestrator": orchestrator,
+            "stages": stages,
+            "invalid_reasons": invalid_reasons,
+            "errors": errors,
+        }
+
+    async def get_drain_status(
+        self,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Return a read-only, fail-closed snapshot of all runtime layers."""
+
+        frontend_before = self._frontend_drain_snapshot()
+        try:
+            orchestrator = await self.engine.get_drain_status_async(
+                timeout=timeout
+            )
+        except Exception as error:
+            logger.exception("[AsyncOmni] drain-status RPC failed")
+            orchestrator = {
+                "schema_version": 1,
+                "healthy": False,
+                "drained": False,
+                "stable": False,
+                "replicas": [],
+                "invalid_reasons": ["orchestrator_rpc_failed"],
+                "errors": [f"{type(error).__name__}: {error}"],
+            }
+        frontend_after = self._frontend_drain_snapshot()
+        return self._combine_drain_snapshots(
+            frontend_before,
+            orchestrator,
+            frontend_after,
+        )
+
     async def collective_rpc(
         self,
         method: str,
@@ -773,7 +985,8 @@ class AsyncOmni(EngineClient, OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         await self.engine.abort_async(request_ids)
         for req_id in request_ids:
-            self.request_states.pop(req_id, None)
+            if self.request_states.pop(req_id, None) is not None:
+                self._bump_frontend_drain_epoch()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 

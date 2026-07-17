@@ -253,6 +253,26 @@ class Orchestrator:
         self._stages_shutdown = False
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
+        self._drain_state_epoch = 0
+        self._drain_output_inflight = 0
+
+    def _bump_drain_epoch(self) -> None:
+        """Record owner-loop state churn (also safe for minimal test doubles)."""
+
+        self._drain_state_epoch = getattr(self, "_drain_state_epoch", 0) + 1
+
+    def _begin_drain_output(self) -> None:
+        self._drain_output_inflight = (
+            getattr(self, "_drain_output_inflight", 0) + 1
+        )
+        self._bump_drain_epoch()
+
+    def _end_drain_output(self) -> None:
+        self._drain_output_inflight = max(
+            0,
+            getattr(self, "_drain_output_inflight", 0) - 1,
+        )
+        self._bump_drain_epoch()
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -314,6 +334,27 @@ class Orchestrator:
                 await self._handle_abort(msg)
             elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
+            elif msg_type == "drain_status":
+                try:
+                    await self._handle_drain_status(msg)
+                except Exception as error:
+                    # Drain is an experimental read-only control RPC.  A
+                    # snapshot failure must fail closed without taking down the
+                    # request/output loops it is observing.
+                    logger.exception("[Orchestrator] drain status failed")
+                    await self.rpc_async_queue.put(
+                        {
+                            "type": "drain_status_result",
+                            "rpc_id": msg.get("rpc_id"),
+                            "schema_version": 1,
+                            "healthy": False,
+                            "drained": False,
+                            "stable": False,
+                            "replicas": [],
+                            "invalid_reasons": ["snapshot_failed"],
+                            "errors": [f"{type(error).__name__}: {error}"],
+                        }
+                    )
             elif msg_type == "shutdown":
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
@@ -358,6 +399,7 @@ class Orchestrator:
             ),
         )
         self.request_states[request_id] = req_state
+        self._bump_drain_epoch()
         if self._running_counter is not None:
             self._running_counter.increment()
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
@@ -413,6 +455,7 @@ class Orchestrator:
             request,
             prompt_text=msg.get("output_prompt_text"),
         )
+        self._bump_drain_epoch()
 
     async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -447,6 +490,7 @@ class Orchestrator:
             scheduling_metadata=parent_state.scheduling_metadata,
         )
         self.request_states[companion_id] = companion_state
+        self._bump_drain_epoch()
         companion_state.stage_submit_ts[0] = _time.time()
         companion_replica_id = await self.stage_pools[0].submit_initial(
             companion_id,
@@ -528,6 +572,130 @@ class Orchestrator:
             }
         )
 
+    def _local_drain_status(self) -> dict[str, Any]:
+        """Snapshot state owned by the orchestrator event loop."""
+
+        cfg = self._cfg_tracker.get_drain_status()
+        pools = [pool.get_local_drain_status() for pool in self.stage_pools]
+        janus_counters = {
+            "admission_queue": self.request_async_queue.qsize(),
+            "output_queue": self.output_async_queue.qsize(),
+            "rpc_output_queue": self.rpc_async_queue.qsize(),
+        }
+        counters = {
+            "request_states": len(self.request_states),
+            "pd_kv_params": len(self._pd_kv_params),
+            "output_handlers_inflight": getattr(
+                self, "_drain_output_inflight", 0
+            ),
+        }
+        healthy = (
+            self._fatal_error is None
+            and not self._stages_shutdown
+            and not self._shutdown_event.is_set()
+        )
+        drained = (
+            healthy
+            and all(value == 0 for value in counters.values())
+            and all(value == 0 for value in janus_counters.values())
+            and bool(cfg["drained"])
+            and all(bool(pool["drained"]) for pool in pools)
+        )
+        return {
+            "epoch": getattr(self, "_drain_state_epoch", 0),
+            "healthy": healthy,
+            "drained": drained,
+            "fatal_error": self._fatal_error,
+            "counters": counters,
+            "janus": janus_counters,
+            "cfg": cfg,
+            "stage_pools": pools,
+        }
+
+    async def _handle_drain_status(self, msg: dict[str, Any]) -> None:
+        """Aggregate loop-local and per-core snapshots without shared reads."""
+
+        rpc_id = msg["rpc_id"]
+        timeout = float(msg.get("timeout", 5.0))
+        if not 0 < timeout <= 60:
+            await self.rpc_async_queue.put(
+                {
+                    "type": "drain_status_result",
+                    "rpc_id": rpc_id,
+                    "schema_version": 1,
+                    "healthy": False,
+                    "drained": False,
+                    "stable": False,
+                    "replicas": [],
+                    "invalid_reasons": ["invalid_timeout"],
+                    "errors": [
+                        "drain status timeout must be in (0, 60] seconds"
+                    ],
+                }
+            )
+            return
+
+        before = self._local_drain_status()
+        replica_tasks = [
+            pool.get_replica_drain_status(replica_id, timeout=timeout)
+            for pool in self.stage_pools
+            for replica_id in range(pool.num_replicas)
+        ]
+        try:
+            replicas = await asyncio.wait_for(
+                asyncio.gather(*replica_tasks),
+                timeout=timeout,
+            )
+            error = None
+        except Exception as exc:
+            logger.exception("[Orchestrator] drain status RPC failed")
+            replicas = []
+            error = f"{type(exc).__name__}: {exc}"
+
+        after = self._local_drain_status()
+        stable = before["epoch"] == after["epoch"]
+        replicas_healthy = bool(replicas) and all(
+            bool(replica.get("healthy")) for replica in replicas
+        )
+        replicas_drained = bool(replicas) and all(
+            bool(replica.get("drained")) for replica in replicas
+        )
+        # Snapshot churn is normal while the server is busy.  It invalidates a
+        # positive drained result, but is not itself a service-health failure.
+        healthy = (
+            error is None
+            and bool(before["healthy"])
+            and bool(after["healthy"])
+            and replicas_healthy
+        )
+        drained = (
+            healthy
+            and stable
+            and bool(before["drained"])
+            and bool(after["drained"])
+            and replicas_drained
+        )
+        invalid_reasons = [] if stable else ["orchestrator_snapshot_changed"]
+        errors = [] if error is None else [error]
+        response = {
+            "type": "drain_status_result",
+            "rpc_id": rpc_id,
+            "schema_version": 1,
+            "healthy": healthy,
+            "drained": drained,
+            "stable": stable,
+            "epoch": {
+                "before": before["epoch"],
+                "after": after["epoch"],
+            },
+            "before": before,
+            "after": after,
+            "replicas": replicas,
+            "invalid_reasons": invalid_reasons,
+            "errors": errors,
+        }
+        await self.rpc_async_queue.put(response)
+
     # ---- Orchestration loop ----
 
     async def _orchestration_output_handler(self) -> None:
@@ -553,8 +721,13 @@ class Orchestrator:
                             output = pool.poll_diffusion_output(replica_id)
                         if output is None:
                             continue
-
-                        await self._handle_processed_outputs(stage_id, replica_id, [output])
+                        self._begin_drain_output()
+                        try:
+                            await self._handle_processed_outputs(
+                                stage_id, replica_id, [output]
+                            )
+                        finally:
+                            self._end_drain_output()
                         idle = False
                     else:
                         try:
@@ -595,6 +768,7 @@ class Orchestrator:
                                         }
                                     )
                                     self.request_states.pop(req_id, None)
+                            self._bump_drain_epoch()
                             self._shutdown_event.set()
                             raise
                         except Exception:
@@ -632,52 +806,56 @@ class Orchestrator:
                 break
             if not raw_outputs.outputs:
                 continue
-            if stage_id == 2:
-                self._trace_s2_raw_outputs_polled(raw_outputs)
+            self._begin_drain_output()
+            try:
+                if stage_id == 2:
+                    self._trace_s2_raw_outputs_polled(raw_outputs)
 
-            await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
-            for eco in raw_outputs.outputs:
-                req_state = self.request_states.get(getattr(eco, "request_id", None))
-                if req_state is None:
-                    continue
-                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                req_state.streaming.new_prompt_len_snapshot = getattr(
-                    eco,
-                    "new_prompt_len_snapshot",
-                    None,
-                )
-            # now = _time.monotonic()
-            # record_stats = (
-            #     self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
-            # )
-            record_stats = self._stat_logger is not None
-            iteration_stats = IterationStats() if record_stats else None
-            if stage_id == 2:
-                with nvtx_range(
-                    f"TTFP:s2_raw_output_to_output_processor:replica={replica_id}",
-                    color="purple",
-                ):
+                await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                for eco in raw_outputs.outputs:
+                    req_state = self.request_states.get(getattr(eco, "request_id", None))
+                    if req_state is None:
+                        continue
+                    req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                    req_state.streaming.new_prompt_len_snapshot = getattr(
+                        eco,
+                        "new_prompt_len_snapshot",
+                        None,
+                    )
+                # now = _time.monotonic()
+                # record_stats = (
+                #     self._stat_logger is not None and now - self._last_stats_ts >= self._stats_interval_s
+                # )
+                record_stats = self._stat_logger is not None
+                iteration_stats = IterationStats() if record_stats else None
+                if stage_id == 2:
+                    with nvtx_range(
+                        f"TTFP:s2_raw_output_to_output_processor:replica={replica_id}",
+                        color="purple",
+                    ):
+                        raw_output = await pool.process_llm_raw_outputs(
+                            replica_id,
+                            raw_outputs,
+                            iteration_stats=iteration_stats,
+                        )
+                else:
                     raw_output = await pool.process_llm_raw_outputs(
                         replica_id,
                         raw_outputs,
                         iteration_stats=iteration_stats,
                     )
-            else:
-                raw_output = await pool.process_llm_raw_outputs(
-                    replica_id,
-                    raw_outputs,
-                    iteration_stats=iteration_stats,
-                )
-            if record_stats:
-                # self._last_stats_ts = now
-                self._stat_logger.record(
-                    raw_outputs.scheduler_stats,
-                    iteration_stats,
-                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
-                )
+                if record_stats:
+                    # self._last_stats_ts = now
+                    self._stat_logger.record(
+                        raw_outputs.scheduler_stats,
+                        iteration_stats,
+                        engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                    )
 
-            await self._handle_processed_outputs(stage_id, replica_id, raw_output)
-            did_work = True
+                await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+                did_work = True
+            finally:
+                self._end_drain_output()
 
         return did_work
 
@@ -745,6 +923,7 @@ class Orchestrator:
             self._omni_nvtx_s2_route_seen.discard(request_id)
             if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
                 self._running_counter.decrement()
+        self._bump_drain_epoch()
 
     def _ttfp_submit_range_name(
         self,

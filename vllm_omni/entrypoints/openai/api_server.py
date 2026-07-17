@@ -1434,6 +1434,115 @@ async def health(raw_request: Request) -> JSONResponse:
         )
 
 
+def _failed_drain_status(reason: str, code: str) -> dict[str, Any]:
+    """Build the exact public schema for a fail-closed drain response."""
+
+    return {
+        "schema_version": 1,
+        "healthy": False,
+        "drained": False,
+        "snapshot_epoch": 0,
+        "frontend": {},
+        "orchestrator": {},
+        "stages": [],
+        "invalid_reasons": [code],
+        "errors": [reason],
+    }
+
+
+async def _drain_status_response(
+    engine_client: Any,
+    timeout: float,
+) -> JSONResponse:
+    """Call the owner-loop snapshot API and enforce its public contract."""
+
+    method = getattr(engine_client, "get_drain_status", None)
+    if not callable(method):
+        status = _failed_drain_status(
+            "Engine does not implement strict drain status",
+            "drain_status_unsupported",
+        )
+    else:
+        try:
+            raw_status = await method(timeout=timeout)
+        except Exception as error:
+            logger.exception("Drain-status endpoint RPC failed")
+            status = _failed_drain_status(
+                f"{type(error).__name__}: {error}",
+                "drain_status_rpc_failed",
+            )
+        else:
+            required_types = {
+                "schema_version": int,
+                "healthy": bool,
+                "drained": bool,
+                "snapshot_epoch": int,
+                "frontend": dict,
+                "orchestrator": dict,
+                "stages": list,
+                "invalid_reasons": list,
+                "errors": list,
+            }
+            contract_valid = isinstance(raw_status, dict) and all(
+                key in raw_status
+                and isinstance(raw_status[key], expected_type)
+                and not (
+                    expected_type is int
+                    and isinstance(raw_status[key], bool)
+                )
+                for key, expected_type in required_types.items()
+            )
+            if not contract_valid or raw_status.get("schema_version") != 1:
+                status = _failed_drain_status(
+                    "Engine returned an invalid drain-status schema",
+                    "drain_status_schema_invalid",
+                )
+            else:
+                # Emit exactly the frozen top-level schema even if an internal
+                # implementation adds diagnostic fields in the future.
+                status = {
+                    key: raw_status[key]
+                    for key in required_types
+                }
+                if not status["healthy"]:
+                    status["drained"] = False
+
+    return JSONResponse(
+        content=status,
+        status_code=(
+            HTTPStatus.OK.value
+            if status["healthy"]
+            else HTTPStatus.SERVICE_UNAVAILABLE.value
+        ),
+    )
+
+
+_remove_route_from_router(router, "/v1/omni/drain_status")
+
+
+@router.get("/v1/omni/drain_status")
+async def omni_drain_status(
+    raw_request: Request,
+    timeout: float = Query(5.0, gt=0, le=60),
+) -> JSONResponse:
+    """Return 200 for a healthy snapshot and 503 for snapshot/RPC failure.
+
+    A healthy server that still has work returns 200 with ``drained=false``.
+    """
+
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    if engine_client is None:
+        status = _failed_drain_status(
+            "No engine initialized",
+            "engine_unavailable",
+        )
+        return JSONResponse(
+            content=status,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    return await _drain_status_response(engine_client, timeout)
+
+
 # Remove existing models endpoint if present (from vllm imports)
 # to ensure our handler takes precedence
 _remove_route_from_router(router, "/v1/models")

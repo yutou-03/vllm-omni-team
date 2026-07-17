@@ -456,6 +456,29 @@ class StageEngineCoreClientBase:
             kwargs=kwargs,
         )
 
+    async def get_drain_status_async(self, timeout: float) -> dict[str, Any]:
+        """Request a scheduler snapshot from the StageEngineCoreProc itself."""
+
+        self.check_health()
+        try:
+            result = await asyncio.wait_for(
+                self.call_utility_async("get_drain_status"),
+                timeout=timeout,
+            )
+        except Exception:
+            logger.exception(
+                "[StageEngineCoreClient] drain status failed: stage=%s replica=%s",
+                self.stage_id,
+                self.replica_id,
+            )
+            raise
+        if not isinstance(result, dict):
+            raise TypeError(
+                "StageEngineCoreProc drain status must be a dictionary, got "
+                f"{type(result).__name__}"
+            )
+        return result
+
     def shutdown(self) -> None:
         """Shutdown managed resources and any externally spawned subprocess."""
         child_procs: list[psutil.Process] = []
