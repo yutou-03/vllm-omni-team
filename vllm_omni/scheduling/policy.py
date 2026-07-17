@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
@@ -80,22 +80,28 @@ def request_scheduling_metadata(request: Any) -> dict[str, Any]:
     return metadata
 
 
-def predict_remaining_ms(
-    *,
-    total_predicted_ms: float,
-    total_work_units: float,
-    completed_work_units: float,
-) -> float:
-    """Scale a frozen total-time prediction by monotonic remaining work."""
+def remaining_prefill_tokens(request: Any) -> int:
+    """Return Sarathi-style local remaining work for one scheduler request.
 
-    if not math.isfinite(total_predicted_ms) or total_predicted_ms < 0:
-        raise ValueError("total_predicted_ms must be non-negative")
-    if not math.isfinite(total_work_units) or total_work_units <= 0:
-        raise ValueError("total_work_units must be positive")
-    if not math.isfinite(completed_work_units):
-        raise ValueError("completed_work_units must be finite")
-    completed = min(max(float(completed_work_units), 0.0), total_work_units)
-    return total_predicted_ms * (total_work_units - completed) / total_work_units
+    Sarathi's SRPF baseline uses unprocessed prompt tokens as a direct proxy
+    for remaining processing time. Output length and downstream-stage work are
+    deliberately excluded. Once prefill is complete the key stays at zero, so
+    decode requests remain ahead of requests with unfinished local prefill.
+    """
+
+    request_id = str(getattr(request, "request_id", "<unknown>"))
+    total = getattr(request, "num_prompt_tokens", None)
+    completed = getattr(request, "num_computed_tokens", None)
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        raise SchedulingMetadataError(
+            f"request {request_id!r} has invalid num_prompt_tokens={total!r}"
+        )
+    if not isinstance(completed, int) or isinstance(completed, bool):
+        raise SchedulingMetadataError(
+            f"request {request_id!r} has invalid num_computed_tokens={completed!r}"
+        )
+    completed_prefill = min(max(completed, 0), total)
+    return total - completed_prefill
 
 
 def _required_field(
@@ -110,25 +116,6 @@ def _required_field(
             f"request {request_id!r} is missing required field {field!r}"
         )
     return value
-
-
-def _required_stage_value(
-    metadata: Mapping[str, Any],
-    field: str,
-    *,
-    stage_id: int,
-    request_id: str,
-) -> float:
-    values = _required_field(metadata, field, request_id=request_id)
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-        raise SchedulingMetadataError(
-            f"request {request_id!r} field {field!r} must be a stage sequence"
-        )
-    if stage_id >= len(values) or values[stage_id] is None:
-        raise SchedulingMetadataError(
-            f"request {request_id!r} field {field!r} has no value for stage {stage_id}"
-        )
-    return float(values[stage_id])
 
 
 def policy_key(
@@ -146,7 +133,8 @@ def policy_key(
     replacement of vLLM's native queue.
     """
 
-    del now  # Reserved for future age-aware policies; keys remain time-stable.
+    # Reserved for future age-aware policies; current keys remain time-stable.
+    del now, data_ready_time
     if not policy_applies_to_stage(policy, stage_id):
         raise ValueError(
             f"policy {policy.value!r} does not reorder stage {stage_id}"
@@ -187,27 +175,18 @@ def policy_key(
         return deadline, ingress_order, source_request_id, request_id
 
     if policy is BaselineSchedulingPolicy.SRPF_LOCAL_NP:
-        total_ms = _required_stage_value(
-            metadata,
-            "sched_predicted_stage_ms",
-            stage_id=stage_id,
-            request_id=request_id,
+        ingress_order = int(
+            _required_field(
+                metadata,
+                "sched_ingress_order",
+                request_id=request_id,
+            )
         )
-        total_work = _required_stage_value(
-            metadata,
-            "sched_predicted_stage_work_units",
-            stage_id=stage_id,
-            request_id=request_id,
+        return (
+            remaining_prefill_tokens(request),
+            ingress_order,
+            source_request_id,
+            request_id,
         )
-        completed_work = float(getattr(request, "num_computed_tokens", 0))
-        remaining_ms = predict_remaining_ms(
-            total_predicted_ms=total_ms,
-            total_work_units=total_work,
-            completed_work_units=completed_work,
-        )
-        ready_time = float(data_ready_time)
-        if not math.isfinite(ready_time):
-            raise ValueError("data_ready_time must be finite")
-        return remaining_ms, ready_time, source_request_id, request_id
 
     raise AssertionError(f"unhandled baseline policy {policy!r}")

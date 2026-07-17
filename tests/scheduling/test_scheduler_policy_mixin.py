@@ -20,8 +20,12 @@ class FakeRequest:
         *,
         deadline: float | None,
         ingress_order: int = 0,
+        num_prompt_tokens: int = 10,
+        num_computed_tokens: int = 0,
     ) -> None:
         self.request_id = request_id
+        self.num_prompt_tokens = num_prompt_tokens
+        self.num_computed_tokens = num_computed_tokens
         self.additional_information = None
         if deadline is not None:
             self.additional_information = {
@@ -122,11 +126,35 @@ def test_enabled_policy_rejects_missing_metadata_at_admission(monkeypatch):
     assert not scheduler.waiting
 
 
-def test_srpf_remains_disabled_before_predictor_gate(monkeypatch):
+@pytest.mark.parametrize("stage_id", [0, 1, 2])
+def test_srpf_is_enabled_at_every_stage_without_predictor_metadata(
+    monkeypatch,
+    stage_id,
+):
     monkeypatch.setenv(BASELINE_POLICY_ENV, "srpf_local_np")
+    scheduler = SchedulerHarness(stage_id)
+    long_request = FakeRequest(
+        "long",
+        deadline=20.0,
+        ingress_order=0,
+        num_prompt_tokens=20,
+        num_computed_tokens=5,
+    )
+    short_request = FakeRequest(
+        "short",
+        deadline=20.0,
+        ingress_order=1,
+        num_prompt_tokens=10,
+        num_computed_tokens=5,
+    )
+    scheduler.add_request(long_request)
+    scheduler.add_request(short_request)
 
-    with pytest.raises(RuntimeError, match="frozen stage predictor"):
-        SchedulerHarness(0)
+    assert isinstance(scheduler.waiting, PolicyOrderedRequestQueue)
+    assert scheduler.waiting.peek_request() is short_request
+
+    long_request.num_computed_tokens = 19
+    assert scheduler.waiting.peek_request() is long_request
 
 
 def test_async_chunk_ready_time_is_recorded_only_after_real_chunk(monkeypatch):

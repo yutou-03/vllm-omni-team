@@ -9,7 +9,7 @@ from vllm_omni.scheduling.policy import (
     get_baseline_scheduling_policy,
     policy_applies_to_stage,
     policy_key,
-    predict_remaining_ms,
+    remaining_prefill_tokens,
 )
 
 
@@ -19,10 +19,12 @@ class FakeRequest:
         request_id: str,
         scheduling: dict,
         *,
+        num_prompt_tokens: int = 10,
         num_computed_tokens: int = 0,
     ) -> None:
         self.request_id = request_id
         self.additional_information = {"meta": scheduling}
+        self.num_prompt_tokens = num_prompt_tokens
         self.num_computed_tokens = num_computed_tokens
 
 
@@ -95,10 +97,11 @@ def test_edf_key_uses_deadline_then_stable_tie_breakers():
     ]
 
 
-def test_srpf_remaining_prediction_is_monotonic_and_stage_local():
+def test_srpf_uses_sarathi_style_local_remaining_prefill_tokens():
     request = FakeRequest(
         "engine-a",
         _scheduling("source-a", ingress_order=0, deadline=20.0),
+        num_prompt_tokens=10,
         num_computed_tokens=5,
     )
     first_key = policy_key(
@@ -117,21 +120,51 @@ def test_srpf_remaining_prediction_is_monotonic_and_stage_local():
         now=3.0,
     )
 
-    assert first_key == (50.0, 1.0, "source-a", "engine-a")
-    assert second_key == (20.0, 1.0, "source-a", "engine-a")
+    assert first_key == (5, 0, "source-a", "engine-a")
+    assert second_key == (2, 0, "source-a", "engine-a")
     assert second_key < first_key
-    assert predict_remaining_ms(
-        total_predicted_ms=100,
-        total_work_units=10,
-        completed_work_units=100,
-    ) == 0.0
+    request.num_computed_tokens = 100
+    assert remaining_prefill_tokens(request) == 0
 
-    with pytest.raises(ValueError, match="finite"):
-        predict_remaining_ms(
-            total_predicted_ms=100,
-            total_work_units=10,
-            completed_work_units=float("nan"),
-        )
+
+def test_srpf_does_not_require_stage_predictions_or_include_output_length():
+    scheduling = {
+        "sched_source_request_id": "source-a",
+        "sched_ingress_order": 3,
+    }
+    short_prefill = FakeRequest(
+        "short",
+        scheduling,
+        num_prompt_tokens=8,
+        num_computed_tokens=4,
+    )
+    short_prefill.max_tokens = 1000
+    long_prefill = FakeRequest(
+        "long",
+        scheduling,
+        num_prompt_tokens=20,
+        num_computed_tokens=10,
+    )
+    long_prefill.max_tokens = 1
+
+    short_key = policy_key(
+        short_prefill,
+        policy=BaselineSchedulingPolicy.SRPF_LOCAL_NP,
+        stage_id=2,
+        data_ready_time=float("inf"),
+        now=2.0,
+    )
+    long_key = policy_key(
+        long_prefill,
+        policy=BaselineSchedulingPolicy.SRPF_LOCAL_NP,
+        stage_id=2,
+        data_ready_time=float("inf"),
+        now=2.0,
+    )
+
+    assert short_key < long_key
+    assert short_key[0] == 4
+    assert long_key[0] == 10
 
 
 def test_enabled_policy_fails_fast_on_missing_metadata():

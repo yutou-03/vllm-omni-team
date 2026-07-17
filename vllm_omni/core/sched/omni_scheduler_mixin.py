@@ -73,11 +73,6 @@ class OmniSchedulerMixin:
 
         if not self._baseline_policy_applies():
             return
-        if self._baseline_policy is BaselineSchedulingPolicy.SRPF_LOCAL_NP:
-            raise RuntimeError(
-                "srpf_local_np is disabled until a frozen stage predictor "
-                "passes the calibration gate"
-            )
 
         self.waiting = maybe_create_policy_ordered_queue(
             self.waiting,

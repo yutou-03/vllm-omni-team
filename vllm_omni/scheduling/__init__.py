@@ -17,7 +17,7 @@ from vllm_omni.scheduling.policy import (
     get_baseline_scheduling_policy,
     policy_applies_to_stage,
     policy_key,
-    predict_remaining_ms,
+    remaining_prefill_tokens,
 )
 from vllm_omni.scheduling.request_queue import (
     PolicyOrderedRequestQueue,
@@ -41,5 +41,5 @@ __all__ = [
     "maybe_create_policy_ordered_queue",
     "policy_applies_to_stage",
     "policy_key",
-    "predict_remaining_ms",
+    "remaining_prefill_tokens",
 ]
