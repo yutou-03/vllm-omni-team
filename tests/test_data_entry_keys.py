@@ -223,6 +223,7 @@ class TestSerializeDeserializePayload:
                 "sched_ingress_monotonic_s": 12.5,
                 "sched_ingress_wall_s": 1700000000.0,
                 "sched_deadline_monotonic_s": 14.0,
+                "sched_stage_deadline_monotonic_s": [13.0, 13.5, 14.0],
                 "sched_slo_ms": 1500.0,
                 "sched_request_path": "audio",
                 "sched_predicted_stage_ms": [10.0, None, 90.0],

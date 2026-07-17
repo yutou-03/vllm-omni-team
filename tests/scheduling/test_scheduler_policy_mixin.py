@@ -20,6 +20,7 @@ class FakeRequest:
         *,
         deadline: float | None,
         ingress_order: int = 0,
+        stage_deadlines: list[float | None] | None = None,
         num_prompt_tokens: int = 10,
         num_computed_tokens: int = 0,
     ) -> None:
@@ -33,6 +34,8 @@ class FakeRequest:
                     "sched_source_request_id": request_id,
                     "sched_ingress_order": ingress_order,
                     "sched_deadline_monotonic_s": deadline,
+                    "sched_stage_deadline_monotonic_s": stage_deadlines
+                    or [deadline - 2.0, deadline - 1.0, deadline],
                 }
             }
 
@@ -78,15 +81,33 @@ def test_native_fcfs_keeps_original_scheduler_queues(monkeypatch):
     assert scheduler.skipped_waiting is scheduler.native_skipped_waiting
 
 
-@pytest.mark.parametrize(
-    ("stage_id", "custom_expected"),
-    [(0, False), (1, False), (2, True)],
-)
-def test_stage2_only_edf_activation(monkeypatch, stage_id, custom_expected):
-    monkeypatch.setenv(BASELINE_POLICY_ENV, "s2_only_edf_np")
+@pytest.mark.parametrize("stage_id", [0, 1, 2])
+def test_stage_deadline_edf_activation(monkeypatch, stage_id):
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "stage_deadline_edf_np")
     scheduler = SchedulerHarness(stage_id)
 
-    assert isinstance(scheduler.waiting, PolicyOrderedRequestQueue) is custom_expected
+    assert isinstance(scheduler.waiting, PolicyOrderedRequestQueue)
+
+
+def test_stage_deadline_edf_uses_current_stage_subdeadline(monkeypatch):
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "stage_deadline_edf_np")
+    scheduler = SchedulerHarness(0)
+    earlier_stage = FakeRequest(
+        "stage-first",
+        deadline=100.0,
+        ingress_order=0,
+        stage_deadlines=[80.0, 90.0, 100.0],
+    )
+    earlier_final = FakeRequest(
+        "final-first",
+        deadline=95.0,
+        ingress_order=1,
+        stage_deadlines=[92.0, 94.0, 95.0],
+    )
+    scheduler.add_request(earlier_final)
+    scheduler.add_request(earlier_stage)
+
+    assert scheduler.waiting.peek_request() is earlier_stage
 
 
 def test_final_edf_orders_waiting_and_running_without_eviction(monkeypatch):

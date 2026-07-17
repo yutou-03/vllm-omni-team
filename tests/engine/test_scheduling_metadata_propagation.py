@@ -24,6 +24,7 @@ def test_rebuilt_stage_request_preserves_identical_scheduling_metadata():
         "sched_ingress_order": 6,
         "sched_ingress_monotonic_s": 20.0,
         "sched_deadline_monotonic_s": 21.5,
+        "sched_stage_deadline_monotonic_s": [20.8, 21.1, 21.5],
         "sched_slo_ms": 1500.0,
     }
     stage0_prompt = {

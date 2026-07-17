@@ -33,12 +33,15 @@ def _scheduling(
     *,
     ingress_order: int,
     deadline: float,
+    stage_deadlines: list[float | None] | None = None,
 ) -> dict:
     return {
         "sched_schema_version": 1,
         "sched_source_request_id": source_request_id,
         "sched_ingress_order": ingress_order,
         "sched_deadline_monotonic_s": deadline,
+        "sched_stage_deadline_monotonic_s": stage_deadlines
+        or [deadline - 2.0, deadline - 1.0, deadline],
         "sched_predicted_stage_ms": [100.0, 200.0, 300.0],
         "sched_predicted_stage_work_units": [10.0, 20.0, 30.0],
     }
@@ -57,11 +60,11 @@ def test_policy_environment_normalizes_and_rejects_unknown_values():
         get_baseline_scheduling_policy({BASELINE_POLICY_ENV: "silent-fallback"})
 
 
-def test_stage2_only_edf_has_explicit_activation_scope():
-    policy = BaselineSchedulingPolicy.S2_ONLY_EDF_NP
+def test_stage_deadline_edf_applies_to_all_stages():
+    policy = BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP
 
-    assert not policy_applies_to_stage(policy, 0)
-    assert not policy_applies_to_stage(policy, 1)
+    assert policy_applies_to_stage(policy, 0)
+    assert policy_applies_to_stage(policy, 1)
     assert policy_applies_to_stage(policy, 2)
 
 
@@ -95,6 +98,51 @@ def test_edf_key_uses_deadline_then_stable_tie_breakers():
         "engine-a",
         "engine-c",
     ]
+
+
+def test_stage_deadline_edf_can_reverse_final_deadline_order_upstream():
+    earlier_stage = FakeRequest(
+        "stage-first",
+        _scheduling(
+            "source-stage",
+            ingress_order=0,
+            deadline=100.0,
+            stage_deadlines=[80.0, 90.0, 100.0],
+        ),
+    )
+    earlier_final = FakeRequest(
+        "final-first",
+        _scheduling(
+            "source-final",
+            ingress_order=1,
+            deadline=95.0,
+            stage_deadlines=[92.0, 94.0, 95.0],
+        ),
+    )
+
+    final_order = sorted(
+        [earlier_stage, earlier_final],
+        key=lambda request: policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,
+            stage_id=0,
+            data_ready_time=0.0,
+            now=0.0,
+        ),
+    )
+    stage_order = sorted(
+        [earlier_stage, earlier_final],
+        key=lambda request: policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP,
+            stage_id=0,
+            data_ready_time=0.0,
+            now=0.0,
+        ),
+    )
+
+    assert final_order == [earlier_final, earlier_stage]
+    assert stage_order == [earlier_stage, earlier_final]
 
 
 def test_srpf_uses_sarathi_style_local_remaining_prefill_tokens():
@@ -175,6 +223,27 @@ def test_enabled_policy_fails_fast_on_missing_metadata():
             request,
             policy=BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,
             stage_id=0,
+            data_ready_time=1.0,
+            now=2.0,
+        )
+
+
+def test_stage_deadline_edf_fails_fast_when_stage_value_is_missing():
+    request = FakeRequest(
+        "text-stage-1",
+        _scheduling(
+            "text-source",
+            ingress_order=0,
+            deadline=20.0,
+            stage_deadlines=[20.0, None, None],
+        ),
+    )
+
+    with pytest.raises(SchedulingMetadataError, match="no value for stage 1"):
+        policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP,
+            stage_id=1,
             data_ready_time=1.0,
             now=2.0,
         )

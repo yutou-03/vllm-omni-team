@@ -3,6 +3,7 @@ import pytest
 from vllm_omni.scheduling.metadata import (
     build_client_scheduling_metadata,
     build_server_scheduling_metadata,
+    derive_stage_deadlines,
     extract_scheduling_metadata,
     merge_scheduling_metadata_into_additional_information,
     normalize_client_scheduling_metadata,
@@ -100,6 +101,39 @@ def test_server_metadata_owns_ingress_and_absolute_deadline():
         "sched_request_path": "text",
         "sched_deadline_monotonic_s": 102.75,
     }
+
+
+def test_server_derives_audio_stage_deadlines_from_final_slo():
+    metadata = build_server_scheduling_metadata(
+        {
+            "schema_version": 1,
+            "source_request_id": "audio-1",
+            "ingress_order": 1,
+            "slo_ms": 2000,
+            "request_path": "audio",
+            "predicted_stage_ms": [500, 300, 700],
+        },
+        ingress_monotonic_s=100.0,
+        ingress_wall_s=1700000000.0,
+    )
+
+    assert metadata["sched_deadline_monotonic_s"] == 102.0
+    assert metadata["sched_stage_deadline_monotonic_s"] == [101.0, 101.3, 102.0]
+
+
+def test_text_stage_deadline_uses_final_deadline_and_rejects_path_mismatch():
+    assert derive_stage_deadlines(
+        deadline_monotonic_s=12.0,
+        request_path="text",
+        predicted_stage_ms=[250.0, None, None],
+    ) == [12.0, None, None]
+
+    with pytest.raises(ValueError, match="must match request_path"):
+        derive_stage_deadlines(
+            deadline_monotonic_s=12.0,
+            request_path="audio",
+            predicted_stage_ms=[250.0, None, 500.0],
+        )
 
 
 def test_scheduling_merge_preserves_existing_payload_fields():

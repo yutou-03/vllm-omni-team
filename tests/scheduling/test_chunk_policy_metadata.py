@@ -45,6 +45,7 @@ def test_chunk_poll_keeps_policy_metadata_when_runtime_payload_replaces_it(
                 "sched_source_request_id": "source-1",
                 "sched_ingress_order": 7,
                 "sched_deadline_monotonic_s": 123.0,
+                "sched_stage_deadline_monotonic_s": [122.0, 122.5, 123.0],
             }
         },
     )
@@ -54,3 +55,8 @@ def test_chunk_poll_keeps_policy_metadata_when_runtime_payload_replaces_it(
     assert metadata["sched_source_request_id"] == "source-1"
     assert metadata["sched_ingress_order"] == 7
     assert metadata["sched_deadline_monotonic_s"] == 123.0
+    assert metadata["sched_stage_deadline_monotonic_s"] == [
+        122.0,
+        122.5,
+        123.0,
+    ]

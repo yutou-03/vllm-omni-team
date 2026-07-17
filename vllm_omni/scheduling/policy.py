@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import Any
 
@@ -20,7 +20,7 @@ class BaselineSchedulingPolicy(str, Enum):
     NATIVE_FCFS = "native_fcfs"
     SRPF_LOCAL_NP = "srpf_local_np"
     FINAL_DEADLINE_EDF_NP = "final_deadline_edf_np"
-    S2_ONLY_EDF_NP = "s2_only_edf_np"
+    STAGE_DEADLINE_EDF_NP = "stage_deadline_edf_np"
 
 
 class SchedulingMetadataError(ValueError):
@@ -61,8 +61,6 @@ def policy_applies_to_stage(
         raise ValueError(f"stage_id must be non-negative, got {stage_id}")
     if policy is BaselineSchedulingPolicy.NATIVE_FCFS:
         return False
-    if policy is BaselineSchedulingPolicy.S2_ONLY_EDF_NP:
-        return stage_id == 2
     return True
 
 
@@ -118,6 +116,25 @@ def _required_field(
     return value
 
 
+def _required_stage_value(
+    metadata: Mapping[str, Any],
+    field: str,
+    *,
+    stage_id: int,
+    request_id: str,
+) -> float:
+    values = _required_field(metadata, field, request_id=request_id)
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise SchedulingMetadataError(
+            f"request {request_id!r} field {field!r} must be a stage sequence"
+        )
+    if stage_id >= len(values) or values[stage_id] is None:
+        raise SchedulingMetadataError(
+            f"request {request_id!r} field {field!r} has no value for stage {stage_id}"
+        )
+    return float(values[stage_id])
+
+
 def policy_key(
     request: Any,
     *,
@@ -128,9 +145,8 @@ def policy_key(
 ) -> PolicyKey:
     """Compute a deterministic total-order key for one eligible request.
 
-    ``native_fcfs`` and stages excluded by the stage-2-only EDF ablation must
-    never call this function. Keeping that path explicit prevents accidental
-    replacement of vLLM's native queue.
+    ``native_fcfs`` must never call this function. Keeping that path explicit
+    prevents accidental replacement of vLLM's native queue.
     """
 
     # Reserved for future age-aware policies; current keys remain time-stable.
@@ -152,15 +168,23 @@ def policy_key(
 
     if policy in (
         BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,
-        BaselineSchedulingPolicy.S2_ONLY_EDF_NP,
+        BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP,
     ):
-        deadline = float(
-            _required_field(
+        if policy is BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP:
+            deadline = float(
+                _required_field(
+                    metadata,
+                    "sched_deadline_monotonic_s",
+                    request_id=request_id,
+                )
+            )
+        else:
+            deadline = _required_stage_value(
                 metadata,
-                "sched_deadline_monotonic_s",
+                "sched_stage_deadline_monotonic_s",
+                stage_id=stage_id,
                 request_id=request_id,
             )
-        )
         if not math.isfinite(deadline):
             raise SchedulingMetadataError(
                 f"request {request_id!r} has a non-finite deadline"

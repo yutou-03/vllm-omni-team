@@ -36,6 +36,7 @@ _SERVER_FIELDS = frozenset(
         "sched_ingress_monotonic_s",
         "sched_ingress_wall_s",
         "sched_deadline_monotonic_s",
+        "sched_stage_deadline_monotonic_s",
         "sched_slo_ms",
         "sched_request_path",
         "sched_predicted_stage_ms",
@@ -306,10 +307,74 @@ def build_server_scheduling_metadata(
 
     slo_ms = normalized.get("slo_ms")
     if slo_ms is not None:
-        server_metadata["sched_deadline_monotonic_s"] = (
-            monotonic_s + slo_ms / 1000.0
-        )
+        deadline = monotonic_s + slo_ms / 1000.0
+        server_metadata["sched_deadline_monotonic_s"] = deadline
+        request_path = normalized.get("request_path")
+        predicted_stage_ms = normalized.get("predicted_stage_ms")
+        if request_path is not None and predicted_stage_ms is not None:
+            server_metadata["sched_stage_deadline_monotonic_s"] = (
+                derive_stage_deadlines(
+                    deadline_monotonic_s=deadline,
+                    request_path=request_path,
+                    predicted_stage_ms=predicted_stage_ms,
+                    context=context,
+                )
+            )
     return server_metadata
+
+
+def derive_stage_deadlines(
+    *,
+    deadline_monotonic_s: float,
+    request_path: str,
+    predicted_stage_ms: Sequence[float | None],
+    context: str = CLIENT_SCHEDULING_FIELD,
+) -> list[float | None]:
+    """Derive immutable per-stage completion deadlines from a final SLO.
+
+    Each stage deadline reserves the frozen predicted service time of every
+    downstream stage on the request path. Text requests stop after stage 0;
+    audio requests traverse stages 0, 1, and 2.
+    """
+
+    deadline = _finite_number(
+        deadline_monotonic_s,
+        field="deadline_monotonic_s",
+        context=context,
+    )
+    normalized_path = str(request_path).lower()
+    if normalized_path not in _REQUEST_PATHS:
+        raise ValueError(
+            f"{context}: request_path must be one of "
+            f"{sorted(_REQUEST_PATHS)!r}, got {request_path!r}"
+        )
+    stage_ms = normalize_stage_vector(
+        predicted_stage_ms,
+        field="predicted_stage_ms",
+        context=context,
+    )
+    path_stages = (0,) if normalized_path == "text" else (0, 1, 2)
+    missing = [stage_id for stage_id in path_stages if stage_ms[stage_id] is None]
+    unexpected = [
+        stage_id
+        for stage_id, value in enumerate(stage_ms)
+        if stage_id not in path_stages and value is not None
+    ]
+    if missing or unexpected:
+        raise ValueError(
+            f"{context}: predicted_stage_ms must match request_path "
+            f"{normalized_path!r}; missing stages={missing}, "
+            f"unexpected stages={unexpected}"
+        )
+
+    stage_deadlines: list[float | None] = [None] * NUM_BASELINE_STAGES
+    downstream_ms = 0.0
+    for stage_id in reversed(path_stages):
+        stage_deadlines[stage_id] = deadline - downstream_ms / 1000.0
+        stage_value = stage_ms[stage_id]
+        assert stage_value is not None
+        downstream_ms += stage_value
+    return stage_deadlines
 
 
 def extract_scheduling_metadata(

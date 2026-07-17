@@ -71,16 +71,16 @@ def test_native_fcfs_factory_returns_exact_original_queue():
     assert wrapped is native_queue
 
 
-def test_stage2_only_edf_keeps_stage0_and_stage1_native():
-    for stage_id in (0, 1):
+def test_stage_deadline_edf_wraps_every_stage_queue():
+    for stage_id in (0, 1, 2):
         native_queue = FCFSRequestQueue()
         wrapped = maybe_create_policy_ordered_queue(
             native_queue,
-            policy=BaselineSchedulingPolicy.S2_ONLY_EDF_NP,
+            policy=BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP,
             stage_id=stage_id,
             data_ready_time=lambda request: 0.0,
         )
-        assert wrapped is native_queue
+        assert isinstance(wrapped, PolicyOrderedRequestQueue)
 
 
 def test_custom_policy_factory_orders_requests_by_shared_policy_key():

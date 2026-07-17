@@ -94,6 +94,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     sched_ingress_monotonic_s: float
     sched_ingress_wall_s: float
     sched_deadline_monotonic_s: float
+    sched_stage_deadline_monotonic_s: list[float | None]
     sched_slo_ms: float
     sched_request_path: str
     sched_predicted_stage_ms: list[float | None]
