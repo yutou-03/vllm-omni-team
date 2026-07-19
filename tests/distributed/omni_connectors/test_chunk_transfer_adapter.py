@@ -522,6 +522,71 @@ def test_cleanup_after_poll_flow(build_adapter):
     assert "ext-flow" not in adapter.request_payload
 
 
+def test_cleanup_during_connector_get_drops_late_payload(build_adapter):
+    """A poll completing after terminal cleanup must not resurrect state.
+
+    An async downstream stage can finish from an earlier chunk while its recv
+    worker is already fetching the next upstream chunk.  Hold connector.get()
+    at that exact boundary, run cleanup, and then let a non-terminal payload
+    arrive.  The transport result is consumed, but it no longer belongs to a
+    live request and must not be published into any receiver dictionary/set.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    req_id, ext_id = "req-late", "ext-late"
+    request = _req(req_id, RequestStatus.RUNNING, external_req_id=ext_id)
+
+    # Model a request that has consumed an earlier chunk and has another poll
+    # in flight.  Without the post-get cancellation check, the late payload
+    # below recreates exactly get_req_chunk/request_payload/finished_load_reqs.
+    adapter.get_req_chunk[req_id] = 1
+    adapter.request_payload[ext_id] = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    adapter.request_ids_mapping[req_id] = ext_id
+
+    get_entered = threading.Event()
+    allow_get_to_return = threading.Event()
+    late_payload: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+
+    def _blocking_get(*_args, **_kwargs):
+        get_entered.set()
+        assert allow_get_to_return.wait(timeout=2.0)
+        return late_payload, 8
+
+    connector.get.side_effect = _blocking_get
+    outcome = {}
+
+    def _poll():
+        try:
+            outcome["result"] = adapter._poll_single_request(request)
+        except BaseException as error:  # pragma: no cover - assertion reports it
+            outcome["error"] = error
+
+    poll_thread = threading.Thread(target=_poll)
+    poll_thread.start()
+    assert get_entered.wait(timeout=2.0)
+
+    adapter.cleanup(req_id, ext_id)
+    allow_get_to_return.set()
+    poll_thread.join(timeout=2.0)
+
+    assert not poll_thread.is_alive()
+    assert "error" not in outcome
+    assert outcome["result"] is True
+    assert req_id not in adapter.finished_requests
+    assert req_id not in adapter.get_req_chunk
+    assert req_id not in adapter._finished_load_reqs
+    assert req_id not in adapter.requests_with_ready_chunks
+    assert req_id not in adapter.request_ids_mapping
+    assert req_id not in adapter._cancelled_load_reqs
+    assert ext_id not in adapter.request_payload
+    assert request.additional_information is None
+
+
 def test_finish_requests_restores_status(build_adapter):
     """Abort path must pop ``requests_origin_status`` and restore pre-wait status.
 

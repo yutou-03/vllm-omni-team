@@ -139,7 +139,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         stage_id = self.connector.stage_id
         target_stage_id = stage_id - 1
         req_id = request.request_id
-        chunk_id = self.get_req_chunk[req_id]
+        # Reading the prospective chunk id must not recreate receiver state if
+        # cleanup wins immediately before this in-flight poll starts.
+        chunk_id = self.get_req_chunk.get(req_id, 0)
         external_req_id = self.request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
@@ -163,54 +165,66 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             previous_additional_information = deserialize_additional_information(
                 getattr(request, "additional_information", None)
             )
-            # Update connector state
-            self.get_req_chunk[req_id] += 1
-
             meta = payload_data.get("meta", {})
-            if self.model_mode == "ar":
-                merged_payload = self._update_request_payload(external_req_id, payload_data)
-                request.additional_information = preserve_scheduling_metadata(
-                    previous_additional_information,
-                    merged_payload,
-                )
-                if meta.get("finished"):
-                    self.finished_requests.add(req_id)
-            else:
-                if meta.get("finished"):
-                    self.finished_requests.add(req_id)
-
-                new_ids = payload_data.get("codes", {}).get("audio", [])
-                request.prompt_token_ids = new_ids
-                info = dict(previous_additional_information)
-                for key, value in payload_data.items():
-                    if key == "codes":
-                        continue
-                    if isinstance(value, dict):
-                        existing_sub = info.get(key)
-                        merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                        for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
-                                continue
-                            merged_sub[sk] = sv
-                        info[key] = merged_sub
-                        continue
-                    info[key] = value
-                request.additional_information = preserve_scheduling_metadata(
-                    previous_additional_information,
-                    info,
-                )
-                request.num_computed_tokens = 0
-
-                # Empty chunk with more data expected: keep polling.
-                if not new_ids and not meta.get("finished"):
+            # cleanup_receiver() can run while connector.get()/deserialization
+            # is in flight (for example when a downstream AR stage terminates
+            # while a later upstream chunk is arriving).  Serialize the final
+            # cancellation check and all receiver-state publication with that
+            # cleanup.  The connector payload has already been consumed, so a
+            # cancelled late arrival must be dropped instead of resurrecting
+            # get/payload/finished bookkeeping for a completed request.
+            with self._drain_state_lock:
+                if req_id in self._cancelled_load_reqs:
+                    self._cancelled_load_reqs.discard(req_id)
                     return True
 
-            # Mark as finished for consumption
-            nvtx_mark(
-                f"s{stage_id}_chunk_ready:req={str(req_id)[-8:]}:"
-                f"chunk={chunk_id}:finished={int(bool(meta.get('finished')))}"
-            )
-            self._finished_load_reqs.add(req_id)
+                # Update connector state.
+                self.get_req_chunk[req_id] += 1
+
+                if self.model_mode == "ar":
+                    merged_payload = self._update_request_payload(external_req_id, payload_data)
+                    request.additional_information = preserve_scheduling_metadata(
+                        previous_additional_information,
+                        merged_payload,
+                    )
+                    if meta.get("finished"):
+                        self.finished_requests.add(req_id)
+                else:
+                    if meta.get("finished"):
+                        self.finished_requests.add(req_id)
+
+                    new_ids = payload_data.get("codes", {}).get("audio", [])
+                    request.prompt_token_ids = new_ids
+                    info = dict(previous_additional_information)
+                    for key, value in payload_data.items():
+                        if key == "codes":
+                            continue
+                        if isinstance(value, dict):
+                            existing_sub = info.get(key)
+                            merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                            for sk, sv in value.items():
+                                if key == "meta" and sk == "finished":
+                                    continue
+                                merged_sub[sk] = sv
+                            info[key] = merged_sub
+                            continue
+                        info[key] = value
+                    request.additional_information = preserve_scheduling_metadata(
+                        previous_additional_information,
+                        info,
+                    )
+                    request.num_computed_tokens = 0
+
+                    # Empty chunk with more data expected: keep polling.
+                    if not new_ids and not meta.get("finished"):
+                        return True
+
+                # Mark as finished for consumption.
+                nvtx_mark(
+                    f"s{stage_id}_chunk_ready:req={str(req_id)[-8:]}:"
+                    f"chunk={chunk_id}:finished={int(bool(meta.get('finished')))}"
+                )
+                self._finished_load_reqs.add(req_id)
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
 
@@ -376,14 +390,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
-        self.finished_requests.discard(request_id)
-        self.get_req_chunk.pop(request_id, None)
-        self.requests_with_ready_chunks.discard(request_id)
-        self.request_ids_mapping.pop(request_id, None)
-        self.requests_origin_status.pop(request_id, None)
+        # Pair this critical section with the post-get commit in
+        # _poll_single_request().  Whichever side acquires the lock last wins:
+        # cleanup either clears an already-published chunk or leaves a
+        # cancellation tombstone that makes the in-flight poll drop it.
+        with self._drain_state_lock:
+            self.finished_requests.discard(request_id)
+            self.get_req_chunk.pop(request_id, None)
+            self.requests_with_ready_chunks.discard(request_id)
+            self.request_ids_mapping.pop(request_id, None)
+            self.requests_origin_status.pop(request_id, None)
 
-        self._cancelled_load_reqs.add(request_id)
-        self._finished_load_reqs.discard(request_id)
+            self._cancelled_load_reqs.add(request_id)
+            self._finished_load_reqs.discard(request_id)
 
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).

@@ -78,10 +78,16 @@ class OmniTransferAdapterBase:
                     self._recv_inflight += 1
                 try:
                     request_id = request.request_id
-                    if request_id in self._cancelled_load_reqs:
-                        self._cancelled_load_reqs.discard(request_id)
-                        continue
-                    self.request_ids_mapping[request_id] = request.external_req_id
+                    # Receiver cleanup may run from the save thread while this
+                    # worker is between dequeue and connector.get().  Keep the
+                    # cancellation check and mapping publication atomic with
+                    # cleanup_receiver() so cleanup cannot be followed by a
+                    # stale mapping write.
+                    with self._drain_state_lock:
+                        if request_id in self._cancelled_load_reqs:
+                            self._cancelled_load_reqs.discard(request_id)
+                            continue
+                        self.request_ids_mapping[request_id] = request.external_req_id
                     is_success = self._poll_single_request(request)
                     if is_success:
                         any_success = True
