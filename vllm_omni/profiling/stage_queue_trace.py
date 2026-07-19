@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
@@ -68,9 +69,27 @@ def _write_jsonl(filename: str, payload: dict[str, Any]) -> None:
     try:
         os.makedirs(_TRACE_DIR, exist_ok=True)
         path = os.path.join(_TRACE_DIR, filename)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, default=_json_default, sort_keys=True))
-            f.write("\n")
+        line = (
+            json.dumps(payload, default=_json_default, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        descriptor = os.open(
+            path,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC,
+            0o644,
+        )
+        try:
+            # All stage processes share these JSONL files.  Keep a complete
+            # record under one cross-process lock so large iteration payloads
+            # cannot splice two JSON objects into the same line.
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            view = memoryview(line)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("trace write made no progress")
+                view = view[written:]
+        finally:
+            os.close(descriptor)
     except Exception:
         # Trace should never affect serving correctness.
         return

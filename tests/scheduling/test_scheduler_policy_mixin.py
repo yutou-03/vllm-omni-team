@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import multiprocessing
 import os
 import tempfile
 from types import SimpleNamespace
@@ -38,6 +40,24 @@ class FakeRequest:
                     or [deadline - 2.0, deadline - 1.0, deadline],
                 }
             }
+
+
+def _write_concurrent_trace_records(
+    trace_dir: str,
+    worker_id: int,
+    records: int,
+) -> None:
+    os.environ.pop("STAGE_QUEUE_TRACE_DISABLE", None)
+    stage_queue_trace._TRACE_DIR = trace_dir
+    for record_id in range(records):
+        stage_queue_trace._write_jsonl(
+            "iteration_events.jsonl",
+            {
+                "worker_id": worker_id,
+                "record_id": record_id,
+                "large_payload": "x" * 16_384,
+            },
+        )
 
 
 class FakeBaseScheduler:
@@ -251,3 +271,41 @@ def test_conformance_trace_default_path_is_safe_temp_directory():
         tempfile.gettempdir() + os.sep
     )
     assert "motivation/stage_queue" not in stage_queue_trace._DEFAULT_TRACE_DIR
+
+
+def test_trace_jsonl_records_do_not_interleave_across_processes(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    worker_count = 6
+    records_per_worker = 20
+    processes = [
+        context.Process(
+            target=_write_concurrent_trace_records,
+            args=(str(tmp_path), worker_id, records_per_worker),
+        )
+        for worker_id in range(worker_count)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("concurrent trace writer did not exit")
+        assert process.exitcode == 0
+
+    lines = (tmp_path / "iteration_events.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    records = [json.loads(line) for line in lines]
+    assert len(records) == worker_count * records_per_worker
+    assert all(len(record["large_payload"]) == 16_384 for record in records)
+    assert {
+        (record["worker_id"], record["record_id"])
+        for record in records
+    } == {
+        (worker_id, record_id)
+        for worker_id in range(worker_count)
+        for record_id in range(records_per_worker)
+    }
