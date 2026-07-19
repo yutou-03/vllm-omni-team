@@ -273,6 +273,55 @@ def test_conformance_trace_default_path_is_safe_temp_directory():
     assert "motivation/stage_queue" not in stage_queue_trace._DEFAULT_TRACE_DIR
 
 
+def test_request_metrics_trace_mode_keeps_only_calibration_join_events(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("STAGE_QUEUE_TRACE_DISABLE", raising=False)
+    monkeypatch.setenv("STAGE_QUEUE_TRACE_MODE", "request_metrics")
+    monkeypatch.setattr(stage_queue_trace, "_TRACE_DIR", str(tmp_path))
+
+    stage_queue_trace._write_jsonl(
+        "stage_events.jsonl",
+        {"event": "request_ingress", "request_id": "server-id"},
+    )
+    stage_queue_trace._write_jsonl(
+        "stage_events.jsonl",
+        {"event": "stage_done_metrics", "request_id": "server-id"},
+    )
+    stage_queue_trace._write_jsonl(
+        "stage_events.jsonl",
+        {"event": "stage_forward", "request_id": None},
+    )
+    stage_queue_trace._write_jsonl(
+        "iteration_events.jsonl",
+        {"event": "iteration", "iteration_id": 1},
+    )
+    stage_queue_trace._write_jsonl(
+        "connector_events.jsonl",
+        {"event": "transfer_rx", "request_id": "server-id"},
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "stage_events.jsonl").read_text().splitlines()
+    ]
+    assert [record["event"] for record in records] == [
+        "request_ingress",
+        "stage_done_metrics",
+    ]
+    assert not (tmp_path / "iteration_events.jsonl").exists()
+    assert not (tmp_path / "connector_events.jsonl").exists()
+
+
+def test_unknown_trace_mode_fails_open_to_full_evidence(monkeypatch):
+    monkeypatch.setenv("STAGE_QUEUE_TRACE_MODE", "misspelled")
+    assert stage_queue_trace._record_enabled(
+        "iteration_events.jsonl",
+        {"event": "iteration"},
+    )
+
+
 def test_trace_jsonl_records_do_not_interleave_across_processes(tmp_path):
     context = multiprocessing.get_context("spawn")
     worker_count = 6

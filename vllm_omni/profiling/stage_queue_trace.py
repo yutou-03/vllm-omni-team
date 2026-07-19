@@ -19,6 +19,7 @@ _DEFAULT_TRACE_DIR = os.path.join(
 _TRACE_DIR = os.environ.get("STAGE_QUEUE_TRACE_DIR", _DEFAULT_TRACE_DIR)
 _RUN_ID = os.environ.get("STAGE_QUEUE_RUN_ID", "server")
 _PID = os.getpid()
+_REQUEST_METRICS_EVENTS = frozenset({"request_ingress", "stage_done_metrics"})
 
 
 class ConformanceIneligibleReason(str, Enum):
@@ -55,6 +56,29 @@ def conformance_trace_enabled() -> bool:
     )
 
 
+def _record_enabled(filename: str, payload: dict[str, Any]) -> bool:
+    """Apply an optional low-overhead trace filter for unloaded calibration.
+
+    Full tracing remains the default.  ``request_metrics`` retains only the
+    two request-scoped events needed to join client completion with server
+    ingress and per-stage generation durations; scheduler iterations,
+    forward spans, connector events, and per-token events are intentionally
+    omitted so synchronous trace I/O does not dominate unloaded latency.
+    """
+
+    mode = os.environ.get("STAGE_QUEUE_TRACE_MODE", "full").strip().lower()
+    if mode in ("", "full"):
+        return True
+    if mode == "request_metrics":
+        return (
+            filename == "stage_events.jsonl"
+            and payload.get("event") in _REQUEST_METRICS_EVENTS
+        )
+    # A typo must not silently remove correctness evidence.  Fall back to the
+    # existing full trace, which is noisy but preserves all observations.
+    return True
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, set):
         return sorted(value)
@@ -64,7 +88,7 @@ def _json_default(value: Any) -> Any:
 
 
 def _write_jsonl(filename: str, payload: dict[str, Any]) -> None:
-    if not _enabled():
+    if not _enabled() or not _record_enabled(filename, payload):
         return
     try:
         os.makedirs(_TRACE_DIR, exist_ok=True)
