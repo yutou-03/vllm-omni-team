@@ -144,6 +144,28 @@ def test_save_async(build_adapter):
     assert task["is_finished"] is False
 
 
+def test_terminal_empty_save_never_leaves_put_chunk_key(build_adapter):
+    """Enqueue tracing and empty terminal processing must be side-effect free."""
+    adapter, _ = build_adapter(stage_id=0)
+    request = _req("req-text", RequestStatus.FINISHED_STOPPED, external_req_id="ext-text")
+    request.additional_information = {"omni_final_stage_id": 0}
+
+    def _empty_terminal_builder(*, transfer_manager, request, **kwargs):
+        # Match builders that inspect the defaultdict chunk index before
+        # deciding that this terminal request has no downstream payload.
+        transfer_manager.put_req_chunk[request.external_req_id]
+        return None
+
+    adapter.custom_process_next_stage_input_func = _empty_terminal_builder
+
+    adapter.save_async(pooling_output=None, request=request)
+
+    assert "ext-text" not in adapter.put_req_chunk
+    task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(task)
+    assert "ext-text" not in adapter.put_req_chunk
+
+
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-finished", RequestStatus.FINISHED_STOPPED, external_req_id="ext-finished")
@@ -158,6 +180,120 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     args, _ = cleanup_calls[0]
     assert args[0] == "req-finished"
     assert args[1] == "ext-finished"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"x": [1]},
+        {"meta": {"finished": False}},
+    ],
+    ids=["missing-finished", "false-finished"],
+)
+def test_terminal_payload_requires_finished_true(build_adapter, payload):
+    """A terminal send without an explicit true EOF marker fails closed."""
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-terminal", RequestStatus.FINISHED_STOPPED, external_req_id="ext-terminal")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: payload
+
+    with pytest.raises(
+        RuntimeError,
+        match="terminal save task emitted a payload without finished=true",
+    ):
+        adapter._send_single_request(
+            {"pooling_output": None, "request": request, "is_finished": True}
+        )
+
+    connector.put.assert_called_once()
+    # The successful put remains visible as live sender state.  save_loop will
+    # additionally persist the raised protocol error in _background_fault.
+    assert adapter.put_req_chunk["ext-terminal"] == 1
+
+
+def test_finished_empty_payload_cleans_only_target_sender_state(build_adapter):
+    """A proven local-final request cleans only its zero-valued sender key."""
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-text", RequestStatus.FINISHED_STOPPED, external_req_id="ext-text")
+    request.additional_information = {"omni_final_stage_id": 0}
+
+    adapter.put_req_chunk["ext-text"] = 0
+    adapter.put_req_chunk["ext-other"] = 3
+    adapter.request_payload["ext-other"] = {"buffered": True}
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: None
+
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": True}
+    )
+
+    connector.put.assert_not_called()
+    assert "ext-text" not in adapter.put_req_chunk
+    assert adapter.put_req_chunk["ext-other"] == 3
+    assert adapter.request_payload["ext-other"] == {"buffered": True}
+
+
+@pytest.mark.parametrize(
+    "additional_information",
+    [None, {}, {"omni_final_stage_id": 1}],
+)
+def test_finished_empty_payload_without_local_final_proof_raises(
+    build_adapter,
+    additional_information,
+):
+    """Unknown or downstream routes need an EOF payload and fail closed."""
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-unsafe", RequestStatus.FINISHED_STOPPED, external_req_id="ext-unsafe")
+    request.additional_information = additional_information
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: None
+
+    with pytest.raises(RuntimeError, match="without a proven local-final route"):
+        adapter._send_single_request(
+            {"pooling_output": None, "request": request, "is_finished": True}
+        )
+
+    connector.put.assert_not_called()
+
+
+@pytest.mark.parametrize("live_state", ["sent_chunk", "payload", "codes"])
+def test_finished_empty_payload_with_live_sender_state_raises(
+    build_adapter,
+    live_state,
+):
+    """Even a local-final route cannot discard buffered or previously sent data."""
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-live", RequestStatus.FINISHED_STOPPED, external_req_id="ext-live")
+    request.additional_information = {"omni_final_stage_id": 0}
+    if live_state == "sent_chunk":
+        adapter.put_req_chunk["ext-live"] = 1
+    elif live_state == "payload":
+        adapter.request_payload["ext-live"] = {"buffered": True}
+    else:
+        adapter.code_prompt_token_ids["ext-live"] = [[1, 2]]
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: None
+
+    with pytest.raises(RuntimeError, match="with live sender state"):
+        adapter._send_single_request(
+            {"pooling_output": None, "request": request, "is_finished": True}
+        )
+
+    connector.put.assert_not_called()
+
+
+def test_unfinished_empty_payload_preserves_async_sender_state(build_adapter):
+    """An empty partial result may be a buffered chunk, so it remains live."""
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-partial", RequestStatus.RUNNING, external_req_id="ext-partial")
+
+    adapter.put_req_chunk["ext-partial"] = 0
+    adapter.request_payload["ext-partial"] = {"buffered": True}
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: None
+
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": False}
+    )
+
+    connector.put.assert_not_called()
+    assert adapter.put_req_chunk["ext-partial"] == 0
+    assert adapter.request_payload["ext-partial"] == {"buffered": True}
 
 
 def test_update_request_payload(build_adapter):

@@ -126,7 +126,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         }
         if request is not None:
             req_id = getattr(request, "external_req_id", getattr(request, "request_id", ""))
-            chunk_id = self.put_req_chunk[req_id]
+            # Merely tracing an enqueue must not create sender bookkeeping.
+            # Some terminal requests (for example text-only requests that end
+            # at stage 0) legitimately produce no next-stage payload.
+            chunk_id = self.put_req_chunk.get(req_id, 0)
             nvtx_mark(f"s{self.connector.stage_id}_save_async:req={str(req_id)[-8:]}:chunk={chunk_id}")
         self._enqueue_save_request(task)
         with self._save_cond:
@@ -249,7 +252,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
-        chunk_id = self.put_req_chunk[external_req_id]
+        # Payload builders own creation of per-request chunk state when they
+        # actually need it.  Reading the prospective chunk id must not leave a
+        # defaultdict entry behind for a request with no downstream payload.
+        chunk_id = self.put_req_chunk.get(external_req_id, 0)
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data = None
@@ -270,6 +276,45 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 ) from e
 
         if not payload_data:
+            # A non-terminal empty result can mean that an async builder is
+            # buffering a partial chunk, so its sender state remains live.  A
+            # terminal empty result is safe only when metadata proves that this
+            # stage is the request's final stage and no data has ever been
+            # buffered or sent downstream.  Otherwise an empty terminal result
+            # would omit the downstream EOF marker, so fail drain closed rather
+            # than hiding a real protocol error.
+            if is_finished:
+                try:
+                    request_info = deserialize_additional_information(
+                        getattr(request, "additional_information", None)
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        "terminal request produced no payload and final-stage "
+                        f"metadata could not be decoded for {external_req_id}: {e}"
+                    ) from e
+
+                final_stage_id = request_info.get("omni_final_stage_id")
+                current_stage_id = self.connector.stage_id
+                safe_local_terminal = (
+                    type(final_stage_id) is int
+                    and type(current_stage_id) is int
+                    and final_stage_id <= current_stage_id
+                    and self.put_req_chunk.get(external_req_id, 0) == 0
+                    and external_req_id not in self.request_payload
+                    and external_req_id not in self.code_prompt_token_ids
+                )
+                if not safe_local_terminal:
+                    raise RuntimeError(
+                        "terminal request produced no payload without a proven "
+                        "local-final route or with live sender state: "
+                        f"request={external_req_id}, final_stage_id={final_stage_id!r}, "
+                        f"current_stage_id={current_stage_id!r}, "
+                        f"put_chunks={self.put_req_chunk.get(external_req_id, 0)!r}, "
+                        f"has_payload={external_req_id in self.request_payload}, "
+                        f"has_codes={external_req_id in self.code_prompt_token_ids}"
+                    )
+                self.cleanup_sender(external_req_id)
             return
 
         nvtx_mark(f"s{stage_id}_send_enqueue:req={str(external_req_id)[-8:]}:chunk={chunk_id}")
@@ -295,6 +340,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
         elif finished_flag is not None:
             is_payload_finished = bool(finished_flag)
+
+        # A successful connector put is not sufficient for a terminal save:
+        # the receiver also needs an explicit EOF marker.  Preserve the sender
+        # bookkeeping and fail closed if the payload violates that protocol;
+        # save_loop will persist the exception in _background_fault.
+        if is_finished and not is_payload_finished:
+            raise RuntimeError(
+                "terminal save task emitted a payload without finished=true: "
+                f"request={external_req_id}, key={connector_put_key}, "
+                f"finished={finished_flag!r}"
+            )
 
         # Reclaim per-request async state only after the terminal payload
         # has been sent successfully. This avoids cleanup->save races.
