@@ -204,6 +204,24 @@ class OmniSchedulerMixin:
                         ConformanceIneligibleReason.WAITING_FOR_CHUNK.value
                     )
                     continue
+                if (
+                    location == "running"
+                    and request.num_output_placeholders > 0
+                    and request.max_tokens is not None
+                    and request.num_computed_tokens
+                    + 2
+                    - request.num_output_placeholders
+                    >= request.num_prompt_tokens + request.max_tokens
+                ):
+                    # Match Scheduler.schedule's async final-placeholder skip:
+                    # the previous step has already selected enough work to
+                    # reach max_tokens, so this request is only waiting for its
+                    # final sampled token to replace the placeholder.  Other
+                    # requests selected in the previous step remain runnable.
+                    ineligible_reasons[request_id] = (
+                        ConformanceIneligibleReason.ASYNC_OUTPUT_PENDING_AT_TOKEN_LIMIT.value
+                    )
+                    continue
                 if location != "running" and sequence_slots == 0:
                     ineligible_reasons[request_id] = (
                         ConformanceIneligibleReason.NONPREEMPTIVE_RUNNING_CAPACITY.value

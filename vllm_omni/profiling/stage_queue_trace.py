@@ -33,6 +33,9 @@ class ConformanceIneligibleReason(str, Enum):
     TOKEN_BUDGET_EXHAUSTED = "token_budget_exhausted"
     KV_ALLOCATION_FAILED = "kv_allocation_failed"
     ALREADY_SELECTED = "already_selected"
+    ASYNC_OUTPUT_PENDING_AT_TOKEN_LIMIT = (
+        "async_output_pending_at_token_limit"
+    )
     UNKNOWN = "unknown"
 
 

@@ -25,10 +25,14 @@ class FakeRequest:
         stage_deadlines: list[float | None] | None = None,
         num_prompt_tokens: int = 10,
         num_computed_tokens: int = 0,
+        max_tokens: int | None = 8,
+        num_output_placeholders: int = 0,
     ) -> None:
         self.request_id = request_id
         self.num_prompt_tokens = num_prompt_tokens
         self.num_computed_tokens = num_computed_tokens
+        self.max_tokens = max_tokens
+        self.num_output_placeholders = num_output_placeholders
         self.additional_information = None
         if deadline is not None:
             self.additional_information = {
@@ -264,6 +268,83 @@ def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
     assert captured["sequence_slots_before"] == 1
     assert captured["ineligible_reasons"] == {}
     assert captured["policy_activation"] is True
+
+
+@pytest.mark.parametrize(
+    (
+        "num_computed_tokens",
+        "max_tokens",
+        "num_output_placeholders",
+        "expected_runnable",
+    ),
+    [
+        pytest.param(100, 4, 0, True, id="no-placeholder"),
+        pytest.param(12, 4, 1, True, id="one-placeholder-one-token-short"),
+        pytest.param(13, 4, 1, False, id="one-placeholder-at-limit"),
+        pytest.param(14, 4, 3, True, id="draft-placeholders-one-token-short"),
+        pytest.param(15, 4, 3, False, id="draft-placeholders-at-limit"),
+        pytest.param(100, None, 1, True, id="unset-max-tokens"),
+    ],
+)
+def test_conformance_snapshot_matches_async_final_placeholder_boundary(
+    monkeypatch,
+    num_computed_tokens,
+    max_tokens,
+    num_output_placeholders,
+    expected_runnable,
+):
+    monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
+    scheduler = SchedulerHarness(0)
+    request = FakeRequest(
+        "async-decode",
+        deadline=None,
+        num_prompt_tokens=10,
+        num_computed_tokens=num_computed_tokens,
+        max_tokens=max_tokens,
+        num_output_placeholders=num_output_placeholders,
+    )
+    scheduler.running = [request]
+    # Being selected in the previous async step is not sufficient by itself
+    # to make a request ineligible; normal continuous decode must remain in
+    # the replayable runnable set.
+    scheduler.prev_step_scheduled_req_ids = {request.request_id}
+
+    scheduler._baseline_prepare_schedule(token_budget_before=1)
+
+    snapshot = scheduler._baseline_conformance_snapshot
+    assert snapshot is not None
+    if expected_runnable:
+        assert snapshot["runnable_req_ids"] == [request.request_id]
+        assert snapshot["ineligible_reasons"] == {}
+    else:
+        assert snapshot["runnable_req_ids"] == []
+        assert snapshot["ineligible_reasons"] == {
+            request.request_id: "async_output_pending_at_token_limit"
+        }
+
+
+def test_conformance_snapshot_does_not_apply_final_placeholder_skip_to_waiting(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
+    scheduler = SchedulerHarness(0)
+    scheduler.max_num_running_reqs = 1
+    request = FakeRequest(
+        "waiting-placeholder",
+        deadline=None,
+        num_prompt_tokens=10,
+        num_computed_tokens=13,
+        max_tokens=4,
+        num_output_placeholders=1,
+    )
+    scheduler.waiting.add_request(request)
+
+    scheduler._baseline_prepare_schedule(token_budget_before=1)
+
+    snapshot = scheduler._baseline_conformance_snapshot
+    assert snapshot is not None
+    assert snapshot["runnable_req_ids"] == [request.request_id]
+    assert snapshot["ineligible_reasons"] == {}
 
 
 def test_conformance_trace_default_path_is_safe_temp_directory():
