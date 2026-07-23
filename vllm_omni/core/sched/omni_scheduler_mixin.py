@@ -28,7 +28,10 @@ from vllm_omni.scheduling.policy import (
     policy_applies_to_stage,
     policy_key,
 )
-from vllm_omni.scheduling.request_queue import maybe_create_policy_ordered_queue
+from vllm_omni.scheduling.request_queue import (
+    PolicyOrderedRequestQueue,
+    maybe_create_policy_ordered_queue,
+)
 
 _STATS_INTERVAL_S = 1.0
 
@@ -69,7 +72,11 @@ class OmniSchedulerMixin:
         self._baseline_policy = get_baseline_scheduling_policy()
         self._baseline_stage_id = int(self._omni_stage_id_for_trace())
         self._baseline_data_ready_time: dict[str, float] = {}
+        self._baseline_data_ready_order: dict[str, int] = {}
+        self._baseline_next_data_ready_order = 0
         self._baseline_conformance_snapshot: dict[str, Any] | None = None
+        self._baseline_policy_order_snapshot: dict[str, Any] | None = None
+        self._baseline_waiting_queue_choices: list[dict[str, Any]] = []
 
         if not self._baseline_policy_applies():
             return
@@ -119,15 +126,44 @@ class OmniSchedulerMixin:
             return True
         return getattr(self, "chunk_transfer_adapter", None) is None
 
-    def _baseline_validate_and_track_admission(self, request: Request) -> None:
-        if not self._baseline_policy_applies():
+    def _baseline_mark_data_ready(
+        self,
+        request_id: str,
+        *,
+        ready_time: float,
+    ) -> None:
+        if request_id in self._baseline_data_ready_time:
             return
+        ready_order = self._baseline_next_data_ready_order
+        self._baseline_next_data_ready_order += 1
+        self._baseline_data_ready_time[request_id] = ready_time
+        self._baseline_data_ready_order[request_id] = ready_order
+        emit_stage_event(
+            "stage_data_ready",
+            stage_id=self._baseline_stage_id,
+            request_id=request_id,
+            data_ready_monotonic_s=ready_time,
+            stage_ready_order=ready_order,
+        )
+
+    def _baseline_validate_and_track_admission(self, request: Request) -> None:
         if self._baseline_request_is_ready_on_add():
-            self._baseline_data_ready_time.setdefault(
-                request.request_id,
-                time.monotonic(),
+            self._baseline_mark_data_ready(
+                str(request.request_id),
+                ready_time=time.monotonic(),
             )
-        self._baseline_request_key(request)
+        if self._baseline_policy_applies():
+            self._baseline_request_key(request)
+
+    @staticmethod
+    def _baseline_queue_insertion_order(queue: Any) -> list[Request]:
+        if isinstance(queue, PolicyOrderedRequestQueue):
+            return queue.insertion_order()
+        return list(queue)
+
+    @staticmethod
+    def _baseline_request_ids(requests: list[Request]) -> list[str]:
+        return [str(request.request_id) for request in requests]
 
     def _baseline_prepare_schedule(
         self,
@@ -136,13 +172,53 @@ class OmniSchedulerMixin:
     ) -> None:
         """Refresh data-ready times and order runnable requests in place."""
 
+        self._baseline_waiting_queue_choices = []
+        trace_mechanism = conformance_trace_enabled()
+        before_orders: dict[str, list[str]] = {}
+        if trace_mechanism:
+            before_orders = {
+                "running": self._baseline_request_ids(list(self.running)),
+                "waiting": self._baseline_request_ids(
+                    self._baseline_queue_insertion_order(self.waiting)
+                ),
+                "skipped_waiting": self._baseline_request_ids(
+                    self._baseline_queue_insertion_order(self.skipped_waiting)
+                ),
+            }
+
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            ready_time = time.monotonic()
+            for request_id in adapter.requests_with_ready_chunks:
+                self._baseline_mark_data_ready(
+                    str(request_id),
+                    ready_time=ready_time,
+                )
         if self._baseline_policy_applies():
-            adapter = getattr(self, "chunk_transfer_adapter", None)
-            if adapter is not None:
-                ready_time = time.monotonic()
-                for request_id in adapter.requests_with_ready_chunks:
-                    self._baseline_data_ready_time.setdefault(request_id, ready_time)
             self.running.sort(key=self._baseline_request_key)
+
+        if trace_mechanism:
+            after_orders = {
+                "running": self._baseline_request_ids(list(self.running)),
+                "waiting": self._baseline_request_ids(list(self.waiting)),
+                "skipped_waiting": self._baseline_request_ids(
+                    list(self.skipped_waiting)
+                ),
+            }
+            reordered_domains = [
+                domain
+                for domain in before_orders
+                if before_orders[domain] != after_orders[domain]
+            ]
+            self._baseline_policy_order_snapshot = {
+                "mechanism_trace_version": 1,
+                "queue_orders_before_policy": before_orders,
+                "queue_orders_after_policy": after_orders,
+                "policy_reordered": bool(reordered_domains),
+                "policy_reordered_domains": reordered_domains,
+            }
+        else:
+            self._baseline_policy_order_snapshot = None
         self._baseline_capture_conformance_snapshot(
             token_budget_before=token_budget_before,
         )
@@ -282,6 +358,12 @@ class OmniSchedulerMixin:
             "ineligible_reasons": ineligible_reasons,
             "token_budget_before": token_budget_before,
             "sequence_slots_before": sequence_slots,
+            "stage_ready_order": {
+                request_id: self._baseline_data_ready_order[request_id]
+                for request_id in request_locations
+                if request_id in self._baseline_data_ready_order
+            },
+            **(self._baseline_policy_order_snapshot or {}),
         }
 
     def _baseline_forget_request_ids(self, request_ids: Any) -> None:
@@ -290,11 +372,13 @@ class OmniSchedulerMixin:
             return
         if request_ids is None:
             ready_times.clear()
+            self._baseline_data_ready_order.clear()
             return
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
         for request_id in request_ids:
             ready_times.pop(request_id, None)
+            self._baseline_data_ready_order.pop(request_id, None)
 
     def _omni_stage_id_for_trace(self) -> int | str:
         return getattr(self.vllm_config.model_config, "stage_id", "?")
@@ -337,13 +421,27 @@ class OmniSchedulerMixin:
         if not self._baseline_policy_applies():
             return super()._select_waiting_queue_for_scheduling()
         if self.waiting and self.skipped_waiting:
-            waiting_key = self._baseline_request_key(
-                self.waiting.peek_request()
+            waiting_request = self.waiting.peek_request()
+            skipped_request = self.skipped_waiting.peek_request()
+            waiting_key = self._baseline_request_key(waiting_request)
+            skipped_key = self._baseline_request_key(skipped_request)
+            choose_waiting = waiting_key <= skipped_key
+            self._baseline_waiting_queue_choices.append(
+                {
+                    "waiting_head_request_id": str(waiting_request.request_id),
+                    "waiting_head_policy_key": list(waiting_key),
+                    "skipped_waiting_head_request_id": str(
+                        skipped_request.request_id
+                    ),
+                    "skipped_waiting_head_policy_key": list(skipped_key),
+                    "chosen_queue": (
+                        "waiting" if choose_waiting else "skipped_waiting"
+                    ),
+                    # Native FCFS always resumes skipped_waiting first.
+                    "differs_from_native_fcfs": choose_waiting,
+                }
             )
-            skipped_key = self._baseline_request_key(
-                self.skipped_waiting.peek_request()
-            )
-            return self.waiting if waiting_key <= skipped_key else self.skipped_waiting
+            return self.waiting if choose_waiting else self.skipped_waiting
         return self.waiting or self.skipped_waiting or None
 
     def _free_request(self, request: Request, *args, **kwargs):
@@ -379,6 +477,7 @@ class OmniSchedulerMixin:
         runnable_set = set(runnable_req_ids)
         selected_set = set(scheduled_req_ids) & runnable_set
         policy_domains = conformance.get("policy_domains", {})
+        request_locations = conformance.get("request_locations", {})
         policy_activation = False
         for domain in set(policy_domains.values()):
             domain_ids = {
@@ -393,6 +492,30 @@ class OmniSchedulerMixin:
             ):
                 policy_activation = True
                 break
+
+        selection_changed_domains: list[str] = []
+        if policy_activation:
+            # This is a local mechanism check against the queue order captured
+            # at this scheduler tick, not a cross-run FCFS counterfactual.
+            before_orders = conformance.get("queue_orders_before_policy", {})
+            for location, before_order in before_orders.items():
+                eligible_before = [
+                    request_id
+                    for request_id in before_order
+                    if request_id in runnable_set
+                    and request_locations.get(request_id) == location
+                ]
+                selected_here = [
+                    request_id
+                    for request_id in scheduled_req_ids
+                    if request_id in runnable_set
+                    and request_locations.get(request_id) == location
+                ]
+                if not selected_here or len(selected_here) == len(eligible_before):
+                    continue
+                expected_prefix = eligible_before[: len(selected_here)]
+                if set(selected_here) != set(expected_prefix):
+                    selection_changed_domains.append(location)
         token_budget_before = conformance.get("token_budget_before")
         token_budget_after = (
             max(int(token_budget_before) - total_num_scheduled_tokens, 0)
@@ -411,6 +534,16 @@ class OmniSchedulerMixin:
                 token_budget_after=token_budget_after,
                 sequence_slots_after=max(max_running - len(self.running), 0),
                 policy_activation=policy_activation,
+                unselected_runnable_req_ids=sorted(
+                    runnable_set - selected_set
+                ),
+                selection_differs_from_pre_policy_prefix=bool(
+                    selection_changed_domains
+                ),
+                selection_changed_domains=selection_changed_domains,
+                waiting_queue_choices=list(
+                    self._baseline_waiting_queue_choices
+                ),
             )
         emit_iteration_event(
             stage_id=stage_id,
@@ -429,6 +562,8 @@ class OmniSchedulerMixin:
             **conformance_fields,
         )
         self._baseline_conformance_snapshot = None
+        self._baseline_policy_order_snapshot = None
+        self._baseline_waiting_queue_choices = []
         emit_stage_event(
             "stage_schedule_done",
             stage_id=stage_id,

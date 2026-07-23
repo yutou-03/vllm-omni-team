@@ -30,7 +30,10 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
-from vllm_omni.profiling.stage_queue_trace import emit_stage_duration_event
+from vllm_omni.profiling.stage_queue_trace import (
+    emit_stage_duration_event,
+    emit_stage_event,
+)
 
 logger = init_logger(__name__)
 
@@ -135,6 +138,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 num_lookahead_tokens=self.num_lookahead_tokens,
             )
             if new_blocks is None:
+                emit_stage_event(
+                    "kv_allocation_failed",
+                    stage_id=self._omni_stage_id_for_trace(),
+                    request_id=request.request_id,
+                    iteration_id=iteration_id,
+                    request_location="running",
+                    requested_tokens=num_new_tokens,
+                    kv_cache_usage=self.kv_cache_manager.usage,
+                )
                 # Allocation failed (e.g., VRAM pressure); stop fast path and
                 # fall back to default scheduling
                 # Put the current request back to the head of the waiting queue
@@ -197,6 +209,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 num_lookahead_tokens=self.num_lookahead_tokens,
             )
             if new_blocks is None:
+                emit_stage_event(
+                    "kv_allocation_failed",
+                    stage_id=self._omni_stage_id_for_trace(),
+                    request_id=request.request_id,
+                    iteration_id=iteration_id,
+                    request_location="waiting",
+                    requested_tokens=num_new_tokens,
+                    kv_cache_usage=self.kv_cache_manager.usage,
+                )
                 # Allocation failed (e.g., VRAM pressure); stop fast path and
                 # fall back to default scheduling
                 # Put the current request back to the head of the waiting queue

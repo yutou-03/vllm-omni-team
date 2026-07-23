@@ -26,6 +26,11 @@ class PolicyOrderedRequestQueue(RequestQueue):
     def _ordered(self) -> list[Request]:
         return sorted(self._requests, key=self._key)
 
+    def insertion_order(self) -> list[Request]:
+        """Return the queue order before the baseline policy is applied."""
+
+        return list(self._requests)
+
     def add_request(self, request: Request) -> None:
         self._requests.append(request)
 

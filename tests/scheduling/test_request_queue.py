@@ -49,6 +49,7 @@ def test_policy_queue_supports_remove_and_prepend_interface():
     other.add_request(second)
     other.add_request(third)
     queue.prepend_requests(other)
+    assert queue.insertion_order() == [first, second, third]
     assert list(queue) == [second, third, first]
 
     queue.remove_request(third)

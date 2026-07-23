@@ -160,6 +160,21 @@ def test_final_edf_compares_waiting_and_skipped_queue_heads(monkeypatch):
     scheduler.skipped_waiting.add_request(earlier)
 
     assert scheduler._select_waiting_queue_for_scheduling() is scheduler.skipped_waiting
+    assert scheduler._baseline_waiting_queue_choices == [
+        {
+            "waiting_head_request_id": "later",
+            "waiting_head_policy_key": [20.0, 0, "later", "later"],
+            "skipped_waiting_head_request_id": "earlier",
+            "skipped_waiting_head_policy_key": [
+                10.0,
+                0,
+                "earlier",
+                "earlier",
+            ],
+            "chosen_queue": "skipped_waiting",
+            "differs_from_native_fcfs": False,
+        }
+    ]
 
 
 def test_enabled_policy_rejects_missing_metadata_at_admission(monkeypatch):
@@ -213,6 +228,7 @@ def test_async_chunk_ready_time_is_recorded_only_after_real_chunk(monkeypatch):
     adapter.requests_with_ready_chunks.add(request.request_id)
     scheduler._baseline_prepare_schedule()
     assert scheduler._baseline_data_ready_time[request.request_id] > 0
+    assert scheduler._baseline_data_ready_order[request.request_id] == 0
 
 
 def test_request_cleanup_removes_data_ready_state(monkeypatch):
@@ -224,6 +240,33 @@ def test_request_cleanup_removes_data_ready_state(monkeypatch):
 
     scheduler._free_request(request)
     assert request.request_id not in scheduler._baseline_data_ready_time
+    assert request.request_id not in scheduler._baseline_data_ready_order
+
+
+def test_stage_data_ready_is_traced_once_for_native_fcfs(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    captured = []
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_stage_event",
+        lambda event, **fields: captured.append((event, fields)),
+    )
+    scheduler = SchedulerHarness(0)
+    request = FakeRequest("ready", deadline=None)
+
+    scheduler.add_request(request)
+    scheduler._baseline_mark_data_ready(
+        request.request_id,
+        ready_time=999.0,
+    )
+
+    assert [event for event, _ in captured] == [
+        "stage_data_ready",
+        "server_receive",
+        "stage_enqueue",
+    ]
+    ready_fields = captured[0][1]
+    assert ready_fields["request_id"] == "ready"
+    assert ready_fields["stage_ready_order"] == 0
 
 
 def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
@@ -268,6 +311,20 @@ def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
     assert captured["sequence_slots_before"] == 1
     assert captured["ineligible_reasons"] == {}
     assert captured["policy_activation"] is True
+    assert captured["stage_ready_order"] == {"later": 0, "earlier": 1}
+    assert captured["queue_orders_before_policy"]["waiting"] == [
+        "later",
+        "earlier",
+    ]
+    assert captured["queue_orders_after_policy"]["waiting"] == [
+        "earlier",
+        "later",
+    ]
+    assert captured["policy_reordered"] is True
+    assert captured["policy_reordered_domains"] == ["waiting"]
+    assert captured["unselected_runnable_req_ids"] == ["later"]
+    assert captured["selection_differs_from_pre_policy_prefix"] is True
+    assert captured["selection_changed_domains"] == ["waiting"]
 
 
 @pytest.mark.parametrize(
