@@ -347,6 +347,60 @@ class OmniSchedulerMixin:
                 domain_offsets[domain] += 1
             policy_key_kind = "native_queue_order"
 
+        shadow_policy_orders: dict[str, dict[str, list[str]]] = {}
+        queue_requests = {
+            "running": running,
+            "waiting": waiting,
+            "skipped_waiting": skipped_waiting,
+        }
+        before_orders = (self._baseline_policy_order_snapshot or {}).get(
+            "queue_orders_before_policy", {}
+        )
+        runnable_by_location = {
+            location: [
+                request
+                for request in requests
+                if str(request.request_id) in runnable_req_ids
+            ]
+            for location, requests in queue_requests.items()
+        }
+        for policy in BaselineSchedulingPolicy:
+            policy_orders: dict[str, list[str]] = {}
+            for location, requests in runnable_by_location.items():
+                if policy is BaselineSchedulingPolicy.NATIVE_FCFS:
+                    original_order = before_orders.get(location)
+                    if original_order is None:
+                        original_order = [str(request.request_id) for request in requests]
+                    runnable_ids = {str(request.request_id) for request in requests}
+                    policy_orders[location] = [
+                        request_id
+                        for request_id in original_order
+                        if request_id in runnable_ids
+                    ]
+                    continue
+                try:
+                    ordered = sorted(
+                        requests,
+                        key=lambda request: policy_key(
+                            request,
+                            policy=policy,
+                            stage_id=self._baseline_stage_id,
+                            data_ready_time=self._baseline_request_data_ready_time(
+                                request
+                            ),
+                            now=time.monotonic(),
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    # Shadow tracing must never change the live scheduler. A
+                    # custom-policy run will independently reject bad metadata.
+                    policy_orders[location] = []
+                else:
+                    policy_orders[location] = [
+                        str(request.request_id) for request in ordered
+                    ]
+            shadow_policy_orders[policy.value] = policy_orders
+
         self._baseline_conformance_snapshot = {
             "policy": self._baseline_policy.value,
             "policy_applies_to_stage": self._baseline_policy_applies(),
@@ -363,8 +417,78 @@ class OmniSchedulerMixin:
                 for request_id in request_locations
                 if request_id in self._baseline_data_ready_order
             },
+            "shadow_policy_orders": shadow_policy_orders,
+            "shadow_nonpreemptive_running_req_ids": [
+                str(request.request_id)
+                for request in runnable_by_location["running"]
+            ],
+            "shadow_waiting_blocked_by_nonpreemption_req_ids": sorted(
+                request_id
+                for request_id, reason in ineligible_reasons.items()
+                if reason
+                == ConformanceIneligibleReason.NONPREEMPTIVE_RUNNING_CAPACITY.value
+            ),
             **(self._baseline_policy_order_snapshot or {}),
         }
+
+    @staticmethod
+    def _baseline_shadow_decision_summary(
+        conformance: dict[str, Any],
+        *,
+        scheduled_req_ids: list[str],
+    ) -> dict[str, Any]:
+        """Compare policy queue prefixes while holding actual admission counts fixed.
+
+        This is deliberately not a second scheduler implementation.  It
+        answers the narrower, auditable question needed for diagnosis: at a
+        real selection boundary, would a policy substitute waiting requests in
+        the same queue if it received the same number of admissions?  Running
+        requests are reported as non-preemptive locks rather than candidates
+        for replacement.
+        """
+
+        locations = conformance.get("request_locations", {})
+        orders = conformance.get("shadow_policy_orders", {})
+        fcfs_orders = orders.get(BaselineSchedulingPolicy.NATIVE_FCFS.value, {})
+        result: dict[str, Any] = {
+            "comparison": "fixed_location_admission_count",
+            "nonpreemptive_running_req_ids": conformance.get(
+                "shadow_nonpreemptive_running_req_ids", []
+            ),
+            "waiting_blocked_by_nonpreemption_req_ids": conformance.get(
+                "shadow_waiting_blocked_by_nonpreemption_req_ids", []
+            ),
+            "policies": {},
+        }
+        for policy_name, policy_orders in orders.items():
+            locations_summary: dict[str, Any] = {}
+            for location in ("waiting", "skipped_waiting"):
+                actual_selected = [
+                    request_id
+                    for request_id in scheduled_req_ids
+                    if locations.get(request_id) == location
+                ]
+                selected_count = len(actual_selected)
+                fcfs_order = list(fcfs_orders.get(location, ()))
+                shadow_order = list(policy_orders.get(location, ()))
+                fcfs_prefix = fcfs_order[:selected_count]
+                shadow_prefix = shadow_order[:selected_count]
+                locations_summary[location] = {
+                    "candidate_order": shadow_order,
+                    "actual_selected_req_ids": actual_selected,
+                    "selected_count": selected_count,
+                    "fcfs_prefix_req_ids": fcfs_prefix,
+                    "shadow_prefix_req_ids": shadow_prefix,
+                    "order_differs_from_fcfs": shadow_order != fcfs_order,
+                    "fixed_count_substitution_from_fcfs": (
+                        set(shadow_prefix) != set(fcfs_prefix)
+                    ),
+                    "fixed_count_substitution_from_actual": (
+                        set(shadow_prefix) != set(actual_selected)
+                    ),
+                }
+            result["policies"][policy_name] = locations_summary
+        return result
 
     def _baseline_forget_request_ids(self, request_ids: Any) -> None:
         ready_times = getattr(self, "_baseline_data_ready_time", None)
@@ -525,6 +649,12 @@ class OmniSchedulerMixin:
         max_running = int(getattr(self, "max_num_running_reqs", len(self.running)))
         conformance_fields = dict(conformance)
         if conformance:
+            shadow_decision = None
+            if policy_activation:
+                shadow_decision = self._baseline_shadow_decision_summary(
+                    conformance,
+                    scheduled_req_ids=scheduled_req_ids,
+                )
             conformance_fields.update(
                 selected_req_ids=scheduled_req_ids,
                 num_scheduled_tokens={
@@ -541,6 +671,7 @@ class OmniSchedulerMixin:
                     selection_changed_domains
                 ),
                 selection_changed_domains=selection_changed_domains,
+                shadow_policy_decision=shadow_decision,
                 waiting_queue_choices=list(
                     self._baseline_waiting_queue_choices
                 ),

@@ -325,6 +325,29 @@ def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
     assert captured["unselected_runnable_req_ids"] == ["later"]
     assert captured["selection_differs_from_pre_policy_prefix"] is True
     assert captured["selection_changed_domains"] == ["waiting"]
+    shadow = captured["shadow_policy_decision"]
+    assert shadow["comparison"] == "fixed_location_admission_count"
+    assert shadow["nonpreemptive_running_req_ids"] == []
+    assert shadow["policies"]["native_fcfs"]["waiting"] == {
+        "candidate_order": ["later", "earlier"],
+        "actual_selected_req_ids": ["earlier"],
+        "selected_count": 1,
+        "fcfs_prefix_req_ids": ["later"],
+        "shadow_prefix_req_ids": ["later"],
+        "order_differs_from_fcfs": False,
+        "fixed_count_substitution_from_fcfs": False,
+        "fixed_count_substitution_from_actual": True,
+    }
+    assert shadow["policies"]["final_deadline_edf_np"]["waiting"] == {
+        "candidate_order": ["earlier", "later"],
+        "actual_selected_req_ids": ["earlier"],
+        "selected_count": 1,
+        "fcfs_prefix_req_ids": ["later"],
+        "shadow_prefix_req_ids": ["earlier"],
+        "order_differs_from_fcfs": True,
+        "fixed_count_substitution_from_fcfs": True,
+        "fixed_count_substitution_from_actual": False,
+    }
 
 
 @pytest.mark.parametrize(
