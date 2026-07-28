@@ -350,6 +350,77 @@ def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
     }
 
 
+def test_conformance_trace_records_kv_preemption_requeue_and_resume(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
+    scheduler = SchedulerHarness(1)
+    scheduler.max_num_running_reqs = 64
+    scheduler.max_num_scheduled_tokens = 32_768
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.99)
+    victim = FakeRequest(
+        "victim",
+        deadline=None,
+        num_computed_tokens=321,
+    )
+    scheduler.running = [victim]
+    scheduler._baseline_prepare_schedule(token_budget_before=32_768)
+
+    # Mirror vLLM's post-preemption state: the victim has been reset and
+    # prepended to waiting before SchedulerOutput is returned.
+    victim.num_computed_tokens = 0
+    scheduler.running = []
+    scheduler.waiting.prepend_request(victim)
+    captured = []
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_iteration_event",
+        lambda **fields: captured.append(fields),
+    )
+    scheduler._trace_scheduler_output(
+        SimpleNamespace(
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            preempted_req_ids={"victim"},
+        ),
+        iteration_id=1,
+        timestamp_start=1.0,
+        timestamp_end=1.1,
+        num_running_before=1,
+        num_waiting_before=0,
+    )
+
+    first = captured[0]
+    assert first["mechanism_trace_version"] == 2
+    assert first["kv_cache_usage_before"] == 0.99
+    assert first["kv_allocation_failed"] is True
+    assert first["kv_allocation_failure_victim_req_ids"] == ["victim"]
+    assert first["preempted_num_computed_tokens_before"] == {"victim": 321}
+    assert first["preempted_requeue_order"] == ["victim"]
+    assert first["queue_orders_after_schedule"]["waiting"] == ["victim"]
+    assert first["resumed_preempted_req_ids"] == []
+
+    scheduler.waiting = FCFSRequestQueue()
+    scheduler.running = [victim]
+    scheduler.kv_cache_manager.usage = 0.01
+    scheduler._baseline_prepare_schedule(token_budget_before=32_768)
+    scheduler._trace_scheduler_output(
+        SimpleNamespace(
+            num_scheduled_tokens={"victim": 1},
+            total_num_scheduled_tokens=1,
+            preempted_req_ids=set(),
+        ),
+        iteration_id=2,
+        timestamp_start=2.0,
+        timestamp_end=2.1,
+        num_running_before=0,
+        num_waiting_before=1,
+    )
+
+    second = captured[1]
+    assert second["kv_allocation_failed"] is False
+    assert second["resumed_preempted_req_ids"] == ["victim"]
+    assert second["queue_orders_after_schedule"]["running"] == ["victim"]
+
+
 @pytest.mark.parametrize(
     (
         "num_computed_tokens",

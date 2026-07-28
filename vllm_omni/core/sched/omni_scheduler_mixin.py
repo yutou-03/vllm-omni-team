@@ -77,6 +77,7 @@ class OmniSchedulerMixin:
         self._baseline_conformance_snapshot: dict[str, Any] | None = None
         self._baseline_policy_order_snapshot: dict[str, Any] | None = None
         self._baseline_waiting_queue_choices: list[dict[str, Any]] = []
+        self._baseline_preempted_pending_resume: set[str] = set()
 
         if not self._baseline_policy_applies():
             return
@@ -211,7 +212,7 @@ class OmniSchedulerMixin:
                 if before_orders[domain] != after_orders[domain]
             ]
             self._baseline_policy_order_snapshot = {
-                "mechanism_trace_version": 1,
+                "mechanism_trace_version": 2,
                 "queue_orders_before_policy": before_orders,
                 "queue_orders_after_policy": after_orders,
                 "policy_reordered": bool(reordered_domains),
@@ -409,8 +410,18 @@ class OmniSchedulerMixin:
             "policy_keys": policy_keys,
             "policy_domains": policy_domains,
             "request_locations": request_locations,
+            "request_num_computed_tokens_before": {
+                request_id: int(request.num_computed_tokens)
+                for request in running + waiting + skipped_waiting
+                if (request_id := str(request.request_id)) in request_locations
+            },
             "ineligible_reasons": ineligible_reasons,
             "token_budget_before": token_budget_before,
+            "kv_cache_usage_before": getattr(
+                getattr(self, "kv_cache_manager", None),
+                "usage",
+                None,
+            ),
             "sequence_slots_before": sequence_slots,
             "stage_ready_order": {
                 request_id: self._baseline_data_ready_order[request_id]
@@ -588,6 +599,34 @@ class OmniSchedulerMixin:
         schedule_duration_ms = (timestamp_end - timestamp_start) * 1000.0
         num_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         scheduled_req_ids = [str(rid) for rid in num_scheduled_tokens.keys()]
+        preempted_req_ids = {
+            str(rid)
+            for rid in (
+                getattr(scheduler_output, "preempted_req_ids", set()) or set()
+            )
+        }
+        pending_resume = self._baseline_preempted_pending_resume
+        resumed_preempted_req_ids = [
+            request_id
+            for request_id in scheduled_req_ids
+            if request_id in pending_resume
+        ]
+        pending_resume.difference_update(resumed_preempted_req_ids)
+        pending_resume.update(preempted_req_ids)
+        queue_orders_after_schedule = {
+            "running": self._baseline_request_ids(list(self.running)),
+            "waiting": self._baseline_request_ids(
+                self._baseline_queue_insertion_order(self.waiting)
+            ),
+            "skipped_waiting": self._baseline_request_ids(
+                self._baseline_queue_insertion_order(self.skipped_waiting)
+            ),
+        }
+        preempted_requeue_order = [
+            request_id
+            for request_id in queue_orders_after_schedule["waiting"]
+            if request_id in preempted_req_ids
+        ]
         total_num_scheduled_tokens = int(
             getattr(
                 scheduler_output,
@@ -649,6 +688,10 @@ class OmniSchedulerMixin:
         max_running = int(getattr(self, "max_num_running_reqs", len(self.running)))
         conformance_fields = dict(conformance)
         if conformance:
+            computed_tokens_before = conformance.get(
+                "request_num_computed_tokens_before",
+                {},
+            )
             shadow_decision = None
             if policy_activation:
                 shadow_decision = self._baseline_shadow_decision_summary(
@@ -675,6 +718,15 @@ class OmniSchedulerMixin:
                 waiting_queue_choices=list(
                     self._baseline_waiting_queue_choices
                 ),
+                queue_orders_after_schedule=queue_orders_after_schedule,
+                kv_allocation_failed=bool(preempted_req_ids),
+                kv_allocation_failure_victim_req_ids=preempted_requeue_order,
+                preempted_num_computed_tokens_before={
+                    request_id: computed_tokens_before.get(request_id)
+                    for request_id in preempted_requeue_order
+                },
+                preempted_requeue_order=preempted_requeue_order,
+                resumed_preempted_req_ids=resumed_preempted_req_ids,
             )
         emit_iteration_event(
             stage_id=stage_id,
@@ -688,7 +740,7 @@ class OmniSchedulerMixin:
             batch_num_tokens=total_num_scheduled_tokens,
             batch_num_seqs=len(num_scheduled_tokens),
             scheduled_req_ids=scheduled_req_ids,
-            preempted_req_ids=list(getattr(scheduler_output, "preempted_req_ids", set()) or []),
+            preempted_req_ids=sorted(preempted_req_ids),
             kv_cache_usage=getattr(self.kv_cache_manager, "usage", None),
             **conformance_fields,
         )
@@ -707,8 +759,20 @@ class OmniSchedulerMixin:
             batch_num_tokens=total_num_scheduled_tokens,
             batch_num_seqs=len(num_scheduled_tokens),
             scheduled_req_ids=scheduled_req_ids,
-            preempted_req_ids=list(getattr(scheduler_output, "preempted_req_ids", set()) or []),
+            preempted_req_ids=sorted(preempted_req_ids),
             kv_cache_usage=getattr(self.kv_cache_manager, "usage", None),
+            kv_allocation_failed=bool(preempted_req_ids),
+            kv_allocation_failure_victim_req_ids=preempted_requeue_order,
+            preempted_num_computed_tokens_before={
+                request_id: conformance.get(
+                    "request_num_computed_tokens_before",
+                    {},
+                ).get(request_id)
+                for request_id in preempted_requeue_order
+            },
+            preempted_requeue_order=preempted_requeue_order,
+            resumed_preempted_req_ids=resumed_preempted_req_ids,
+            queue_orders_after_schedule=queue_orders_after_schedule,
         )
         for rid, num_tokens in num_scheduled_tokens.items():
             rid_str = str(rid)
