@@ -67,6 +67,9 @@ def _record_enabled(filename: str, payload: dict[str, Any]) -> bool:
     ingress and per-stage generation durations; scheduler iterations,
     forward spans, connector events, and per-token events are intentionally
     omitted so synchronous trace I/O does not dominate unloaded latency.
+    ``scheduler_resource`` retains only scheduler iteration events.  It is
+    intended for resource-pressure sweeps that need queue sizes, KV usage,
+    batch sizes, and preemption IDs without large request-level snapshots.
     """
 
     mode = os.environ.get("STAGE_QUEUE_TRACE_MODE", "full").strip().lower()
@@ -76,6 +79,11 @@ def _record_enabled(filename: str, payload: dict[str, Any]) -> bool:
         return (
             filename == "stage_events.jsonl"
             and payload.get("event") in _REQUEST_METRICS_EVENTS
+        )
+    if mode == "scheduler_resource":
+        return (
+            filename == "iteration_events.jsonl"
+            and payload.get("event") == "iteration"
         )
     # A typo must not silently remove correctness evidence.  Fall back to the
     # existing full trace, which is noisy but preserves all observations.
