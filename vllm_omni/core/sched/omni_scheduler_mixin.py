@@ -24,9 +24,12 @@ from vllm_omni.scheduling.metadata import (
 )
 from vllm_omni.scheduling.policy import (
     BaselineSchedulingPolicy,
+    get_active_preemption_config,
     get_baseline_scheduling_policy,
     policy_applies_to_stage,
+    policy_is_deadline_edf,
     policy_key,
+    policy_uses_active_preemption,
 )
 from vllm_omni.scheduling.request_queue import (
     PolicyOrderedRequestQueue,
@@ -78,6 +81,9 @@ class OmniSchedulerMixin:
         self._baseline_policy_order_snapshot: dict[str, Any] | None = None
         self._baseline_waiting_queue_choices: list[dict[str, Any]] = []
         self._baseline_preempted_pending_resume: set[str] = set()
+        self._baseline_active_preemption_config = get_active_preemption_config()
+        self._baseline_active_preemption_evaluation: dict[str, Any] | None = None
+        self._baseline_active_preemption_records: list[dict[str, Any]] = []
 
         if not self._baseline_policy_applies():
             return
@@ -174,6 +180,8 @@ class OmniSchedulerMixin:
         """Refresh data-ready times and order runnable requests in place."""
 
         self._baseline_waiting_queue_choices = []
+        self._baseline_active_preemption_evaluation = None
+        self._baseline_active_preemption_records = []
         trace_mechanism = conformance_trace_enabled()
         before_orders: dict[str, list[str]] = {}
         if trace_mechanism:
@@ -198,8 +206,17 @@ class OmniSchedulerMixin:
         if self._baseline_policy_applies():
             self.running.sort(key=self._baseline_request_key)
 
+        after_policy_orders = {
+            "running": self._baseline_request_ids(list(self.running)),
+            "waiting": self._baseline_request_ids(list(self.waiting)),
+            "skipped_waiting": self._baseline_request_ids(
+                list(self.skipped_waiting)
+            ),
+        }
+        self._baseline_maybe_preempt_running()
+
         if trace_mechanism:
-            after_orders = {
+            after_preemption_orders = {
                 "running": self._baseline_request_ids(list(self.running)),
                 "waiting": self._baseline_request_ids(list(self.waiting)),
                 "skipped_waiting": self._baseline_request_ids(
@@ -209,12 +226,15 @@ class OmniSchedulerMixin:
             reordered_domains = [
                 domain
                 for domain in before_orders
-                if before_orders[domain] != after_orders[domain]
+                if before_orders[domain] != after_policy_orders[domain]
             ]
             self._baseline_policy_order_snapshot = {
-                "mechanism_trace_version": 2,
+                "mechanism_trace_version": 3,
                 "queue_orders_before_policy": before_orders,
-                "queue_orders_after_policy": after_orders,
+                "queue_orders_after_policy": after_policy_orders,
+                "queue_orders_after_active_preemption": (
+                    after_preemption_orders
+                ),
                 "policy_reordered": bool(reordered_domains),
                 "policy_reordered_domains": reordered_domains,
             }
@@ -223,6 +243,170 @@ class OmniSchedulerMixin:
         self._baseline_capture_conformance_snapshot(
             token_budget_before=token_budget_before,
         )
+
+    @staticmethod
+    def _baseline_request_can_compete(request: Request) -> bool:
+        status_name = getattr(
+            getattr(request, "status", None),
+            "name",
+            str(getattr(request, "status", "")),
+        ).lower()
+        return not any(
+            marker in status_name
+            for marker in (
+                "finished",
+                "waiting_for_input",
+                "waiting_for_chunk",
+                "waiting_for_remote",
+            )
+        )
+
+    @staticmethod
+    def _baseline_running_can_be_preempted(request: Request) -> bool:
+        if not OmniSchedulerMixin._baseline_request_can_compete(request):
+            return False
+        if (
+            request.num_output_placeholders > 0
+            and request.max_tokens is not None
+            and request.num_computed_tokens
+            + 2
+            - request.num_output_placeholders
+            >= request.num_prompt_tokens + request.max_tokens
+        ):
+            return False
+        return True
+
+    def _baseline_maybe_preempt_running(self) -> None:
+        """Measure deadline inversion and optionally replace one running request.
+
+        Only the explicit ``*_edf_p`` policies mutate scheduler state. The
+        non-preemptive EDF policies still emit the same evaluation, which makes
+        it possible to estimate the opportunity rate before enabling the more
+        expensive recompute-preemption mechanism.
+        """
+
+        policy = self._baseline_policy
+        if not policy_is_deadline_edf(policy):
+            return
+
+        running = [
+            request
+            for request in self.running
+            if self._baseline_running_can_be_preempted(request)
+        ]
+        waiting = [
+            request
+            for request in list(self.waiting)
+            + list(getattr(self, "skipped_waiting", ()))
+            if self._baseline_request_can_compete(request)
+        ]
+        max_running = int(getattr(self, "max_num_running_reqs", len(self.running)))
+        full_running = len(self.running) >= max_running
+        evaluation: dict[str, Any] = {
+            "evaluated": bool(full_running and running and waiting),
+            "running_capacity_full": full_running,
+            "num_running_candidates": len(running),
+            "num_waiting_candidates": len(waiting),
+            "deadline_inversion": False,
+            "active_preemption_enabled": policy_uses_active_preemption(policy),
+            "preempted": False,
+        }
+        self._baseline_active_preemption_evaluation = evaluation
+        if not evaluation["evaluated"]:
+            return
+
+        best_waiting = min(waiting, key=self._baseline_request_key)
+        worst_running = max(running, key=self._baseline_request_key)
+        best_waiting_deadline = float(self._baseline_request_key(best_waiting)[0])
+        worst_running_deadline = float(self._baseline_request_key(worst_running)[0])
+        deadline_gain_ms = (
+            worst_running_deadline - best_waiting_deadline
+        ) * 1000.0
+        evaluation.update(
+            waiting_request_id=str(best_waiting.request_id),
+            waiting_deadline_monotonic_s=best_waiting_deadline,
+            worst_running_request_id=str(worst_running.request_id),
+            worst_running_deadline_monotonic_s=worst_running_deadline,
+            deadline_gain_ms=deadline_gain_ms,
+            deadline_inversion=deadline_gain_ms > 0.0,
+        )
+        if deadline_gain_ms <= 0.0 or not policy_uses_active_preemption(policy):
+            return
+
+        config = self._baseline_active_preemption_config
+        max_recompute_tokens = int(config["max_recompute_tokens"])
+        max_per_request = int(config["max_per_request"])
+        min_deadline_gain_ms = float(config["min_deadline_gain_ms"])
+        feasible_victims = [
+            request
+            for request in running
+            if int(request.num_computed_tokens) <= max_recompute_tokens
+            and int(getattr(request, "num_preemptions", 0)) < max_per_request
+            and (
+                float(self._baseline_request_key(request)[0])
+                - best_waiting_deadline
+            )
+            * 1000.0
+            >= min_deadline_gain_ms
+            and float(self._baseline_request_key(request)[0])
+            > best_waiting_deadline
+        ]
+        if not feasible_victims:
+            if deadline_gain_ms < min_deadline_gain_ms:
+                rejection_reason = "deadline_gain_below_guard"
+            elif all(
+                int(request.num_computed_tokens) > max_recompute_tokens
+                for request in running
+            ):
+                rejection_reason = "recompute_token_cap"
+            else:
+                rejection_reason = "per_request_preemption_cap"
+            evaluation["rejection_reason"] = rejection_reason
+            return
+
+        victim = max(feasible_victims, key=self._baseline_request_key)
+        victim_deadline = float(self._baseline_request_key(victim)[0])
+        victim_computed_tokens = int(victim.num_computed_tokens)
+        record = {
+            "waiting_request_id": str(best_waiting.request_id),
+            "victim_request_id": str(victim.request_id),
+            "waiting_deadline_monotonic_s": best_waiting_deadline,
+            "victim_deadline_monotonic_s": victim_deadline,
+            "deadline_gain_ms": (
+                victim_deadline - best_waiting_deadline
+            )
+            * 1000.0,
+            "victim_num_computed_tokens_before": victim_computed_tokens,
+            "victim_num_preemptions_before": int(
+                getattr(victim, "num_preemptions", 0)
+            ),
+            "max_recompute_tokens": max_recompute_tokens,
+            "max_per_request": max_per_request,
+            "min_deadline_gain_ms": min_deadline_gain_ms,
+        }
+        self.running.remove(victim)
+        self._preempt_request(victim, time.monotonic())
+        self._baseline_active_preemption_records.append(record)
+        evaluation.update(
+            preempted=True,
+            selected_victim_request_id=str(victim.request_id),
+            selected_victim_num_computed_tokens_before=victim_computed_tokens,
+        )
+
+    def _baseline_attach_active_preemptions(self, scheduler_output: Any) -> None:
+        """Expose pre-schedule active victims through vLLM's normal output."""
+
+        active_ids = {
+            record["victim_request_id"]
+            for record in self._baseline_active_preemption_records
+        }
+        if not active_ids:
+            return
+        preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", None)
+        if preempted_req_ids is None:
+            scheduler_output.preempted_req_ids = active_ids
+        else:
+            preempted_req_ids.update(active_ids)
 
     def _baseline_capture_conformance_snapshot(
         self,
@@ -605,6 +789,14 @@ class OmniSchedulerMixin:
                 getattr(scheduler_output, "preempted_req_ids", set()) or set()
             )
         }
+        active_preemption_records = list(
+            self._baseline_active_preemption_records
+        )
+        active_preempted_req_ids = {
+            str(record["victim_request_id"])
+            for record in active_preemption_records
+        }
+        kv_preempted_req_ids = preempted_req_ids - active_preempted_req_ids
         pending_resume = self._baseline_preempted_pending_resume
         resumed_preempted_req_ids = [
             request_id
@@ -692,6 +884,18 @@ class OmniSchedulerMixin:
                 "request_num_computed_tokens_before",
                 {},
             )
+            preempted_num_computed_tokens_before = {
+                request_id: computed_tokens_before.get(request_id)
+                for request_id in preempted_requeue_order
+            }
+            preempted_num_computed_tokens_before.update(
+                {
+                    str(record["victim_request_id"]): int(
+                        record["victim_num_computed_tokens_before"]
+                    )
+                    for record in active_preemption_records
+                }
+            )
             shadow_decision = None
             if policy_activation:
                 shadow_decision = self._baseline_shadow_decision_summary(
@@ -719,15 +923,35 @@ class OmniSchedulerMixin:
                     self._baseline_waiting_queue_choices
                 ),
                 queue_orders_after_schedule=queue_orders_after_schedule,
-                kv_allocation_failed=bool(preempted_req_ids),
-                kv_allocation_failure_victim_req_ids=preempted_requeue_order,
-                preempted_num_computed_tokens_before={
-                    request_id: computed_tokens_before.get(request_id)
+                kv_allocation_failed=bool(kv_preempted_req_ids),
+                kv_allocation_failure_victim_req_ids=[
+                    request_id
                     for request_id in preempted_requeue_order
-                },
+                    if request_id in kv_preempted_req_ids
+                ],
+                preempted_num_computed_tokens_before=(
+                    preempted_num_computed_tokens_before
+                ),
                 preempted_requeue_order=preempted_requeue_order,
                 resumed_preempted_req_ids=resumed_preempted_req_ids,
+                active_preemption_evaluation=(
+                    self._baseline_active_preemption_evaluation
+                ),
+                active_preemption_records=active_preemption_records,
+                active_preempted_req_ids=sorted(active_preempted_req_ids),
             )
+        conformance_fields.setdefault(
+            "active_preemption_evaluation",
+            self._baseline_active_preemption_evaluation,
+        )
+        conformance_fields.setdefault(
+            "active_preemption_records",
+            active_preemption_records,
+        )
+        conformance_fields.setdefault(
+            "active_preempted_req_ids",
+            sorted(active_preempted_req_ids),
+        )
         emit_iteration_event(
             stage_id=stage_id,
             iteration_id=iteration_id,
@@ -761,18 +985,30 @@ class OmniSchedulerMixin:
             scheduled_req_ids=scheduled_req_ids,
             preempted_req_ids=sorted(preempted_req_ids),
             kv_cache_usage=getattr(self.kv_cache_manager, "usage", None),
-            kv_allocation_failed=bool(preempted_req_ids),
-            kv_allocation_failure_victim_req_ids=preempted_requeue_order,
-            preempted_num_computed_tokens_before={
-                request_id: conformance.get(
-                    "request_num_computed_tokens_before",
-                    {},
-                ).get(request_id)
+            kv_allocation_failed=bool(kv_preempted_req_ids),
+            kv_allocation_failure_victim_req_ids=[
+                request_id
                 for request_id in preempted_requeue_order
-            },
+                if request_id in kv_preempted_req_ids
+            ],
+            preempted_num_computed_tokens_before=(
+                preempted_num_computed_tokens_before
+                if conformance
+                else {
+                    str(record["victim_request_id"]): int(
+                        record["victim_num_computed_tokens_before"]
+                    )
+                    for record in active_preemption_records
+                }
+            ),
             preempted_requeue_order=preempted_requeue_order,
             resumed_preempted_req_ids=resumed_preempted_req_ids,
             queue_orders_after_schedule=queue_orders_after_schedule,
+            active_preemption_evaluation=(
+                self._baseline_active_preemption_evaluation
+            ),
+            active_preemption_records=active_preemption_records,
+            active_preempted_req_ids=sorted(active_preempted_req_ids),
         )
         for rid, num_tokens in num_scheduled_tokens.items():
             rid_str = str(rid)
@@ -796,6 +1032,8 @@ class OmniSchedulerMixin:
                     first_schedule_seen.add(rid_str)
                     with nvtx_range(f"TTFP:s2_first_schedule:req={rid_str[-8:]}", color="orange"):
                         self._omni_nvtx_s2_first_schedule_seen = first_schedule_seen
+        self._baseline_active_preemption_evaluation = None
+        self._baseline_active_preemption_records = []
 
     def _replace_session_with_streaming_update(
         self,

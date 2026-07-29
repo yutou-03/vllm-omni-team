@@ -12,6 +12,15 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.scheduling.metadata import extract_scheduling_metadata
 
 BASELINE_POLICY_ENV = "VLLM_OMNI_BASELINE_POLICY"
+ACTIVE_PREEMPTION_MAX_RECOMPUTE_TOKENS_ENV = (
+    "VLLM_OMNI_ACTIVE_PREEMPTION_MAX_RECOMPUTE_TOKENS"
+)
+ACTIVE_PREEMPTION_MAX_PER_REQUEST_ENV = (
+    "VLLM_OMNI_ACTIVE_PREEMPTION_MAX_PER_REQUEST"
+)
+ACTIVE_PREEMPTION_MIN_DEADLINE_GAIN_MS_ENV = (
+    "VLLM_OMNI_ACTIVE_PREEMPTION_MIN_DEADLINE_GAIN_MS"
+)
 
 
 class BaselineSchedulingPolicy(str, Enum):
@@ -21,6 +30,8 @@ class BaselineSchedulingPolicy(str, Enum):
     SRPF_LOCAL_NP = "srpf_local_np"
     FINAL_DEADLINE_EDF_NP = "final_deadline_edf_np"
     STAGE_DEADLINE_EDF_NP = "stage_deadline_edf_np"
+    FINAL_DEADLINE_EDF_P = "final_deadline_edf_p"
+    STAGE_DEADLINE_EDF_P = "stage_deadline_edf_p"
 
 
 class SchedulingMetadataError(ValueError):
@@ -28,6 +39,81 @@ class SchedulingMetadataError(ValueError):
 
 
 PolicyKey = tuple[float | int | str, ...]
+
+
+def policy_uses_active_preemption(policy: BaselineSchedulingPolicy) -> bool:
+    """Return whether a policy may replace a running request."""
+
+    return policy in (
+        BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_P,
+        BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_P,
+    )
+
+
+def policy_is_deadline_edf(policy: BaselineSchedulingPolicy) -> bool:
+    """Return whether the leading policy key is an absolute deadline."""
+
+    return policy in (
+        BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,
+        BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP,
+        BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_P,
+        BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_P,
+    )
+
+
+def _read_non_negative_number(
+    environ: Mapping[str, str],
+    name: str,
+    *,
+    default: float,
+    integer: bool = False,
+) -> float | int:
+    raw_value = environ.get(name)
+    if raw_value is None:
+        return int(default) if integer else default
+    try:
+        value = int(raw_value) if integer else float(raw_value)
+    except ValueError as error:
+        expected = "integer" if integer else "number"
+        raise ValueError(
+            f"invalid {name}={raw_value!r}; expected a non-negative {expected}"
+        ) from error
+    if value < 0:
+        raise ValueError(f"invalid {name}={raw_value!r}; expected a non-negative value")
+    return value
+
+
+def get_active_preemption_config(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, float | int]:
+    """Read conservative guards for the opt-in preemptive EDF policies.
+
+    vLLM recompute preemption discards the victim's KV cache and resets its
+    ``num_computed_tokens`` to zero. The token cap therefore bounds the direct
+    wasted work, while the per-request cap prevents oscillation. A deployment
+    can additionally require a minimum deadline improvement.
+    """
+
+    source = os.environ if environ is None else environ
+    return {
+        "max_recompute_tokens": _read_non_negative_number(
+            source,
+            ACTIVE_PREEMPTION_MAX_RECOMPUTE_TOKENS_ENV,
+            default=256,
+            integer=True,
+        ),
+        "max_per_request": _read_non_negative_number(
+            source,
+            ACTIVE_PREEMPTION_MAX_PER_REQUEST_ENV,
+            default=1,
+            integer=True,
+        ),
+        "min_deadline_gain_ms": _read_non_negative_number(
+            source,
+            ACTIVE_PREEMPTION_MIN_DEADLINE_GAIN_MS_ENV,
+            default=0.0,
+        ),
+    }
 
 
 def get_baseline_scheduling_policy(
@@ -169,8 +255,13 @@ def policy_key(
     if policy in (
         BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,
         BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP,
+        BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_P,
+        BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_P,
     ):
-        if policy is BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP:
+        if policy in (
+            BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,
+            BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_P,
+        ):
             deadline = float(
                 _required_field(
                     metadata,

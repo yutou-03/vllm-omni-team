@@ -3,9 +3,13 @@ from __future__ import annotations
 import pytest
 
 from vllm_omni.scheduling.policy import (
+    ACTIVE_PREEMPTION_MAX_PER_REQUEST_ENV,
+    ACTIVE_PREEMPTION_MAX_RECOMPUTE_TOKENS_ENV,
+    ACTIVE_PREEMPTION_MIN_DEADLINE_GAIN_MS_ENV,
     BASELINE_POLICY_ENV,
     BaselineSchedulingPolicy,
     SchedulingMetadataError,
+    get_active_preemption_config,
     get_baseline_scheduling_policy,
     policy_applies_to_stage,
     policy_key,
@@ -58,6 +62,41 @@ def test_policy_environment_normalizes_and_rejects_unknown_values():
 
     with pytest.raises(ValueError, match=BASELINE_POLICY_ENV):
         get_baseline_scheduling_policy({BASELINE_POLICY_ENV: "silent-fallback"})
+
+
+def test_preemptive_edf_policy_and_guards_are_explicit():
+    assert get_baseline_scheduling_policy(
+        {BASELINE_POLICY_ENV: "stage_deadline_edf_p"}
+    ) is BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_P
+    assert get_active_preemption_config({}) == {
+        "max_recompute_tokens": 256,
+        "max_per_request": 1,
+        "min_deadline_gain_ms": 0.0,
+    }
+    assert get_active_preemption_config(
+        {
+            ACTIVE_PREEMPTION_MAX_RECOMPUTE_TOKENS_ENV: "32",
+            ACTIVE_PREEMPTION_MAX_PER_REQUEST_ENV: "2",
+            ACTIVE_PREEMPTION_MIN_DEADLINE_GAIN_MS_ENV: "12.5",
+        }
+    ) == {
+        "max_recompute_tokens": 32,
+        "max_per_request": 2,
+        "min_deadline_gain_ms": 12.5,
+    }
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        (ACTIVE_PREEMPTION_MAX_RECOMPUTE_TOKENS_ENV, "-1"),
+        (ACTIVE_PREEMPTION_MAX_PER_REQUEST_ENV, "1.5"),
+        (ACTIVE_PREEMPTION_MIN_DEADLINE_GAIN_MS_ENV, "nan?"),
+    ],
+)
+def test_active_preemption_guards_reject_invalid_values(name, value):
+    with pytest.raises(ValueError, match=name):
+        get_active_preemption_config({name: value})
 
 
 def test_stage_deadline_edf_applies_to_all_stages():

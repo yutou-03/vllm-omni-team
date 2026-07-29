@@ -233,6 +233,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 nvtx_range("omni:base_schedule"),
             ):
                 scheduler_output = super().schedule()
+            self._baseline_attach_active_preemptions(scheduler_output)
             for rid, ntok in scheduler_output.num_scheduled_tokens.items():
                 nvtx_mark(f"scheduler_scheduled:req={str(rid)[-8:]}:ntok={ntok}")
             self._trace_scheduler_output(

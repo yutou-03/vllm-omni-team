@@ -33,6 +33,8 @@ class FakeRequest:
         self.num_computed_tokens = num_computed_tokens
         self.max_tokens = max_tokens
         self.num_output_placeholders = num_output_placeholders
+        self.num_preemptions = 0
+        self.status = SimpleNamespace(name="WAITING")
         self.additional_information = None
         if deadline is not None:
             self.additional_information = {
@@ -84,6 +86,13 @@ class FakeBaseScheduler:
 
     def _free_request(self, request, *args, **kwargs):
         return request.request_id
+
+    def _preempt_request(self, request, timestamp) -> None:
+        del timestamp
+        request.status = SimpleNamespace(name="PREEMPTED")
+        request.num_computed_tokens = 0
+        request.num_preemptions += 1
+        self.waiting.prepend_request(request)
 
 
 class SchedulerHarness(OmniSchedulerMixin, FakeBaseScheduler):
@@ -149,6 +158,116 @@ def test_final_edf_orders_waiting_and_running_without_eviction(monkeypatch):
     scheduler._baseline_prepare_schedule()
     assert scheduler.running == [earlier, later]
     assert set(scheduler.running) == original_members
+
+
+def test_nonpreemptive_edf_traces_deadline_inversion_without_eviction(
+    monkeypatch,
+):
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "final_deadline_edf_np")
+    scheduler = SchedulerHarness(0)
+    scheduler.max_num_running_reqs = 1
+    victim = FakeRequest(
+        "victim",
+        deadline=20.0,
+        num_computed_tokens=128,
+    )
+    victim.status = SimpleNamespace(name="RUNNING")
+    urgent = FakeRequest("urgent", deadline=10.0)
+    scheduler.running = [victim]
+    scheduler.add_request(urgent)
+
+    scheduler._baseline_prepare_schedule()
+
+    assert scheduler.running == [victim]
+    assert scheduler._baseline_active_preemption_records == []
+    assert scheduler._baseline_active_preemption_evaluation == {
+        "evaluated": True,
+        "running_capacity_full": True,
+        "num_running_candidates": 1,
+        "num_waiting_candidates": 1,
+        "deadline_inversion": True,
+        "active_preemption_enabled": False,
+        "preempted": False,
+        "waiting_request_id": "urgent",
+        "waiting_deadline_monotonic_s": 10.0,
+        "worst_running_request_id": "victim",
+        "worst_running_deadline_monotonic_s": 20.0,
+        "deadline_gain_ms": 10_000.0,
+    }
+
+
+def test_preemptive_edf_replaces_one_running_request_and_reports_cost(
+    monkeypatch,
+):
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "final_deadline_edf_p")
+    scheduler = SchedulerHarness(0)
+    scheduler.max_num_running_reqs = 1
+    victim = FakeRequest(
+        "victim",
+        deadline=20.0,
+        num_computed_tokens=128,
+    )
+    victim.status = SimpleNamespace(name="RUNNING")
+    urgent = FakeRequest("urgent", deadline=10.0)
+    scheduler.running = [victim]
+    scheduler.add_request(urgent)
+
+    scheduler._baseline_prepare_schedule()
+
+    assert scheduler.running == []
+    assert list(scheduler.waiting) == [urgent, victim]
+    assert victim.num_computed_tokens == 0
+    assert victim.num_preemptions == 1
+    assert scheduler._baseline_active_preemption_records == [
+        {
+            "waiting_request_id": "urgent",
+            "victim_request_id": "victim",
+            "waiting_deadline_monotonic_s": 10.0,
+            "victim_deadline_monotonic_s": 20.0,
+            "deadline_gain_ms": 10_000.0,
+            "victim_num_computed_tokens_before": 128,
+            "victim_num_preemptions_before": 0,
+            "max_recompute_tokens": 256,
+            "max_per_request": 1,
+            "min_deadline_gain_ms": 0.0,
+        }
+    ]
+    scheduler_output = SimpleNamespace(preempted_req_ids=set())
+    scheduler._baseline_attach_active_preemptions(scheduler_output)
+    assert scheduler_output.preempted_req_ids == {"victim"}
+
+
+def test_preemptive_edf_rejects_victim_above_recompute_cap(monkeypatch):
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "stage_deadline_edf_p")
+    monkeypatch.setenv(
+        "VLLM_OMNI_ACTIVE_PREEMPTION_MAX_RECOMPUTE_TOKENS",
+        "64",
+    )
+    scheduler = SchedulerHarness(1)
+    scheduler.max_num_running_reqs = 1
+    victim = FakeRequest(
+        "victim",
+        deadline=20.0,
+        stage_deadlines=[10.0, 20.0, 20.0],
+        num_computed_tokens=65,
+    )
+    victim.status = SimpleNamespace(name="RUNNING")
+    urgent = FakeRequest(
+        "urgent",
+        deadline=20.0,
+        stage_deadlines=[9.0, 10.0, 20.0],
+    )
+    scheduler.running = [victim]
+    scheduler.add_request(urgent)
+
+    scheduler._baseline_prepare_schedule()
+
+    assert scheduler.running == [victim]
+    assert scheduler._baseline_active_preemption_records == []
+    assert (
+        scheduler._baseline_active_preemption_evaluation["rejection_reason"]
+        == "recompute_token_cap"
+    )
 
 
 def test_final_edf_compares_waiting_and_skipped_queue_heads(monkeypatch):

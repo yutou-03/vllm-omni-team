@@ -247,6 +247,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
             else:
                 res = super().schedule()
+                self._baseline_attach_active_preemptions(res)
                 self._trace_scheduler_output(
                     res,
                     iteration_id=iteration_id,
@@ -320,7 +321,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             num_common_prefix_blocks=num_common_prefix_blocks,
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-            preempted_req_ids=set(),
+            preempted_req_ids={
+                record["victim_request_id"]
+                for record in self._baseline_active_preemption_records
+            },
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
