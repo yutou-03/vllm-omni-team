@@ -229,7 +229,7 @@ class OmniSchedulerMixin:
                 if before_orders[domain] != after_policy_orders[domain]
             ]
             self._baseline_policy_order_snapshot = {
-                "mechanism_trace_version": 3,
+                "mechanism_trace_version": 2,
                 "queue_orders_before_policy": before_orders,
                 "queue_orders_after_policy": after_policy_orders,
                 "queue_orders_after_active_preemption": (
@@ -484,9 +484,14 @@ class OmniSchedulerMixin:
                     )
                     continue
                 if location != "running" and sequence_slots == 0:
-                    ineligible_reasons[request_id] = (
-                        ConformanceIneligibleReason.NONPREEMPTIVE_RUNNING_CAPACITY.value
+                    capacity_reason = (
+                        ConformanceIneligibleReason.SEQUENCE_SLOT_LIMIT
+                        if policy_uses_active_preemption(
+                            self._baseline_policy
+                        )
+                        else ConformanceIneligibleReason.NONPREEMPTIVE_RUNNING_CAPACITY
                     )
+                    ineligible_reasons[request_id] = capacity_reason.value
                     continue
                 if token_budget_before <= 0:
                     ineligible_reasons[request_id] = (

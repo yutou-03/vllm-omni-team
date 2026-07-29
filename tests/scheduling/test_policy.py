@@ -91,7 +91,7 @@ def test_preemptive_edf_policy_and_guards_are_explicit():
     [
         (ACTIVE_PREEMPTION_MAX_RECOMPUTE_TOKENS_ENV, "-1"),
         (ACTIVE_PREEMPTION_MAX_PER_REQUEST_ENV, "1.5"),
-        (ACTIVE_PREEMPTION_MIN_DEADLINE_GAIN_MS_ENV, "nan?"),
+        (ACTIVE_PREEMPTION_MIN_DEADLINE_GAIN_MS_ENV, "nan"),
     ],
 )
 def test_active_preemption_guards_reject_invalid_values(name, value):

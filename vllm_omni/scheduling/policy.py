@@ -78,6 +78,8 @@ def _read_non_negative_number(
         raise ValueError(
             f"invalid {name}={raw_value!r}; expected a non-negative {expected}"
         ) from error
+    if not integer and not math.isfinite(value):
+        raise ValueError(f"invalid {name}={raw_value!r}; expected a finite value")
     if value < 0:
         raise ValueError(f"invalid {name}={raw_value!r}; expected a non-negative value")
     return value

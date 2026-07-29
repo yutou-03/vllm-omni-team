@@ -270,6 +270,56 @@ def test_preemptive_edf_rejects_victim_above_recompute_cap(monkeypatch):
     )
 
 
+def test_active_preemption_trace_is_not_reported_as_kv_failure(monkeypatch):
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "final_deadline_edf_p")
+    monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
+    scheduler = SchedulerHarness(0)
+    scheduler.max_num_running_reqs = 1
+    scheduler.max_num_scheduled_tokens = 1
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.25)
+    victim = FakeRequest(
+        "victim",
+        deadline=20.0,
+        num_computed_tokens=32,
+    )
+    victim.status = SimpleNamespace(name="RUNNING")
+    urgent = FakeRequest("urgent", deadline=10.0)
+    scheduler.running = [victim]
+    scheduler.add_request(urgent)
+    scheduler._baseline_prepare_schedule(token_budget_before=1)
+
+    urgent = scheduler.waiting.pop_request()
+    scheduler.running.append(urgent)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"urgent": 1},
+        total_num_scheduled_tokens=1,
+        preempted_req_ids=set(),
+    )
+    scheduler._baseline_attach_active_preemptions(scheduler_output)
+    captured = {}
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_iteration_event",
+        lambda **fields: captured.update(fields),
+    )
+
+    scheduler._trace_scheduler_output(
+        scheduler_output,
+        iteration_id=1,
+        timestamp_start=1.0,
+        timestamp_end=1.1,
+        num_running_before=1,
+        num_waiting_before=1,
+    )
+
+    assert captured["preempted_req_ids"] == ["victim"]
+    assert captured["active_preempted_req_ids"] == ["victim"]
+    assert captured["kv_allocation_failed"] is False
+    assert captured["kv_allocation_failure_victim_req_ids"] == []
+    assert captured["active_preemption_records"][0][
+        "victim_num_computed_tokens_before"
+    ] == 32
+
+
 def test_final_edf_compares_waiting_and_skipped_queue_heads(monkeypatch):
     monkeypatch.setenv(BASELINE_POLICY_ENV, "final_deadline_edf_np")
     scheduler = SchedulerHarness(1)
