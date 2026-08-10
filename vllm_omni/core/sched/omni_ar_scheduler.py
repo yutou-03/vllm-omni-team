@@ -87,6 +87,45 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Output placeholders are zero when async scheduling isn't used
         return request.num_computed_tokens - request.num_output_placeholders
 
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Mark the old physical execution invalid until the orchestrator aborts it."""
+        discarded_output_tokens = len(request._output_token_ids)
+        discarded_computed_tokens = request.num_computed_tokens
+        old_output_connector_req_id = (
+            getattr(request, "output_connector_req_id", None)
+            or getattr(request, "connector_req_id", None)
+            or getattr(request, "external_req_id", None)
+            or request.request_id
+        )
+
+        super()._preempt_request(request, timestamp)
+
+        # The upstream implementation immediately prepends the victim to the
+        # waiting queue.  Full-pipeline recovery must never let that retired
+        # physical request resume locally while the orchestrator is creating
+        # its replacement execution.
+        self.waiting.remove_requests([request])
+
+        # An asynchronous GPU step launched before preemption may return after
+        # the scheduler event is published.  Tag it stale immediately; the
+        # orchestrator will abort this entire physical execution and submit a
+        # new execution id from Stage 0.
+        request._omni_execution_attempt = (
+            getattr(request, "_omni_execution_attempt", 0) + 1
+        )
+        if self.chunk_transfer_adapter is not None:
+            self.chunk_transfer_adapter.abandon_sender(
+                str(old_output_connector_req_id)
+            )
+        emit_stage_event(
+            "full_pipeline_restart_requested",
+            stage_id=self._omni_stage_id_for_trace(),
+            request_id=request.request_id,
+            discarded_output_tokens=discarded_output_tokens,
+            discarded_computed_tokens=discarded_computed_tokens,
+            connector_req_id=old_output_connector_req_id,
+        )
+
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
         if not hasattr(self, "vllm_config"):
@@ -291,6 +330,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
+            request_execution_attempts={
+                request_id: getattr(self.requests.get(request_id), "_omni_execution_attempt", 0)
+                for request_id in scheduler_output.num_scheduled_tokens
+            },
         )
 
     def update_from_output(
@@ -420,19 +463,38 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 status_before_stop = request.status
                 finish_reason = None
                 routed_experts = None
+                scheduled_attempt = getattr(
+                    scheduler_output, "request_execution_attempts", {}
+                ).get(req_id, 0)
+                current_attempt = getattr(request, "_omni_execution_attempt", 0)
+                discard_async_output = scheduled_attempt != current_attempt
 
                 # Check for stop and update request status.
-                if new_token_ids:
+                if discard_async_output:
+                    new_token_ids = []
+                    pooler_output = None
+                elif new_token_ids:
                     new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
                 elif request.pooling_params and pooler_output is not None:
                     # Pooling stops as soon as there is output.
                     request.status = RequestStatus.FINISHED_STOPPED
                     stopped = True
 
+                # Async scheduling may finish an already-launched model step
+                # after this request was preempted.  The async scheduler drops
+                # the sampled token above, but the Omni model runner also
+                # returns a pooler payload used by the stage connector.  That
+                # payload belongs to the abandoned execution attempt as well;
+                # forwarding it under the new connector namespace would mix
+                # old codec frames into the restarted downstream request.
                 # If criteria returns True, it means we must STOP the request.
                 # If criteria returns False, it might have triggered a background
                 # transfer (e.g. prefill finished / special token) but continues decoding.
-                if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
+                if (
+                    not discard_async_output
+                    and not stopped
+                    and self._process_kv_transfer_trigger(request, new_token_ids)
+                ):
                     stopped = True
 
                 if new_token_ids and self.structured_output_manager.should_advance(request):
@@ -630,6 +692,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Create EngineCoreOutputs for all clients that have requests with
             # outputs in this step.
             engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
+
+            # A preemption can happen without producing an EngineCoreOutput for
+            # the victim.  Publish it on the batch envelope so the multi-stage
+            # orchestrator can invalidate downstream consumers and create a
+            # new full-pipeline execution.
+            preempted_by_client: dict[int, list[str]] = defaultdict(list)
+            for req_id in getattr(scheduler_output, "preempted_req_ids", set()) or set():
+                request = self.requests.get(req_id)
+                client_index = request.client_index if request is not None else 0
+                preempted_by_client[client_index].append(str(req_id))
+            for client_index, request_ids in preempted_by_client.items():
+                if (eco := engine_core_outputs.get(client_index)) is None:
+                    engine_core_outputs[client_index] = eco = EngineCoreOutputs()
+                eco.stage_preempted_request_ids = sorted(request_ids)
+                eco.stage_preempted_connector_req_ids = {
+                    req_id: str(
+                        getattr(
+                            self.requests.get(req_id),
+                            "output_connector_req_id",
+                            req_id,
+                        )
+                    )
+                    for req_id in request_ids
+                }
 
             finished_req_ids = self.finished_req_ids_dict
             if finished_req_ids:

@@ -75,6 +75,13 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
     # Optional additional information dictionary (serialized)
     additional_information: AdditionalInformationPayload | None = None
+    # Transfer namespace.  Unlike external_req_id (the user-visible logical
+    # id), this identifies the immutable upstream input stream.
+    connector_req_id: str | None = None
+    # Downstream transfer namespace.  Stage-local recovery preserves
+    # connector_req_id but changes this value so replay chunks cannot mix with
+    # the discarded downstream attempt.
+    output_connector_req_id: str | None = None
 
     @classmethod
     def from_request(
@@ -108,6 +115,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             trace_headers=request.trace_headers,
             resumable=request.resumable,
             external_req_id=request.external_req_id,
+            connector_req_id=getattr(request, "connector_req_id", None),
+            output_connector_req_id=getattr(request, "output_connector_req_id", None),
             reasoning_ended=request.reasoning_ended,
             additional_information=additional_information,
         )
@@ -123,3 +132,8 @@ class OmniEngineCoreOutput(EngineCoreOutput):
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
     outputs: list[OmniEngineCoreOutput] = []
+    # Resource preemption is a scheduler-level event and may not produce a
+    # request output.  Carry it explicitly to the orchestrator so downstream
+    # stages can invalidate data derived from the discarded attempt.
+    stage_preempted_request_ids: list[str] = []
+    stage_preempted_connector_req_ids: dict[str, str] = {}

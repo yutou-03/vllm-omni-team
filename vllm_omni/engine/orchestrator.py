@@ -9,6 +9,7 @@ stage-to-stage transfer logic.
 from __future__ import annotations
 
 import asyncio
+import copy
 import time as _time
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,7 +38,7 @@ from vllm_omni.profiling.nvtx import (
     nvtx_mark,
     nvtx_range,
 )
-from vllm_omni.profiling.stage_queue_trace import stage_trace_span
+from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     merge_scheduling_metadata_into_additional_information,
@@ -103,6 +104,35 @@ def merge_scheduling_metadata_into_request_input(
     )
 
 
+def set_execution_global_request_id(
+    request_input: Any,
+    execution_id: str,
+) -> Any:
+    """Give a restarted execution a fresh model/KV-transfer identity."""
+    if isinstance(request_input, dict):
+        additional_information = request_input.get("additional_information")
+        if additional_information is None:
+            additional_information = {}
+        elif not isinstance(additional_information, dict):
+            additional_information = deserialize_additional_information(
+                additional_information
+            )
+        additional_information["global_request_id"] = [execution_id]
+        request_input["additional_information"] = additional_information
+        return request_input
+
+    if not hasattr(request_input, "additional_information"):
+        return request_input
+    additional_information = deserialize_additional_information(
+        request_input.additional_information
+    )
+    additional_information["global_request_id"] = [execution_id]
+    request_input.additional_information = serialize_additional_information(
+        additional_information
+    )
+    return request_input
+
+
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -111,6 +141,8 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
+    connector_req_id: str | None = None,
+    output_connector_req_id: str | None = None,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -146,6 +178,8 @@ def build_engine_core_request_from_tokens(
         prompt_embeds=prompt_embeds,
         resumable=resumable,
         additional_information=additional_info_payload,
+        connector_req_id=connector_req_id,
+        output_connector_req_id=output_connector_req_id,
     )
 
 
@@ -169,6 +203,19 @@ class OrchestratorRequestState:
 
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
+
+    # Recovery bookkeeping.  A resource preemption invalidates the current
+    # physical pipeline and creates a new execution id from the Stage-0 input.
+    final_outputs_emitted: dict[int, int] = field(default_factory=dict)
+    replay_outputs_to_drop: dict[int, int] = field(default_factory=dict)
+    discard_stage_outputs_before: dict[int, float] = field(default_factory=dict)
+    stage0_request_template: Any = None
+    current_stage0_request: Any = None
+    stage0_prompt_text: str | None = None
+    stage_request_ids: dict[int, str] = field(default_factory=dict)
+    pending_restart_stages: set[int] = field(default_factory=set)
+    execution_attempt: int = 0
+    current_execution_id: str | None = None
 
 
 @dataclass
@@ -217,6 +264,7 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        self._physical_to_logical_request_ids: dict[str, str] = {}
         self._cfg_tracker = CfgCompanionTracker()
         self._running_counter = running_counter
         self._omni_nvtx_s2_raw_output_seen: set[str] = set()
@@ -397,8 +445,14 @@ class Orchestrator:
                 extract_scheduling_metadata_from_request_input(original_prompt)
                 or extract_scheduling_metadata_from_request_input(prompt)
             ),
+            stage0_request_template=copy.deepcopy(prompt),
+            current_stage0_request=prompt,
+            stage0_prompt_text=msg.get("output_prompt_text"),
+            stage_request_ids={stage_id: request_id},
+            current_execution_id=request_id,
         )
         self.request_states[request_id] = req_state
+        self._physical_to_logical_request_ids[request_id] = request_id
         self._bump_drain_epoch()
         if self._running_counter is not None:
             self._running_counter.increment()
@@ -804,16 +858,58 @@ class Orchestrator:
             raw_outputs = pool.poll_llm_raw_output_nowait(replica_id)
             if raw_outputs is None:
                 break
+            await self._handle_stage_preemptions(
+                stage_id,
+                list(getattr(raw_outputs, "stage_preempted_request_ids", []) or []),
+                dict(getattr(raw_outputs, "stage_preempted_connector_req_ids", {}) or {}),
+            )
+            if raw_outputs.outputs:
+                physical_to_logical = getattr(
+                    self, "_physical_to_logical_request_ids", {}
+                )
+                kept_outputs = []
+                for eco in raw_outputs.outputs:
+                    physical_req_id = getattr(eco, "request_id", None)
+                    logical_req_id = physical_to_logical.get(
+                        physical_req_id, physical_req_id
+                    )
+                    req_state = self.request_states.get(logical_req_id)
+                    current_stage_req_id = (
+                        req_state.stage_request_ids.get(stage_id)
+                        if req_state is not None
+                        else None
+                    )
+                    if current_stage_req_id is not None and physical_req_id != current_stage_req_id:
+                        continue
+                    cutoff = (
+                        req_state.discard_stage_outputs_before.get(stage_id)
+                        if req_state is not None
+                        else None
+                    )
+                    if cutoff is not None and float(raw_outputs.timestamp) <= cutoff:
+                        continue
+                    kept_outputs.append(eco)
+                raw_outputs.outputs = kept_outputs
             if not raw_outputs.outputs:
                 continue
+            await self._submit_next_restart_stage_after_upstream_output(
+                stage_id, raw_outputs.outputs
+            )
             self._begin_drain_output()
             try:
                 if stage_id == 2:
                     self._trace_s2_raw_outputs_polled(raw_outputs)
 
                 await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                physical_to_logical = getattr(
+                    self, "_physical_to_logical_request_ids", {}
+                )
                 for eco in raw_outputs.outputs:
-                    req_state = self.request_states.get(getattr(eco, "request_id", None))
+                    physical_req_id = getattr(eco, "request_id", None)
+                    logical_req_id = physical_to_logical.get(
+                        physical_req_id, physical_req_id
+                    )
+                    req_state = self.request_states.get(logical_req_id)
                     if req_state is None:
                         continue
                     req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
@@ -907,6 +1003,146 @@ class Orchestrator:
             abort=True,
         )
 
+    async def _handle_stage_preemptions(
+        self,
+        stage_id: int,
+        request_ids: list[str],
+        connector_req_ids: dict[str, str] | None = None,
+    ) -> None:
+        """Invalidate the old pipeline and submit a new execution from Stage 0."""
+        if not request_ids:
+            return
+
+        for physical_request_id in request_ids:
+            physical_to_logical = getattr(self, "_physical_to_logical_request_ids", {})
+            request_id = physical_to_logical.get(physical_request_id, physical_request_id)
+            req_state = self.request_states.get(request_id)
+            if req_state is None:
+                continue
+            if physical_request_id != req_state.stage_request_ids.get(stage_id, request_id):
+                # A delayed preemption envelope from a retired execution.
+                continue
+
+            req_state.execution_attempt += 1
+            old_execution_id = req_state.current_execution_id or physical_request_id
+            new_execution_id = (
+                f"{request_id}__execution{req_state.execution_attempt}"
+            )
+            cutoff = _time.monotonic()
+
+            final_stage_id = req_state.final_stage_id
+            emitted = req_state.final_outputs_emitted.get(final_stage_id, 0)
+            req_state.replay_outputs_to_drop[final_stage_id] = emitted
+            for pipeline_stage_id in range(final_stage_id + 1):
+                req_state.discard_stage_outputs_before[pipeline_stage_id] = cutoff
+
+            old_stage_request_ids = list(
+                dict.fromkeys(req_state.stage_request_ids.values())
+            )
+            await self._abort_request_ids(old_stage_request_ids)
+            self._release_request_bindings(old_stage_request_ids)
+
+            # All runtime-derived bridge and stage progress belongs to the old
+            # execution.  Only the immutable user input, parameters and
+            # already-emitted frontend count survive.
+            req_state.streaming.bridge_states.clear()
+            req_state.streaming.segment_finished = False
+            req_state.streaming.new_prompt_len_snapshot = None
+            req_state.pd_prefill_multimodal_output = None
+            req_state.stage_submit_ts.clear()
+            req_state.stage_request_ids = {
+                pipeline_stage_id: new_execution_id
+                for pipeline_stage_id in range(final_stage_id + 1)
+            }
+            req_state.current_execution_id = new_execution_id
+            physical_to_logical[new_execution_id] = request_id
+
+            stage0_request = copy.deepcopy(req_state.stage0_request_template)
+            set_execution_global_request_id(stage0_request, new_execution_id)
+            stage0_request.request_id = new_execution_id
+            stage0_request.external_req_id = request_id
+            stage0_request.connector_req_id = new_execution_id
+            stage0_request.output_connector_req_id = new_execution_id
+            req_state.current_stage0_request = stage0_request
+            req_state.pending_restart_stages = set(range(1, final_stage_id + 1))
+            req_state.stage_submit_ts[0] = _time.time()
+            await self.stage_pools[0].submit_initial(
+                new_execution_id,
+                req_state,
+                stage0_request,
+                prompt_text=req_state.stage0_prompt_text,
+            )
+
+            emit_stage_event(
+                "full_pipeline_restarted",
+                stage_id=stage_id,
+                request_id=request_id,
+                old_execution_id=old_execution_id,
+                new_execution_id=new_execution_id,
+                restarted_stage_ids=list(range(final_stage_id + 1)),
+                replay_outputs_to_drop=dict(req_state.replay_outputs_to_drop),
+            )
+            self._bump_drain_epoch()
+
+    async def _submit_next_restart_stage_after_upstream_output(
+        self,
+        stage_id: int,
+        outputs: list[Any],
+    ) -> None:
+        """Start one restarted downstream stage after its upstream is live.
+
+        ``abort_requests_async`` only acknowledges that an abort command was
+        sent.  Submitting every replacement stage immediately can therefore
+        overlap old GPU/model state with the replacement execution.  Waiting
+        for an output from the replacement upstream stage gives each stage a
+        causal hand-off and preserves true Stage-0 -> Stage-1 -> Stage-2
+        re-execution.
+        """
+        if not self.async_chunk:
+            return
+
+        next_stage_id = stage_id + 1
+        for output in outputs:
+            physical_request_id = getattr(output, "request_id", None)
+            physical_to_logical = getattr(
+                self, "_physical_to_logical_request_ids", {}
+            )
+            request_id = physical_to_logical.get(
+                physical_request_id, physical_request_id
+            )
+            req_state = self.request_states.get(request_id)
+            if req_state is None:
+                continue
+            if next_stage_id not in req_state.pending_restart_stages:
+                continue
+            if physical_request_id != req_state.stage_request_ids.get(stage_id):
+                continue
+
+            # Remove before awaiting so another ready output cannot submit the
+            # same physical request twice.  Restore it if submission fails.
+            req_state.pending_restart_stages.remove(next_stage_id)
+            try:
+                await self._prewarm_async_chunk_stages(
+                    request_id,
+                    req_state.current_stage0_request,
+                    req_state,
+                    start_stage_id=next_stage_id,
+                    end_stage_id=next_stage_id,
+                    recovery=True,
+                    connector_req_id=req_state.current_execution_id,
+                )
+            except Exception:
+                req_state.pending_restart_stages.add(next_stage_id)
+                raise
+
+            emit_stage_event(
+                "full_pipeline_restart_stage_submitted",
+                stage_id=next_stage_id,
+                request_id=request_id,
+                execution_id=req_state.current_execution_id,
+                upstream_stage_id=stage_id,
+            )
+
     # ---- Shared helpers ----
 
     async def _cleanup_request_ids(self, request_ids: list[str], *, abort: bool = False) -> None:
@@ -914,15 +1150,33 @@ class Orchestrator:
         if not request_ids:
             return
 
-        if abort:
-            await self._abort_request_ids(request_ids)
-        self._release_request_bindings(request_ids)
+        physical_request_ids = list(request_ids)
+        logical_request_ids = set(request_ids)
+        physical_to_logical = getattr(
+            self, "_physical_to_logical_request_ids", {}
+        )
+        for physical_id, logical_id in physical_to_logical.items():
+            if logical_id in logical_request_ids:
+                physical_request_ids.append(physical_id)
+        physical_request_ids = list(dict.fromkeys(physical_request_ids))
+
+        has_recovery_attempts = any(
+            physical_id not in logical_request_ids
+            for physical_id in physical_request_ids
+        )
+        if abort or has_recovery_attempts:
+            await self._abort_request_ids(physical_request_ids)
+        self._release_request_bindings(physical_request_ids)
         for request_id in request_ids:
             self._pd_kv_params.pop(request_id, None)
-            self._omni_nvtx_s2_raw_output_seen.discard(request_id)
-            self._omni_nvtx_s2_route_seen.discard(request_id)
-            if self.request_states.pop(request_id, None) is not None and self._running_counter is not None:
-                self._running_counter.decrement()
+            getattr(self, "_omni_nvtx_s2_raw_output_seen", set()).discard(request_id)
+            getattr(self, "_omni_nvtx_s2_route_seen", set()).discard(request_id)
+            for physical_id, logical_id in list(physical_to_logical.items()):
+                if logical_id == request_id:
+                    physical_to_logical.pop(physical_id, None)
+            running_counter = getattr(self, "_running_counter", None)
+            if self.request_states.pop(request_id, None) is not None and running_counter is not None:
+                running_counter.decrement()
         self._bump_drain_epoch()
 
     def _ttfp_submit_range_name(
@@ -988,6 +1242,19 @@ class Orchestrator:
             return
 
         if self.stage_pools[stage_id].final_output:
+            outputs_to_drop = req_state.replay_outputs_to_drop.get(stage_id, 0)
+            if outputs_to_drop > 0:
+                req_state.replay_outputs_to_drop[stage_id] = outputs_to_drop - 1
+                emit_stage_event(
+                    "stage_replay_output_suppressed",
+                    stage_id=stage_id,
+                    request_id=req_id,
+                    remaining=req_state.replay_outputs_to_drop[stage_id],
+                )
+            else:
+                req_state.final_outputs_emitted[stage_id] = (
+                    req_state.final_outputs_emitted.get(stage_id, 0) + 1
+                )
             queue_payload = {
                 "type": "output",
                 "request_id": req_id,
@@ -998,7 +1265,9 @@ class Orchestrator:
                 "finished": finished and stage_id == req_state.final_stage_id,
                 "stage_submit_ts": submit_ts,
             }
-            if stage_id == 2 and req_id not in self._omni_nvtx_s2_route_seen:
+            if outputs_to_drop > 0:
+                pass
+            elif stage_id == 2 and req_id not in self._omni_nvtx_s2_route_seen:
                 self._omni_nvtx_s2_route_seen.add(req_id)
                 short_req_id = str(req_id)[-8:]
                 with nvtx_range(
@@ -1185,6 +1454,7 @@ class Orchestrator:
     ) -> None:
         """Forward output from the current logical stage to the next one."""
         next_logical = src_stage_id + 1
+        next_stage_request_id = req_state.stage_request_ids.get(next_logical, req_id)
         next_pool = self.stage_pools[next_logical]
         next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
@@ -1248,7 +1518,7 @@ class Orchestrator:
             )
 
             if already_submitted:
-                await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+                await next_pool.submit_update(next_stage_request_id, req_state, diffusion_prompt)
             else:
                 ttfp_range_name = self._ttfp_submit_range_name(
                     req_id,
@@ -1258,26 +1528,26 @@ class Orchestrator:
                 if ttfp_range_name is not None:
                     with nvtx_range(ttfp_range_name, color="magenta"):
                         await next_pool.submit_initial(
-                            req_id,
+                            next_stage_request_id,
                             req_state,
                             diffusion_prompt,
                             submit_kwargs={
                                 "kv_sender_info": self._build_kv_sender_info(
                                     list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                                    request_id=req_id,
+                                    request_id=next_stage_request_id,
                                 )
                             },
                             params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                         )
                 else:
                     await next_pool.submit_initial(
-                        req_id,
+                        next_stage_request_id,
                         req_state,
                         diffusion_prompt,
                         submit_kwargs={
                             "kv_sender_info": self._build_kv_sender_info(
                                 list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                                request_id=req_id,
+                                request_id=next_stage_request_id,
                             )
                         },
                         params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
@@ -1312,16 +1582,18 @@ class Orchestrator:
                     req_state.scheduling_metadata,
                 )
                 request = build_engine_core_request_from_tokens(
-                    request_id=req_id,
+                    request_id=next_stage_request_id,
                     prompt=decode_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
                     mm_features=req_state.mm_features,
                     resumable=next_stage_resumable,
                 )
-                request.external_req_id = request.request_id
+                request.external_req_id = req_id
+                request.connector_req_id = next_stage_request_id
+                request.output_connector_req_id = next_stage_request_id
                 if already_submitted:
-                    await next_pool.submit_update(req_id, req_state, request)
+                    await next_pool.submit_update(next_stage_request_id, req_state, request)
                 else:
                     ttfp_range_name = self._ttfp_submit_range_name(
                         req_id,
@@ -1330,9 +1602,13 @@ class Orchestrator:
                     )
                     if ttfp_range_name is not None:
                         with nvtx_range(ttfp_range_name, color="magenta"):
-                            await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                            await next_pool.submit_initial(
+                                next_stage_request_id, req_state, request, prompt_text=None
+                            )
                     else:
-                        await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                        await next_pool.submit_initial(
+                            next_stage_request_id, req_state, request, prompt_text=None
+                        )
 
             req_state.stage_submit_ts[next_logical] = _time.time()
             return
@@ -1347,7 +1623,7 @@ class Orchestrator:
             with stage_trace_span(
                 "stage_route_to_next",
                 stage_id=src_stage_id,
-                request_id=req_id,
+                request_id=next_stage_request_id,
                 nvtx_name=f"s{src_stage_id}_route_to_s{next_logical}",
                 nvtx_color="purple",
                 to_stage=next_logical,
@@ -1379,7 +1655,7 @@ class Orchestrator:
             model_stage = getattr(next_client, "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
             request = build_engine_core_request_from_tokens(
-                request_id=req_id,
+                request_id=next_stage_request_id,
                 prompt=next_input,
                 params=params,
                 model_config=next_pool.stage_vllm_config.model_config,
@@ -1387,10 +1663,12 @@ class Orchestrator:
                 resumable=next_stage_resumable,
             )
 
-            request.external_req_id = request.request_id
+            request.external_req_id = req_id
+            request.connector_req_id = next_stage_request_id
+            request.output_connector_req_id = next_stage_request_id
             if already_submitted:
                 with nvtx_range("orchestrator:submit_update"):
-                    await next_pool.submit_update(req_id, req_state, request)
+                    await next_pool.submit_update(next_stage_request_id, req_state, request)
             else:
                 ttfp_range_name = self._ttfp_submit_range_name(
                     req_id,
@@ -1400,10 +1678,20 @@ class Orchestrator:
                 with nvtx_range("orchestrator:submit_initial"):
                     if ttfp_range_name is not None:
                         with nvtx_range(ttfp_range_name, color="magenta"):
-                            await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                            await next_pool.submit_initial(
+                                next_stage_request_id, req_state, request, prompt_text=None
+                            )
                     else:
-                        await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                        await next_pool.submit_initial(
+                            next_stage_request_id, req_state, request, prompt_text=None
+                        )
 
+        req_state.stage_request_ids[next_logical] = next_stage_request_id
+        physical_to_logical = getattr(
+            self, "_physical_to_logical_request_ids", None
+        )
+        if physical_to_logical is not None:
+            physical_to_logical[next_stage_request_id] = req_id
         req_state.stage_submit_ts[next_logical] = _time.time()
 
     async def _prewarm_async_chunk_stages(
@@ -1411,6 +1699,11 @@ class Orchestrator:
         request_id: str,
         stage0_request: Any,
         req_state: OrchestratorRequestState,
+        *,
+        start_stage_id: int = 1,
+        end_stage_id: int | None = None,
+        recovery: bool = False,
+        connector_req_id: str | None = None,
     ) -> None:
         """Pre-submit downstream stages for async-chunk mode."""
         if req_state.final_stage_id <= 0:
@@ -1424,7 +1717,11 @@ class Orchestrator:
             )
             return
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
+        last_stage_id = (
+            req_state.final_stage_id if end_stage_id is None else end_stage_id
+        )
+        for next_stage_id in range(start_stage_id, last_stage_id + 1):
+            stage_request_id = req_state.stage_request_ids.get(next_stage_id, request_id)
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 
@@ -1436,19 +1733,17 @@ class Orchestrator:
                     req_state.scheduling_metadata,
                 )
                 await next_pool.submit_initial(
-                    request_id,
+                    stage_request_id,
                     req_state,
                     prewarm_prompt,
                     submit_kwargs={
                         "kv_sender_info": self._build_kv_sender_info(
                             list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
-                            request_id=request_id,
+                            request_id=stage_request_id,
                         )
                     },
                 )
             else:
-                import copy
-
                 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 
                 try:
@@ -1462,7 +1757,23 @@ class Orchestrator:
                 else:
                     base_input = {}
 
-                base_input["prompt_token_ids"] = [0] * next_prompt_len
+                if recovery:
+                    set_execution_global_request_id(
+                        base_input,
+                        connector_req_id or stage_request_id,
+                    )
+
+                # A recovery consumer must wait for replayed connector data.
+                # Reusing the ordinary prewarm placeholder makes Stage-2 run
+                # Talker's prompt length as if it were codec tokens before the
+                # first replay chunk arrives.
+                # Stage 1 needs the ordinary fixed-length placeholder so its
+                # first scheduling step is non-empty.  Later stages must wait
+                # for newly generated upstream chunks from this execution.
+                wait_for_replayed_upstream = recovery and next_stage_id > 1
+                base_input["prompt_token_ids"] = (
+                    [] if wait_for_replayed_upstream else [0] * next_prompt_len
+                )
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
                 base_input = merge_scheduling_metadata_into_prompt(
@@ -1471,13 +1782,21 @@ class Orchestrator:
                 )
 
                 request = build_engine_core_request_from_tokens(
-                    request_id=request_id,
+                    request_id=stage_request_id,
                     prompt=base_input,
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
+                    connector_req_id=connector_req_id or request_id,
+                    output_connector_req_id=connector_req_id or request_id,
                 )
-                request.external_req_id = request.request_id
-                await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
+                request.external_req_id = request_id
+                await next_pool.submit_initial(stage_request_id, req_state, request, prompt_text=None)
+            req_state.stage_request_ids[next_stage_id] = stage_request_id
+            physical_to_logical = getattr(
+                self, "_physical_to_logical_request_ids", None
+            )
+            if physical_to_logical is not None:
+                physical_to_logical[stage_request_id] = request_id
 
     def _build_kv_sender_info(
         self,

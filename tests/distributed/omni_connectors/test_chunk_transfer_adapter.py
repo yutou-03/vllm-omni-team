@@ -608,6 +608,57 @@ def test_finish_requests_restores_status(build_adapter):
     assert req_id not in adapter.requests_origin_status
 
 
+def test_cleanup_receiver_removes_pending_attempt_and_upstream_payload(build_adapter):
+    adapter, _ = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("physical-attempt", RequestStatus.WAITING, "upstream-attempt")
+    other = _req("other", RequestStatus.WAITING, "other-upstream")
+    adapter.request_ids_mapping[request.request_id] = "upstream-attempt"
+    adapter.request_payload["upstream-attempt"] = {"partial": [1]}
+    adapter.request_payload["downstream-attempt"] = {"sender": [2]}
+    adapter._pending_load_reqs.extend([request, other])
+    adapter.waiting_for_chunk_waiting_requests.append(request)
+    adapter.waiting_for_chunk_running_requests.append(request)
+
+    adapter.cleanup_receiver(request.request_id)
+
+    assert [item.request_id for item in adapter._pending_load_reqs] == ["other"]
+    assert adapter.waiting_for_chunk_waiting_requests == deque()
+    assert adapter.waiting_for_chunk_running_requests == deque()
+    assert "upstream-attempt" not in adapter.request_payload
+    assert adapter.request_payload["downstream-attempt"] == {"sender": [2]}
+
+
+def test_abandon_sender_cleans_transport_namespace(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    adapter.put_req_chunk["retired-attempt"] = 2
+    adapter.request_payload["retired-attempt"] = {"partial": [1]}
+
+    adapter.abandon_sender("retired-attempt")
+
+    assert "retired-attempt" not in adapter.put_req_chunk
+    assert "retired-attempt" not in adapter.request_payload
+    connector.cleanup.assert_called_once_with("retired-attempt")
+
+
+def test_builder_cannot_resurrect_abandoned_partial_state(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-race", RequestStatus.RUNNING, "logical")
+    request.output_connector_req_id = "retired-attempt"
+
+    def _racing_builder(*, transfer_manager, **_kwargs):
+        transfer_manager.abandon_sender("retired-attempt")
+        transfer_manager.code_prompt_token_ids["retired-attempt"].append([1, 2])
+        return None
+
+    adapter.custom_process_next_stage_input_func = _racing_builder
+    adapter._send_single_request(
+        {"pooling_output": None, "request": request, "is_finished": False}
+    )
+
+    assert "retired-attempt" not in adapter.code_prompt_token_ids
+    connector.put.assert_not_called()
+
+
 # ---------------------------------------------------------------
 # Scheduler trigger tests
 # ---------------------------------------------------------------
@@ -781,6 +832,84 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     assert len(cleanup_calls) == 0
     assert len(save_calls) == 1
+
+
+def test_ar_scheduler_drops_stale_async_pooler_output_after_preemption(mocker: MockerFixture):
+    """The in-flight preemption step must not enter the new stage namespace."""
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    adapter = mocker.MagicMock()
+    scheduler = mocker.MagicMock()
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler.connector = None
+    scheduler.perf_metrics = None
+    scheduler.log_stats = False
+    scheduler.recompute_kv_load_failures = False
+    scheduler.structured_output_manager = mocker.MagicMock()
+    scheduler.structured_output_manager.should_advance.return_value = False
+    scheduler.finished_req_ids_dict = {}
+    scheduler.kv_cache_manager = mocker.MagicMock()
+    scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_event_publisher = mocker.MagicMock()
+    scheduler.waiting_for_transfer_free = set()
+    scheduler.transfer_triggered_requests = set()
+    scheduler.active_kv_transfers = set()
+
+    request = _HashableRequest(
+        request_id="req-ar",
+        external_req_id="ext-ar",
+        connector_req_id="ext-ar__stage1__attempt1",
+        status=RequestStatus.WAITING,
+        is_finished=lambda: False,
+        discard_latest_async_tokens=False,
+        _omni_execution_attempt=1,
+        num_computed_tokens=0,
+        num_prompt_tokens=1,
+        prompt_token_ids=[1],
+        num_output_placeholders=1,
+        sampling_params=None,
+        pooling_params=None,
+        stop_reason=None,
+        client_index=0,
+        take_events=lambda: [],
+        trace_headers=None,
+        has_encoder_inputs=False,
+        take_prefill_stats=lambda: None,
+        num_nans_in_logits=0,
+        get_finished_reason=lambda: None,
+    )
+    scheduler.requests = {"req-ar": request}
+
+    scheduler._process_kv_transfer_trigger.return_value = False
+    scheduler.running = []
+    scheduler.waiting = mocker.MagicMock()
+    scheduler.make_spec_decoding_stats.return_value = None
+    scheduler.make_stats.return_value = None
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req-ar": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+        request_execution_attempts={"req-ar": 0},
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=[[123]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[{"codec": "stale"}],
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"req-ar": 0},
+        kv_extracted_req_ids=None,
+    )
+
+    outputs = OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+
+    adapter.save_async.assert_not_called()
+    scheduler._update_request_with_output.assert_not_called()
+    assert outputs == {}
+    assert request.discard_latest_async_tokens is False
 
 
 def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):

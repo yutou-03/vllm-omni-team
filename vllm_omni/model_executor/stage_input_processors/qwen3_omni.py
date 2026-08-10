@@ -287,7 +287,11 @@ def thinker2talker_async_chunk(
     3. Package for talker with additional information
     """
 
-    request_id = request.external_req_id
+    request_id = (
+        request.output_connector_req_id
+        or request.connector_req_id
+        or request.external_req_id
+    )
     chunk_id = transfer_manager.put_req_chunk[request_id]
     nvtx_mark(
         f"s0_payload_start:req={str(request_id)[-8:]}:"
@@ -560,7 +564,11 @@ def talker2code2wav_async_chunk(
     if sum(codec_codes) == 0:
         return None
 
-    request_id = request.external_req_id
+    request_id = (
+        request.output_connector_req_id
+        or request.connector_req_id
+        or request.external_req_id
+    )
     transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
 

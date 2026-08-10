@@ -437,8 +437,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             if runtime_additional_information is not None:
                 for info in runtime_additional_information:
                     meta = info.get("meta", {})
-                    if "left_context_size" in meta:
-                        left_context_size.append(meta["left_context_size"])
+                    # Preserve one entry per batched request.  A replayed
+                    # request can legitimately start without left context;
+                    # skipping that entry shifts every later request and can
+                    # make Code2Wav index past the list boundary.
+                    left_context_size.append(meta.get("left_context_size", 0))
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
             with nvtx_range(f"code2wav_wrapper:generate_audio:b={codes.shape[0]}:t={codes.shape[-1]}", color="red"):

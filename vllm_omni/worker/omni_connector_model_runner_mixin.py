@@ -122,6 +122,7 @@ class OmniConnectorModelRunnerMixin:
         self._send_side_request_payload: dict[str, dict[str, Any]] = {}
         self._code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
         self._request_ids_mapping: dict[str, str] = {}
+        self._output_request_ids_mapping: dict[str, str] = {}
 
         # -- async I/O state (shared by chunk + full_payload_mode) --
         self._pending_load_reqs: dict[str, Any] = {}
@@ -212,7 +213,8 @@ class OmniConnectorModelRunnerMixin:
         is keyed by external ID.
         """
         ext_id = self._request_ids_mapping.pop(req_id, None)
-        send_req_id = ext_id if ext_id is not None else req_id
+        output_id = self._output_request_ids_mapping.pop(req_id, None)
+        send_req_id = output_id or ext_id or req_id
 
         with self._lock:
             if self._pending_save_counts.get(send_req_id, 0):
@@ -230,11 +232,14 @@ class OmniConnectorModelRunnerMixin:
     def drop_inactive_request_delivery_state(self, req_id: str) -> None:
         """Clear recv-side state for inactive requests."""
         ext_id = self._request_ids_mapping.pop(req_id, None)
+        output_id = self._output_request_ids_mapping.pop(req_id, None)
         if hasattr(self, "_lock"):
             with self._lock:
                 self._drop_send_side_payload_state(req_id, ext_id)
+                self._drop_send_side_payload_state(req_id, output_id)
         else:
             self._drop_send_side_payload_state(req_id, ext_id)
+            self._drop_send_side_payload_state(req_id, output_id)
         self._cleanup_recv_delivery_state(req_id)
 
     def _drop_send_side_payload_state(self, req_id: str, ext_id: str | None) -> None:
@@ -866,10 +871,10 @@ class OmniConnectorModelRunnerMixin:
         if self._stage_id == 0:
             return
         request_id = request.request_id
-        self._request_ids_mapping[request_id] = getattr(
-            request,
-            "external_req_id",
-            request_id,
+        self._request_ids_mapping[request_id] = (
+            getattr(request, "connector_req_id", None)
+            or getattr(request, "external_req_id", None)
+            or request_id
         )
         with self._lock:
             if request_id in self._stage_recv_req_ids:
@@ -1978,6 +1983,11 @@ class OmniConnectorModelRunnerMixin:
                 attrs[name] = self._freeze_request_attr(getattr(request, name))
 
         attrs["external_req_id"] = external_req_id
+        attrs["connector_req_id"] = getattr(request, "connector_req_id", None) or external_req_id
+        attrs["output_connector_req_id"] = (
+            getattr(request, "output_connector_req_id", None)
+            or attrs["connector_req_id"]
+        )
         attrs["_frozen_is_finished"] = finished
         snapshot = SimpleNamespace(**attrs)
         snapshot.is_finished = lambda: finished
@@ -2098,11 +2108,20 @@ class OmniConnectorModelRunnerMixin:
         ``external_req_id`` attribute, and finally to the given
         ``fallback_req_id``.
         """
-        mapped = self._request_ids_mapping.get(fallback_req_id)
+        if request is not None:
+            output_id = getattr(request, "output_connector_req_id", None)
+            if output_id:
+                self._output_request_ids_mapping[fallback_req_id] = output_id
+                return output_id
+        mapped = self._output_request_ids_mapping.get(fallback_req_id)
         if mapped is not None:
             return mapped
         if request is not None:
-            return getattr(request, "external_req_id", fallback_req_id)
+            return (
+                getattr(request, "output_connector_req_id", None)
+                or getattr(request, "connector_req_id", None)
+                or getattr(request, "external_req_id", fallback_req_id)
+            )
         return fallback_req_id
 
     def _resolve_next_stage_id(self, model_config: Any) -> int:

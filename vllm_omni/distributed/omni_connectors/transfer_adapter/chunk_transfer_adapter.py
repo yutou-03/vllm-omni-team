@@ -3,6 +3,7 @@
 
 import importlib
 from collections import defaultdict, deque
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -59,6 +60,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
+        self._abandoned_sender_ids: set[str] = set()
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
@@ -119,13 +121,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             pooling_output: Partial pooling output dictionary
             request: Request object
         """
+        is_finished = request.is_finished()
+        request_snapshot = self._snapshot_request_for_send(request, is_finished)
         task = {
             "pooling_output": pooling_output,
-            "request": request,
-            "is_finished": request.is_finished(),
+            "request": request_snapshot,
+            "is_finished": is_finished,
         }
         if request is not None:
-            req_id = getattr(request, "external_req_id", getattr(request, "request_id", ""))
+            req_id = (
+                getattr(request, "output_connector_req_id", None)
+                or getattr(request, "connector_req_id", None)
+                or getattr(request, "external_req_id", None)
+                or getattr(request, "request_id", "")
+            )
             # Merely tracing an enqueue must not create sender bookkeeping.
             # Some terminal requests (for example text-only requests that end
             # at stage 0) legitimately produce no next-stage payload.
@@ -134,6 +143,57 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._enqueue_save_request(task)
         with self._save_cond:
             self._save_cond.notify()
+
+    @staticmethod
+    def _snapshot_request_for_send(request: Request, is_finished: bool) -> Any:
+        """Freeze request fields observed by the asynchronous save worker."""
+        attrs: dict[str, Any] = {}
+        for name in (
+            "request_id",
+            "external_req_id",
+            "connector_req_id",
+            "output_connector_req_id",
+            "prompt_token_ids",
+            "output_token_ids",
+            "all_token_ids",
+            "additional_information",
+            "sampling_params",
+        ):
+            if not hasattr(request, name):
+                continue
+            value = getattr(request, name)
+            raw_list = getattr(value, "_x", None)
+            if raw_list is not None:
+                value = list(raw_list)
+            elif isinstance(value, (list, tuple)):
+                value = list(value)
+            attrs[name] = value
+        snapshot = SimpleNamespace(**attrs)
+        snapshot.is_finished = lambda: is_finished
+        return snapshot
+
+    def abandon_sender(self, external_req_id: str) -> None:
+        """Invalidate one non-terminal output attempt after preemption."""
+        with self._drain_state_lock:
+            self._abandoned_sender_ids.add(external_req_id)
+            self._pending_save_reqs = deque(
+                task
+                for task in self._pending_save_reqs
+                if (
+                    getattr(task.get("request"), "output_connector_req_id", None)
+                    or getattr(task.get("request"), "connector_req_id", None)
+                    or getattr(task.get("request"), "external_req_id", None)
+                )
+                != external_req_id
+            )
+        self._cleanup_abandoned_sender(external_req_id)
+
+    def _cleanup_abandoned_sender(self, external_req_id: str) -> None:
+        """Drop adapter state and transport objects for a retired attempt."""
+        self.cleanup_sender(external_req_id)
+        cleanup = getattr(self.connector, "cleanup", None)
+        if callable(cleanup):
+            cleanup(external_req_id)
 
     def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
@@ -265,7 +325,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
-        external_req_id = request.external_req_id
+        external_req_id = (
+            getattr(request, "output_connector_req_id", None)
+            or getattr(request, "connector_req_id", None)
+            or request.external_req_id
+        )
+        if external_req_id in self._abandoned_sender_ids:
+            self._cleanup_abandoned_sender(external_req_id)
+            return
         # Payload builders own creation of per-request chunk state when they
         # actually need it.  Reading the prospective chunk id must not leave a
         # defaultdict entry behind for a request with no downstream payload.
@@ -288,6 +355,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     "custom next-stage payload builder failed for "
                     f"request {external_req_id}: {e}"
                 ) from e
+
+        # Preemption can race with a builder that accumulates partial codec
+        # frames before returning an empty chunk.  Recheck after the builder so
+        # it cannot recreate state that abandon_sender() just removed.
+        if external_req_id in self._abandoned_sender_ids:
+            self._cleanup_abandoned_sender(external_req_id)
+            return
 
         if not payload_data:
             # A non-terminal empty result can mean that an async builder is
@@ -355,6 +429,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif finished_flag is not None:
             is_payload_finished = bool(finished_flag)
 
+        if external_req_id in self._abandoned_sender_ids:
+            self._cleanup_abandoned_sender(external_req_id)
+            return
+
         # A successful connector put is not sufficient for a terminal save:
         # the receiver also needs an explicit EOF marker.  Preserve the sender
         # bookkeeping and fail closed if the payload violates that protocol;
@@ -395,14 +473,35 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # cleanup either clears an already-published chunk or leaves a
         # cancellation tombstone that makes the in-flight poll drop it.
         with self._drain_state_lock:
+            external_req_id = self.request_ids_mapping.get(request_id, request_id)
+            self._pending_load_reqs = deque(
+                request
+                for request in self._pending_load_reqs
+                if getattr(request, "request_id", None) != request_id
+            )
             self.finished_requests.discard(request_id)
             self.get_req_chunk.pop(request_id, None)
             self.requests_with_ready_chunks.discard(request_id)
             self.request_ids_mapping.pop(request_id, None)
             self.requests_origin_status.pop(request_id, None)
+            # Receiver accumulation is keyed by the immutable upstream
+            # connector namespace.  It is intentionally distinct from the
+            # sender attempt namespace during stage-local recovery.
+            self.request_payload.pop(external_req_id, None)
 
             self._cancelled_load_reqs.add(request_id)
             self._finished_load_reqs.discard(request_id)
+
+        self.waiting_for_chunk_waiting_requests = deque(
+            request
+            for request in self.waiting_for_chunk_waiting_requests
+            if getattr(request, "request_id", None) != request_id
+        )
+        self.waiting_for_chunk_running_requests = deque(
+            request
+            for request in self.waiting_for_chunk_running_requests
+            if getattr(request, "request_id", None) != request_id
+        )
 
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
@@ -642,13 +741,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
-            request_ids = requests.keys()
+            request_ids = set(requests or {})
 
-        # First pass: collect requests to remove from queues
+        # ``finish_requests`` is the forced termination path (abort or load
+        # failure).  Natural completion is handled by the terminal save task.
+        # Retire both sides here even if the request has already left the
+        # scheduler dictionary: chunk-wait queues and transport bookkeeping
+        # outlive the scheduler entry otherwise.
         for req_id in request_ids:
             request = requests.get(req_id) if requests else None
-            if request is None or request.is_finished():
-                # Invalid request ID.
-                continue
-            if req_id in self.requests_origin_status:
-                request.status = self.requests_origin_status.pop(req_id)
+            prior_status = self.requests_origin_status.get(req_id)
+            if request is not None and prior_status is not None:
+                request.status = prior_status
+            output_req_id = None
+            if request is not None:
+                output_req_id = (
+                    getattr(request, "output_connector_req_id", None)
+                    or getattr(request, "connector_req_id", None)
+                    or getattr(request, "external_req_id", None)
+                )
+            self.cleanup_receiver(req_id)
+            if output_req_id is not None:
+                self.abandon_sender(str(output_req_id))
+
+        return []
