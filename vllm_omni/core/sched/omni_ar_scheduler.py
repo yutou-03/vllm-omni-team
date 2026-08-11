@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from time import time
+from time import monotonic, time
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -30,10 +31,15 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
+from vllm_omni.scheduling.policy import request_scheduling_metadata
 
 logger = init_logger(__name__)
 
 _CONTROLLED_PREEMPTION_FILE_ENV = "VLLM_OMNI_CONTROLLED_PREEMPTION_FILE"
+_SLO_ACTIVE_PREEMPTION_ENV = "VLLM_OMNI_SLO_ACTIVE_PREEMPTION"
+_SLO_ACTIVE_STAGES_ENV = "VLLM_OMNI_SLO_ACTIVE_STAGES"
+_SLO_ACTIVE_GUARD_MS_ENV = "VLLM_OMNI_SLO_ACTIVE_GUARD_MS"
+_SLO_PRIORITY_TRACE_ENV = "VLLM_OMNI_SLO_PRIORITY_TRACE"
 
 
 def _logical_request_id(request_id: str) -> str:
@@ -96,6 +102,40 @@ def _load_controlled_preemption_rules() -> list[dict[str, Any]]:
     return normalized
 
 
+def _load_slo_active_preemption_config() -> tuple[bool, set[int], float, bool]:
+    """Load the opt-in SLO active-switch experiment configuration."""
+    raw_enabled = os.environ.get(_SLO_ACTIVE_PREEMPTION_ENV, "0").strip().lower()
+    if raw_enabled not in {"0", "1", "false", "true"}:
+        raise ValueError(
+            f"{_SLO_ACTIVE_PREEMPTION_ENV} must be one of 0/1/false/true"
+        )
+    enabled = raw_enabled in {"1", "true"}
+    raw_stages = os.environ.get(_SLO_ACTIVE_STAGES_ENV, "1")
+    try:
+        stages = {
+            int(value.strip())
+            for value in raw_stages.split(",")
+            if value.strip()
+        }
+    except ValueError as error:
+        raise ValueError(
+            f"{_SLO_ACTIVE_STAGES_ENV} must be a comma-separated integer list"
+        ) from error
+    if not stages or any(stage_id < 0 for stage_id in stages):
+        raise ValueError(f"{_SLO_ACTIVE_STAGES_ENV} must contain non-negative stages")
+    try:
+        guard_ms = float(os.environ.get(_SLO_ACTIVE_GUARD_MS_ENV, "0"))
+    except ValueError as error:
+        raise ValueError(f"{_SLO_ACTIVE_GUARD_MS_ENV} must be numeric") from error
+    if not math.isfinite(guard_ms) or guard_ms < 0:
+        raise ValueError(f"{_SLO_ACTIVE_GUARD_MS_ENV} must be finite and non-negative")
+    raw_trace = os.environ.get(_SLO_PRIORITY_TRACE_ENV, "0").strip().lower()
+    if raw_trace not in {"0", "1", "false", "true"}:
+        raise ValueError(f"{_SLO_PRIORITY_TRACE_ENV} must be one of 0/1/false/true")
+    trace_enabled = raw_trace in {"1", "true"}
+    return enabled, stages, guard_ms, trace_enabled
+
+
 @dataclass
 class KVCacheTransferData:
     request_id: str
@@ -154,6 +194,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omni_preemption_causes_pending: dict[str, str] = {}
         self._omni_preemption_progress_pending: dict[str, int] = {}
         self._omni_preemption_rule_ids_pending: dict[str, str] = {}
+        (
+            self._slo_active_preemption_enabled,
+            self._slo_active_preemption_stages,
+            self._slo_active_guard_ms,
+            self._slo_priority_trace_enabled,
+        ) = _load_slo_active_preemption_config()
+        self._slo_priority_witness_seen: set[tuple[str, str, int]] = set()
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -258,6 +305,131 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 injection_succeeded=True,
             )
         return injected
+
+    def _slo_stage_fields(self, request: Request) -> tuple[float, float]:
+        """Return the absolute Stage deadline and predicted Stage service ms."""
+        stage_id = int(self._omni_stage_id_for_trace())
+        metadata = request_scheduling_metadata(request)
+        deadlines = metadata.get("sched_stage_deadline_monotonic_s")
+        predictions = metadata.get("sched_predicted_stage_ms")
+        if not isinstance(deadlines, (list, tuple)) or stage_id >= len(deadlines):
+            raise ValueError(
+                f"request {request.request_id!r} has no Stage-{stage_id} deadline"
+            )
+        if not isinstance(predictions, (list, tuple)) or stage_id >= len(predictions):
+            raise ValueError(
+                f"request {request.request_id!r} has no Stage-{stage_id} prediction"
+            )
+        deadline = float(deadlines[stage_id])
+        predicted_ms = float(predictions[stage_id])
+        if not math.isfinite(deadline) or not math.isfinite(predicted_ms):
+            raise ValueError(
+                f"request {request.request_id!r} has non-finite SLO metadata"
+            )
+        if predicted_ms <= 0:
+            raise ValueError(
+                f"request {request.request_id!r} has non-positive Stage prediction"
+            )
+        return deadline, predicted_ms
+
+    def _maybe_preempt_for_slo(
+        self,
+        timestamp: float,
+        *,
+        monotonic_now: float | None = None,
+    ) -> set[str]:
+        """Actively replace one running request when an earlier SLO is urgent.
+
+        The passive and active experiment groups use identical Stage-deadline
+        ordering.  This opt-in hook changes only the running-to-waiting
+        boundary: with no free sequence slot, the earliest-deadline waiting
+        request may replace the latest-deadline running request once its slack
+        can no longer cover its own predicted Stage service time.
+        """
+        stage_id = int(self._omni_stage_id_for_trace())
+        if not (
+            getattr(self, "_slo_active_preemption_enabled", False)
+            or getattr(self, "_slo_priority_trace_enabled", False)
+        ):
+            return set()
+        if stage_id not in getattr(self, "_slo_active_preemption_stages", {1}):
+            return set()
+        waiting = list(self.waiting)
+        running = list(self.running)
+        max_running = int(getattr(self, "max_num_running_reqs", len(running)))
+        if not waiting or not running or len(running) < max_running:
+            return set()
+
+        waiting_with_fields = [
+            (request, *self._slo_stage_fields(request)) for request in waiting
+        ]
+        running_with_fields = [
+            (request, *self._slo_stage_fields(request)) for request in running
+        ]
+        aggressor, aggressor_deadline, aggressor_predicted_ms = min(
+            waiting_with_fields,
+            key=lambda item: (item[1], str(item[0].request_id)),
+        )
+        victim, victim_deadline, _ = max(
+            running_with_fields,
+            key=lambda item: (item[1], str(item[0].request_id)),
+        )
+        if aggressor_deadline >= victim_deadline:
+            return set()
+
+        if monotonic_now is None:
+            monotonic_now = timestamp
+        slack_ms = (aggressor_deadline - monotonic_now) * 1000.0
+        trigger_budget_ms = aggressor_predicted_ms + float(
+            getattr(self, "_slo_active_guard_ms", 0.0)
+        )
+        witness_key = (
+            _logical_request_id(str(aggressor.request_id)),
+            _logical_request_id(str(victim.request_id)),
+            stage_id,
+        )
+        if witness_key not in self._slo_priority_witness_seen:
+            self._slo_priority_witness_seen.add(witness_key)
+            emit_stage_event(
+                "strict_priority_blocking_witness",
+                stage_id=stage_id,
+                aggressor_request_id=str(aggressor.request_id),
+                victim_request_id=str(victim.request_id),
+                aggressor_deadline_monotonic_s=aggressor_deadline,
+                victim_deadline_monotonic_s=victim_deadline,
+                aggressor_slack_ms=slack_ms,
+                aggressor_predicted_stage_ms=aggressor_predicted_ms,
+                trigger_budget_ms=trigger_budget_ms,
+                active_preemption_enabled=bool(
+                    getattr(self, "_slo_active_preemption_enabled", False)
+                ),
+                blocking_reason="sequence_slots_full",
+            )
+
+        if not getattr(self, "_slo_active_preemption_enabled", False):
+            return set()
+        if slack_ms > trigger_budget_ms:
+            return set()
+
+        physical_victim_id = str(victim.request_id)
+        self.running.remove(victim)
+        victim._omni_next_preemption_cause = "slo_active_switch"
+        progress = self._get_confirmed_num_computed_tokens(victim)
+        self._preempt_request(victim, timestamp)
+        emit_stage_event(
+            "slo_active_preemption",
+            stage_id=stage_id,
+            aggressor_request_id=str(aggressor.request_id),
+            victim_request_id=physical_victim_id,
+            victim_num_computed_tokens=progress,
+            aggressor_deadline_monotonic_s=aggressor_deadline,
+            victim_deadline_monotonic_s=victim_deadline,
+            aggressor_slack_ms=slack_ms,
+            aggressor_predicted_stage_ms=aggressor_predicted_ms,
+            trigger_budget_ms=trigger_budget_ms,
+            preemption_cause="slo_active_switch",
+        )
+        return {physical_victim_id}
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -391,6 +563,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request._omni_first_real_chunk_handled = True
 
         self._baseline_prepare_schedule()
+        slo_active_preempted_req_ids = self._maybe_preempt_for_slo(
+            schedule_start,
+            monotonic_now=monotonic(),
+        )
         controlled_preempted_req_ids = self._inject_controlled_preemptions(
             schedule_start
         )
@@ -410,7 +586,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 scheduler_output = super().schedule()
             scheduler_output.preempted_req_ids = set(
                 scheduler_output.preempted_req_ids
-            ) | controlled_preempted_req_ids
+            ) | controlled_preempted_req_ids | slo_active_preempted_req_ids
             scheduler_output.stage_preemption_causes = {
                 request_id: self._omni_preemption_causes_pending[request_id]
                 for request_id in scheduler_output.preempted_req_ids

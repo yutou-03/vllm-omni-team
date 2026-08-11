@@ -7,6 +7,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm_omni.core.sched.omni_ar_scheduler import (
     OmniARAsyncScheduler,
     _load_controlled_preemption_rules,
+    _load_slo_active_preemption_config,
 )
 from vllm_omni.core.sched.omni_scheduler_mixin import (
     extract_request_recovery_trace_fields,
@@ -49,6 +50,12 @@ class _Waiting:
 
     def prepend_request(self, request):
         self.requests.insert(0, request)
+
+    def add_request(self, request):
+        self.requests.append(request)
+
+    def __iter__(self):
+        return iter(self.requests)
 
     def remove_requests(self, requests):
         for request in requests:
@@ -276,6 +283,102 @@ def test_controlled_preemption_file_contract(tmp_path, monkeypatch):
             "target_num_computed_tokens": 42,
             "occurrence_index": 0,
         }
+    ]
+
+
+def test_slo_active_preemption_config_contract(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_SLO_ACTIVE_PREEMPTION", "true")
+    monkeypatch.setenv("VLLM_OMNI_SLO_ACTIVE_STAGES", "0,1")
+    monkeypatch.setenv("VLLM_OMNI_SLO_ACTIVE_GUARD_MS", "25.5")
+    monkeypatch.setenv("VLLM_OMNI_SLO_PRIORITY_TRACE", "1")
+
+    assert _load_slo_active_preemption_config() == (True, {0, 1}, 25.5, True)
+
+
+def test_slo_active_hook_is_noop_by_default_without_metadata():
+    scheduler = object.__new__(OmniARAsyncScheduler)
+    scheduler._omni_stage_id_for_trace = lambda: 1
+    scheduler._slo_active_preemption_enabled = False
+    scheduler._slo_priority_trace_enabled = False
+    scheduler._slo_active_preemption_stages = {1}
+    scheduler.running = [SimpleNamespace(request_id="ordinary-running")]
+    scheduler.waiting = _Waiting()
+    scheduler.waiting.add_request(SimpleNamespace(request_id="ordinary-waiting"))
+    scheduler.max_num_running_reqs = 1
+
+    assert scheduler._maybe_preempt_for_slo(1.0) == set()
+
+
+def test_slo_active_switch_replaces_later_deadline_running_request(monkeypatch):
+    scheduler = object.__new__(OmniARAsyncScheduler)
+    scheduler.waiting = _Waiting()
+    scheduler.chunk_transfer_adapter = None
+    scheduler._omni_stage_id_for_trace = lambda: 1
+    scheduler.max_num_running_reqs = 1
+    scheduler._slo_active_preemption_enabled = True
+    scheduler._slo_active_preemption_stages = {1}
+    scheduler._slo_active_guard_ms = 0.0
+    scheduler._slo_priority_trace_enabled = True
+    scheduler._slo_priority_witness_seen = set()
+    scheduler._omni_preemption_causes_pending = {}
+    scheduler._omni_preemption_progress_pending = {}
+    scheduler._omni_preemption_rule_ids_pending = {}
+
+    def _request(request_id, *, deadline, predicted_ms, progress):
+        return SimpleNamespace(
+            request_id=request_id,
+            _output_token_ids=[],
+            num_computed_tokens=progress,
+            num_output_placeholders=0,
+            output_connector_req_id=request_id,
+            connector_req_id=request_id,
+            external_req_id=request_id,
+            additional_information=serialize_additional_information(
+                {
+                    "meta": {
+                        "sched_source_request_id": request_id,
+                        "sched_ingress_order": 0,
+                        "sched_deadline_monotonic_s": deadline + 1.0,
+                        "sched_stage_deadline_monotonic_s": [
+                            deadline - 1.0,
+                            deadline,
+                            deadline + 1.0,
+                        ],
+                        "sched_predicted_stage_ms": [100.0, predicted_ms, 100.0],
+                    }
+                }
+            ),
+        )
+
+    victim = _request("low", deadline=20.0, predicted_ms=500.0, progress=73)
+    aggressor = _request("high", deadline=10.0, predicted_ms=1200.0, progress=0)
+    scheduler.running = [victim]
+    scheduler.waiting.add_request(aggressor)
+
+    def _base_preempt(self, request, _timestamp):
+        request.num_computed_tokens = 0
+        self.waiting.prepend_request(request)
+
+    events = []
+    monkeypatch.setattr(Scheduler, "_preempt_request", _base_preempt)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_ar_scheduler.emit_stage_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+
+    preempted = scheduler._maybe_preempt_for_slo(9.0)
+
+    assert preempted == {"low"}
+    assert scheduler.running == []
+    assert list(scheduler.waiting) == [aggressor]
+    assert scheduler._omni_preemption_causes_pending == {
+        "low": "slo_active_switch"
+    }
+    assert scheduler._omni_preemption_progress_pending == {"low": 73}
+    assert [event for event, _ in events] == [
+        "strict_priority_blocking_witness",
+        "full_pipeline_restart_requested",
+        "slo_active_preemption",
     ]
 
 
