@@ -115,6 +115,18 @@ from vllm_omni.scheduling.metadata import (
 logger = init_logger(__name__)
 
 
+def _has_completion_output(omni_output: OmniRequestOutput) -> bool:
+    """Whether a multistage wrapper carries a concrete model output.
+
+    Full-pipeline restart can retire an old physical execution after its
+    scheduler has already emitted an empty, finished RequestOutput. That
+    lifecycle marker must not be decoded as an audio/image payload; the new
+    physical execution will provide the replacement output.
+    """
+    request_output = omni_output.request_output
+    return request_output is not None and bool(request_output.outputs)
+
+
 def _extract_client_scheduling_metadata(request: Any) -> Any | None:
     """Read the extra scheduling object from either supported client shape."""
 
@@ -975,6 +987,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
 
+                if final_output_type in {"audio", "image"} and not _has_completion_output(omni_res):
+                    emit_stage_event(
+                        "empty_retired_multimodal_output_skipped",
+                        stage_id=omni_res.stage_id,
+                        request_id=getattr(res, "request_id", request_id),
+                        logical_request_id=request_id,
+                        final_output_type=final_output_type,
+                        finished=bool(getattr(res, "finished", False)),
+                    )
+                    continue
+
                 if omni_res.metrics:
                     last_metrics = omni_res.metrics
 
@@ -1725,6 +1748,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         for omni_outputs in final_outputs:
             choices_data = []
             if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
+                continue
+
+            if omni_outputs.final_output_type in {"audio", "image"} and not _has_completion_output(omni_outputs):
+                logger.debug(
+                    "Skipping empty retired %s output for request %s",
+                    omni_outputs.final_output_type,
+                    request_id,
+                )
                 continue
 
             # Filter outputs based on requested modalites

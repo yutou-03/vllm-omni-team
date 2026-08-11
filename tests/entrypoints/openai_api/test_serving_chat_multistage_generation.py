@@ -91,3 +91,15 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+def test_retired_empty_multimodal_output_has_no_payload():
+    from vllm_omni.entrypoints.openai.serving_chat import _has_completion_output
+
+    empty = SimpleNamespace(request_output=SimpleNamespace(outputs=[], finished=True))
+    concrete = SimpleNamespace(
+        request_output=SimpleNamespace(outputs=[SimpleNamespace()], finished=True)
+    )
+
+    assert not _has_completion_output(empty)
+    assert _has_completion_output(concrete)
