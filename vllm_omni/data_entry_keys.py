@@ -99,6 +99,12 @@ class OmniPayloadMeta(TypedDict, total=False):
     sched_request_path: str
     sched_predicted_stage_ms: list[float | None]
     sched_predicted_stage_work_units: list[float | None]
+    omni_logical_request_id: str
+    omni_pipeline_attempt_id: int
+    omni_recovery_target_stage_id: int
+    omni_recovery_target_num_computed_tokens: int
+    omni_recovery_preemption_cause: str
+    omni_controlled_rule_id: str
 
 
 class OmniPayload(TypedDict, total=False):

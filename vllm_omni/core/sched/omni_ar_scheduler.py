@@ -665,6 +665,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 ):
                     stopped = True
 
+                if not discard_async_output:
+                    self._trace_recovery_progress_after_output(
+                        request,
+                        num_tokens_scheduled=num_tokens_scheduled,
+                    )
+
                 if new_token_ids and self.structured_output_manager.should_advance(request):
                     struct_output_request = request.structured_output_request
                     assert struct_output_request is not None
@@ -993,6 +999,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
         self._baseline_forget_request_ids(request.request_id)
+        self._omni_recovery_trace_by_request.pop(request.request_id, None)
 
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)

@@ -282,6 +282,17 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        traced_request_ids = [str(req_id) for req_id in req_ids[:num_reqs]]
+        traced_scheduled_tokens = {
+            traced_request_ids[index]: int(num_scheduled_tokens_np[index])
+            for index in range(num_reqs)
+        }
+        traced_computed_tokens_before = {
+            traced_request_ids[index]: int(
+                self.input_batch.num_computed_tokens_cpu[index]
+            )
+            for index in range(num_reqs)
+        }
         first_forward_seen = getattr(self, "_omni_stage_queue_first_forward_seen", set())
         for req_id in req_ids[:num_reqs]:
             if req_id in first_forward_seen:
@@ -314,6 +325,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 batch_num_tokens=int(num_tokens_unpadded),
                 batch_num_seqs=int(num_reqs),
                 num_tokens_padded=int(num_tokens_padded),
+                request_ids=traced_request_ids,
+                request_num_scheduled_tokens=traced_scheduled_tokens,
+                request_num_computed_tokens_before=(
+                    traced_computed_tokens_before
+                ),
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(

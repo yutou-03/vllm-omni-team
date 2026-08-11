@@ -63,6 +63,37 @@ def extract_request_scheduling_trace_fields(request: Any) -> dict[str, Any]:
     return extract_scheduling_metadata(decoded) or {}
 
 
+def extract_request_recovery_trace_fields(request: Any) -> dict[str, Any]:
+    """Decode full-pipeline recovery identifiers from request metadata."""
+
+    decoded = deserialize_additional_information(
+        getattr(request, "additional_information", None)
+    )
+    meta = decoded.get("meta")
+    if not isinstance(meta, dict):
+        return {}
+    attempt = meta.get("omni_pipeline_attempt_id")
+    if attempt is None or int(attempt) <= 0:
+        return {}
+    fields = {
+        "logical_request_id": str(meta["omni_logical_request_id"]),
+        "pipeline_attempt_id": int(attempt),
+        "recovery_target_stage_id": int(
+            meta["omni_recovery_target_stage_id"]
+        ),
+        "recovery_target_num_computed_tokens": int(
+            meta["omni_recovery_target_num_computed_tokens"]
+        ),
+        "preemption_cause": str(
+            meta["omni_recovery_preemption_cause"]
+        ),
+    }
+    controlled_rule_id = meta.get("omni_controlled_rule_id")
+    if controlled_rule_id is not None:
+        fields["controlled_rule_id"] = str(controlled_rule_id)
+    return fields
+
+
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
@@ -78,6 +109,11 @@ class OmniSchedulerMixin:
         self._baseline_policy_order_snapshot: dict[str, Any] | None = None
         self._baseline_waiting_queue_choices: list[dict[str, Any]] = []
         self._baseline_preempted_pending_resume: set[str] = set()
+        self._omni_recovery_trace_by_request: dict[str, dict[str, Any]] = {}
+        self._omni_reentered_recovery_requests: set[str] = set()
+        self._omni_first_recovery_progress_seen: set[str] = set()
+        self._omni_recovery_catchup_seen: set[str] = set()
+        self._omni_request_progress_before_schedule: dict[str, int] = {}
 
         if not self._baseline_policy_applies():
             return
@@ -174,6 +210,10 @@ class OmniSchedulerMixin:
         """Refresh data-ready times and order runnable requests in place."""
 
         self._baseline_waiting_queue_choices = []
+        self._omni_request_progress_before_schedule = {
+            str(request_id): int(request.num_computed_tokens)
+            for request_id, request in getattr(self, "requests", {}).items()
+        }
         trace_mechanism = conformance_trace_enabled()
         before_orders: dict[str, list[str]] = {}
         if trace_mechanism:
@@ -527,6 +567,11 @@ class OmniSchedulerMixin:
         stage_id = self._omni_stage_id_for_trace()
         request_id = getattr(request, "request_id", None)
         scheduling_fields = extract_request_scheduling_trace_fields(request)
+        recovery_fields = extract_request_recovery_trace_fields(request)
+        if recovery_fields and request_id is not None:
+            self._omni_recovery_trace_by_request[str(request_id)] = (
+                recovery_fields
+            )
         self._baseline_validate_and_track_admission(request)
         emit_stage_event(
             "server_receive",
@@ -535,6 +580,7 @@ class OmniSchedulerMixin:
             queue_len=len(self.waiting),
             active_reqs=len(self.running),
             **scheduling_fields,
+            **recovery_fields,
         )
         emit_stage_event(
             "stage_enqueue",
@@ -543,6 +589,7 @@ class OmniSchedulerMixin:
             queue_len=len(self.waiting),
             active_reqs=len(self.running),
             **scheduling_fields,
+            **recovery_fields,
         )
         if str(stage_id) == "2" and request_id is not None:
             req_id = str(request_id)
@@ -584,6 +631,56 @@ class OmniSchedulerMixin:
             return super()._free_request(request, *args, **kwargs)
         finally:
             self._baseline_forget_request_ids(request.request_id)
+            self._omni_recovery_trace_by_request.pop(
+                str(request.request_id), None
+            )
+
+    def _trace_recovery_progress_after_output(
+        self,
+        request: Request,
+        *,
+        num_tokens_scheduled: int,
+    ) -> None:
+        """Record progress only after one replacement model step returns."""
+
+        request_id = str(request.request_id)
+        recovery_fields = self._omni_recovery_trace_by_request.get(request_id)
+        if not recovery_fields:
+            return
+        stage_id = int(self._omni_stage_id_for_trace())
+        confirmed_progress = int(request.num_computed_tokens)
+        if request_id not in self._omni_first_recovery_progress_seen:
+            self._omni_first_recovery_progress_seen.add(request_id)
+            emit_stage_event(
+                "first_recomputed_progress",
+                stage_id=stage_id,
+                request_id=request_id,
+                confirmed_num_computed_tokens=confirmed_progress,
+                num_tokens_scheduled=int(num_tokens_scheduled),
+                **recovery_fields,
+            )
+
+        target_stage_id = int(recovery_fields["recovery_target_stage_id"])
+        target_progress = int(
+            recovery_fields["recovery_target_num_computed_tokens"]
+        )
+        if (
+            stage_id == target_stage_id
+            and confirmed_progress >= target_progress
+            and request_id not in self._omni_recovery_catchup_seen
+        ):
+            self._omni_recovery_catchup_seen.add(request_id)
+            emit_stage_event(
+                "full_pipeline_progress_caught_up",
+                stage_id=stage_id,
+                request_id=request_id,
+                confirmed_num_computed_tokens=confirmed_progress,
+                target_num_computed_tokens=target_progress,
+                overshoot_num_computed_tokens=(
+                    confirmed_progress - target_progress
+                ),
+                **recovery_fields,
+            )
 
     def _trace_scheduler_output(
         self,
@@ -796,6 +893,26 @@ class OmniSchedulerMixin:
         )
         for rid, num_tokens in num_scheduled_tokens.items():
             rid_str = str(rid)
+            computed_before = self._omni_request_progress_before_schedule.get(
+                rid_str
+            )
+            recovery_fields = self._omni_recovery_trace_by_request.get(
+                rid_str, {}
+            )
+            if (
+                recovery_fields
+                and rid_str not in self._omni_reentered_recovery_requests
+            ):
+                self._omni_reentered_recovery_requests.add(rid_str)
+                emit_stage_event(
+                    "stage_reentered",
+                    stage_id=stage_id,
+                    request_id=rid_str,
+                    iteration_id=iteration_id,
+                    num_computed_tokens_before=computed_before,
+                    num_scheduled_tokens=int(num_tokens),
+                    **recovery_fields,
+                )
             emit_stage_event(
                 "stage_schedule",
                 stage_id=stage_id,
@@ -808,7 +925,14 @@ class OmniSchedulerMixin:
                 batch_num_tokens=total_num_scheduled_tokens,
                 batch_num_seqs=len(num_scheduled_tokens),
                 num_scheduled_tokens=int(num_tokens),
+                num_computed_tokens_before=computed_before,
+                num_computed_tokens_after_schedule=(
+                    computed_before + int(num_tokens)
+                    if computed_before is not None
+                    else None
+                ),
                 schedule_duration_ms=schedule_duration_ms,
+                **recovery_fields,
             )
             if str(stage_id) == "2":
                 first_schedule_seen = getattr(self, "_omni_nvtx_s2_first_schedule_seen", set())

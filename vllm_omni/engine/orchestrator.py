@@ -133,6 +133,75 @@ def set_execution_global_request_id(
     return request_input
 
 
+def merge_pipeline_attempt_metadata_into_request_input(
+    request_input: Any,
+    *,
+    logical_request_id: str,
+    pipeline_attempt_id: int,
+    recovery_target_stage_id: int,
+    recovery_target_num_computed_tokens: int,
+    recovery_preemption_cause: str,
+    controlled_rule_id: str | None,
+) -> Any:
+    """Attach immutable recovery trace fields to one physical execution."""
+
+    recovery_meta: dict[str, Any] = {
+        "omni_logical_request_id": logical_request_id,
+        "omni_pipeline_attempt_id": int(pipeline_attempt_id),
+        "omni_recovery_target_stage_id": int(recovery_target_stage_id),
+        "omni_recovery_target_num_computed_tokens": int(
+            recovery_target_num_computed_tokens
+        ),
+        "omni_recovery_preemption_cause": recovery_preemption_cause,
+    }
+    if controlled_rule_id is not None:
+        recovery_meta["omni_controlled_rule_id"] = controlled_rule_id
+
+    if isinstance(request_input, list):
+        return [
+            merge_pipeline_attempt_metadata_into_request_input(
+                item,
+                logical_request_id=logical_request_id,
+                pipeline_attempt_id=pipeline_attempt_id,
+                recovery_target_stage_id=recovery_target_stage_id,
+                recovery_target_num_computed_tokens=(
+                    recovery_target_num_computed_tokens
+                ),
+                recovery_preemption_cause=recovery_preemption_cause,
+                controlled_rule_id=controlled_rule_id,
+            )
+            for item in request_input
+        ]
+
+    if isinstance(request_input, dict):
+        merged_input = dict(request_input)
+        additional_information = dict(
+            deserialize_additional_information(
+                merged_input.get("additional_information")
+            )
+        )
+        meta = dict(additional_information.get("meta") or {})
+        meta.update(recovery_meta)
+        additional_information["meta"] = meta
+        merged_input["additional_information"] = additional_information
+        return merged_input
+
+    if not hasattr(request_input, "additional_information"):
+        return request_input
+    additional_information = dict(
+        deserialize_additional_information(
+            request_input.additional_information
+        )
+    )
+    meta = dict(additional_information.get("meta") or {})
+    meta.update(recovery_meta)
+    additional_information["meta"] = meta
+    request_input.additional_information = serialize_additional_information(
+        additional_information
+    )
+    return request_input
+
+
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -1082,6 +1151,15 @@ class Orchestrator:
 
             stage0_request = copy.deepcopy(req_state.stage0_request_template)
             set_execution_global_request_id(stage0_request, new_execution_id)
+            stage0_request = merge_pipeline_attempt_metadata_into_request_input(
+                stage0_request,
+                logical_request_id=request_id,
+                pipeline_attempt_id=req_state.execution_attempt,
+                recovery_target_stage_id=stage_id,
+                recovery_target_num_computed_tokens=discarded_progress,
+                recovery_preemption_cause=preemption_cause,
+                controlled_rule_id=controlled_rule_id,
+            )
             stage0_request.request_id = new_execution_id
             stage0_request.external_req_id = request_id
             stage0_request.connector_req_id = new_execution_id
@@ -1362,6 +1440,24 @@ class Orchestrator:
                     )
 
         if finished and stage_id == req_state.final_stage_id:
+            if req_state.execution_attempt > 0:
+                emit_stage_event(
+                    "full_pipeline_recovery_completed",
+                    stage_id=stage_id,
+                    request_id=req_state.request_id,
+                    execution_id=req_state.current_execution_id,
+                    pipeline_attempt_id=req_state.execution_attempt,
+                    recovery_target_stage_id=(
+                        req_state.recovery_target_stage_id
+                    ),
+                    recovery_target_num_computed_tokens=(
+                        req_state.recovery_target_progress
+                    ),
+                    preemption_cause=req_state.recovery_preemption_cause,
+                    controlled_rule_id=(
+                        req_state.recovery_controlled_rule_id
+                    ),
+                )
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
@@ -1787,6 +1883,26 @@ class Orchestrator:
                     set_execution_global_request_id(
                         base_input,
                         connector_req_id or stage_request_id,
+                    )
+                    base_input = merge_pipeline_attempt_metadata_into_request_input(
+                        base_input,
+                        logical_request_id=request_id,
+                        pipeline_attempt_id=req_state.execution_attempt,
+                        recovery_target_stage_id=(
+                            req_state.recovery_target_stage_id
+                            if req_state.recovery_target_stage_id is not None
+                            else next_stage_id
+                        ),
+                        recovery_target_num_computed_tokens=(
+                            req_state.recovery_target_progress or 0
+                        ),
+                        recovery_preemption_cause=(
+                            req_state.recovery_preemption_cause
+                            or "allocation_failure"
+                        ),
+                        controlled_rule_id=(
+                            req_state.recovery_controlled_rule_id
+                        ),
                     )
 
                 # A recovery consumer must wait for replayed connector data.

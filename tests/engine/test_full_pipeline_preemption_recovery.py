@@ -8,6 +8,9 @@ from vllm_omni.core.sched.omni_ar_scheduler import (
     OmniARAsyncScheduler,
     _load_controlled_preemption_rules,
 )
+from vllm_omni.core.sched.omni_scheduler_mixin import (
+    extract_request_recovery_trace_fields,
+)
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
@@ -229,7 +232,15 @@ def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
         lambda *args, **kwargs: None,
     )
 
-    asyncio.run(orchestrator._handle_stage_preemptions(1, ["logical"]))
+    asyncio.run(
+        orchestrator._handle_stage_preemptions(
+            1,
+            ["logical"],
+            preemption_causes={"logical": "controlled_restart"},
+            preemption_progress={"logical": 37},
+            preemption_rule_ids={"logical": "s1-half"},
+        )
+    )
 
     execution_id = "logical__execution1"
     assert all(pool.aborted == ["logical"] for pool in orchestrator.stage_pools)
@@ -252,6 +263,14 @@ def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
     assert deserialize_additional_information(
         restarted_request.additional_information
     )["global_request_id"] == [execution_id]
+    assert extract_request_recovery_trace_fields(restarted_request) == {
+        "logical_request_id": "logical",
+        "pipeline_attempt_id": 1,
+        "recovery_target_stage_id": 1,
+        "recovery_target_num_computed_tokens": 37,
+        "preemption_cause": "controlled_restart",
+        "controlled_rule_id": "s1-half",
+    }
     assert restarted_request.prompt_token_ids == [1, 2]
     assert prompt_text == "fixed prompt"
     assert restarted_request is not template
@@ -284,6 +303,49 @@ def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
     assert prewarm_calls[1][3]["start_stage_id"] == 2
     assert prewarm_calls[1][3]["end_stage_id"] == 2
     assert state.pending_restart_stages == set()
+
+
+def test_recovery_progress_events_are_confirmed_once(monkeypatch):
+    scheduler = object.__new__(OmniARAsyncScheduler)
+    scheduler._omni_stage_id_for_trace = lambda: 1
+    scheduler._omni_recovery_trace_by_request = {
+        "logical__execution1": {
+            "logical_request_id": "logical",
+            "pipeline_attempt_id": 1,
+            "recovery_target_stage_id": 1,
+            "recovery_target_num_computed_tokens": 37,
+            "preemption_cause": "controlled_restart",
+            "controlled_rule_id": "s1-half",
+        }
+    }
+    scheduler._omni_first_recovery_progress_seen = set()
+    scheduler._omni_recovery_catchup_seen = set()
+    request = SimpleNamespace(
+        request_id="logical__execution1",
+        num_computed_tokens=40,
+    )
+    events = []
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_stage_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+
+    scheduler._trace_recovery_progress_after_output(
+        request,
+        num_tokens_scheduled=20,
+    )
+    scheduler._trace_recovery_progress_after_output(
+        request,
+        num_tokens_scheduled=1,
+    )
+
+    assert [event for event, _ in events] == [
+        "first_recomputed_progress",
+        "full_pipeline_progress_caught_up",
+    ]
+    assert events[1][1]["target_num_computed_tokens"] == 37
+    assert events[1][1]["confirmed_num_computed_tokens"] == 40
+    assert events[1][1]["overshoot_num_computed_tokens"] == 3
 
 
 def test_delayed_preemption_from_retired_execution_is_ignored(monkeypatch):

@@ -518,6 +518,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
+            self._trace_recovery_progress_after_output(
+                request,
+                num_tokens_scheduled=num_tokens_scheduled,
+            )
+
             # Diffusion request: completes in one step; mark finished and free resources
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
