@@ -1347,6 +1347,7 @@ class Orchestrator:
 
         if self.stage_pools[stage_id].final_output:
             outputs_to_drop = req_state.replay_outputs_to_drop.get(stage_id, 0)
+            terminal_only_output = None
             if outputs_to_drop > 0:
                 req_state.replay_outputs_to_drop[stage_id] = outputs_to_drop - 1
                 emit_stage_event(
@@ -1355,6 +1356,35 @@ class Orchestrator:
                     request_id=req_id,
                     remaining=req_state.replay_outputs_to_drop[stage_id],
                 )
+                if finished:
+                    # The replay may finish before reproducing every output that
+                    # the retired execution already sent.  Suppressing its final
+                    # output in that case also suppresses the frontend completion
+                    # signal, leaving the HTTP stream open after backend cleanup.
+                    # Forward a content-free output so the frontend observes only
+                    # termination, without replaying an already-emitted chunk.
+                    terminal_only_output = OmniRequestOutput(
+                        request_id=req_id,
+                        finished=True,
+                        stage_id=getattr(output, "stage_id", stage_id),
+                        final_output_type=getattr(
+                            output,
+                            "final_output_type",
+                            getattr(
+                                self.stage_pools[stage_id],
+                                "final_output_type",
+                                "text",
+                            ),
+                        ),
+                    )
+                    emit_stage_event(
+                        "stage_replay_terminal_forwarded",
+                        stage_id=stage_id,
+                        request_id=req_id,
+                        suppressed_outputs_remaining=(
+                            req_state.replay_outputs_to_drop[stage_id]
+                        ),
+                    )
             else:
                 req_state.final_outputs_emitted[stage_id] = (
                     req_state.final_outputs_emitted.get(stage_id, 0) + 1
@@ -1364,12 +1394,14 @@ class Orchestrator:
                 "request_id": req_id,
                 "stage_id": stage_id,
                 "replica_id": replica_id,
-                "engine_outputs": output,
+                "engine_outputs": terminal_only_output or output,
                 "metrics": stage_metrics,
                 "finished": finished and stage_id == req_state.final_stage_id,
                 "stage_submit_ts": submit_ts,
             }
-            if outputs_to_drop > 0:
+            if terminal_only_output is not None:
+                await self.output_async_queue.put(queue_payload)
+            elif outputs_to_drop > 0:
                 pass
             elif stage_id == 2 and req_id not in self._omni_nvtx_s2_route_seen:
                 self._omni_nvtx_s2_route_seen.add(req_id)

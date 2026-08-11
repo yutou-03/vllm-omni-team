@@ -16,6 +16,7 @@ from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
 )
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -84,6 +85,65 @@ def _orchestrator_with_request():
     orchestrator.request_states = {"logical": state}
     orchestrator._physical_to_logical_request_ids = {"logical": "logical"}
     return orchestrator, state, template
+
+
+def test_suppressed_replay_terminal_still_reaches_frontend(monkeypatch):
+    orchestrator, state, _ = _orchestrator_with_request()
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._cfg_tracker = SimpleNamespace(
+        is_companion=lambda _request_id: False,
+        cleanup_parent=lambda _request_id: [],
+    )
+    orchestrator._pd_pair = None
+    orchestrator._omni_nvtx_s2_route_seen = set()
+    state.execution_attempt = 1
+    state.current_execution_id = "logical__execution1"
+    state.replay_outputs_to_drop = {2: 5}
+    cleanup_calls = []
+    events = []
+
+    async def _cleanup(request_ids):
+        cleanup_calls.append(request_ids)
+
+    monkeypatch.setattr(orchestrator, "_cleanup_request_ids", _cleanup)
+    monkeypatch.setattr(
+        "vllm_omni.engine.orchestrator.emit_stage_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+
+    duplicate_terminal = OmniRequestOutput(
+        request_id="logical",
+        finished=True,
+        stage_id=2,
+        final_output_type="audio",
+        request_output=SimpleNamespace(
+            outputs=[SimpleNamespace(token_ids=[1])],
+            multimodal_output={"audio": b"duplicate"},
+        ),
+    )
+    asyncio.run(
+        orchestrator._route_output(
+            2,
+            0,
+            duplicate_terminal,
+            state,
+            stage_metrics=None,
+        )
+    )
+
+    message = orchestrator.output_async_queue.get_nowait()
+    assert message["finished"] is True
+    assert message["engine_outputs"].finished is True
+    assert message["engine_outputs"].request_id == "logical"
+    assert message["engine_outputs"].outputs == []
+    assert message["engine_outputs"].multimodal_output == {}
+    assert state.replay_outputs_to_drop == {2: 4}
+    assert cleanup_calls == [["logical"]]
+    assert [event for event, _ in events] == [
+        "stage_replay_output_suppressed",
+        "stage_replay_terminal_forwarded",
+        "full_pipeline_recovery_completed",
+    ]
 
 
 def test_scheduler_does_not_requeue_retired_physical_request(monkeypatch):
