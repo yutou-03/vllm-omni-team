@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import (
+    OmniARAsyncScheduler,
+    _load_controlled_preemption_rules,
+)
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
@@ -85,6 +88,9 @@ def test_scheduler_does_not_requeue_retired_physical_request(monkeypatch):
     scheduler.waiting = _Waiting()
     scheduler.chunk_transfer_adapter = None
     scheduler._omni_stage_id_for_trace = lambda: 1
+    scheduler._omni_preemption_causes_pending = {}
+    scheduler._omni_preemption_progress_pending = {}
+    scheduler._omni_preemption_rule_ids_pending = {}
     request = SimpleNamespace(
         request_id="logical",
         _output_token_ids=[4, 5],
@@ -119,8 +125,94 @@ def test_scheduler_does_not_requeue_retired_physical_request(monkeypatch):
                 "discarded_output_tokens": 2,
                 "discarded_computed_tokens": 37,
                 "connector_req_id": "logical",
+                "preemption_cause": "allocation_failure",
+                "controlled_rule_id": None,
             },
         )
+    ]
+
+
+def test_controlled_preemption_uses_same_recovery_entrypoint(monkeypatch):
+    scheduler = object.__new__(OmniARAsyncScheduler)
+    scheduler.waiting = _Waiting()
+    scheduler.chunk_transfer_adapter = None
+    scheduler._omni_stage_id_for_trace = lambda: 1
+    scheduler._controlled_preemption_rules = [
+        {
+            "rule_id": "s1-half",
+            "victim_request_id": "logical",
+            "target_stage": 1,
+            "target_num_computed_tokens": 30,
+            "occurrence_index": 1,
+        }
+    ]
+    scheduler._controlled_preemption_fired_rule_ids = set()
+    scheduler._omni_preemption_causes_pending = {}
+    scheduler._omni_preemption_progress_pending = {}
+    scheduler._omni_preemption_rule_ids_pending = {}
+    request = SimpleNamespace(
+        request_id="logical__execution1",
+        _output_token_ids=[4, 5],
+        num_computed_tokens=37,
+        num_output_placeholders=0,
+        output_connector_req_id="logical__execution1",
+        connector_req_id="logical__execution1",
+        external_req_id="logical",
+        _omni_execution_attempt=0,
+    )
+    scheduler.running = [request]
+
+    def _base_preempt(self, victim, _timestamp):
+        victim.num_computed_tokens = 0
+        self.waiting.prepend_request(victim)
+
+    events = []
+    monkeypatch.setattr(Scheduler, "_preempt_request", _base_preempt)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_ar_scheduler.emit_stage_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+
+    injected = scheduler._inject_controlled_preemptions(1.0)
+
+    assert injected == {"logical__execution1"}
+    assert scheduler.running == []
+    assert scheduler.waiting.requests == []
+    assert scheduler._controlled_preemption_fired_rule_ids == {"s1-half"}
+    assert scheduler._omni_preemption_causes_pending == {
+        "logical__execution1": "controlled_restart"
+    }
+    assert scheduler._omni_preemption_progress_pending == {
+        "logical__execution1": 37
+    }
+    assert scheduler._omni_preemption_rule_ids_pending == {
+        "logical__execution1": "s1-half"
+    }
+    assert [event for event, _ in events] == [
+        "full_pipeline_restart_requested",
+        "controlled_preemption_injected",
+    ]
+
+
+def test_controlled_preemption_file_contract(tmp_path, monkeypatch):
+    path = tmp_path / "events.json"
+    path.write_text(
+        '{"schema_version":1,"events":[{'
+        '"rule_id":"r1","victim_request_id":"logical",'
+        '"target_stage":1,"target_num_computed_tokens":42,'
+        '"occurrence_index":0}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VLLM_OMNI_CONTROLLED_PREEMPTION_FILE", str(path))
+
+    assert _load_controlled_preemption_rules() == [
+        {
+            "rule_id": "r1",
+            "victim_request_id": "logical",
+            "target_stage": 1,
+            "target_num_computed_tokens": 42,
+            "occurrence_index": 0,
+        }
     ]
 
 

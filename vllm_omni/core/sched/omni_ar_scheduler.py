@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -30,6 +32,68 @@ from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 
 logger = init_logger(__name__)
+
+_CONTROLLED_PREEMPTION_FILE_ENV = "VLLM_OMNI_CONTROLLED_PREEMPTION_FILE"
+
+
+def _logical_request_id(request_id: str) -> str:
+    """Return the frontend request id shared by all physical executions."""
+    return request_id.split("__execution", 1)[0]
+
+
+def _pipeline_occurrence(request_id: str) -> int:
+    """Return 0 for the initial pipeline and N for ``__executionN``."""
+    marker = "__execution"
+    if marker not in request_id:
+        return 0
+    try:
+        return int(request_id.rsplit(marker, 1)[1])
+    except ValueError:
+        return -1
+
+
+def _load_controlled_preemption_rules() -> list[dict[str, Any]]:
+    path = os.environ.get(_CONTROLLED_PREEMPTION_FILE_ENV)
+    if not path:
+        return []
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    if document.get("schema_version") != 1:
+        raise ValueError("controlled preemption file must use schema_version=1")
+    events = document.get("events")
+    if not isinstance(events, list):
+        raise ValueError("controlled preemption file must contain an events list")
+
+    normalized = []
+    required = {
+        "rule_id",
+        "victim_request_id",
+        "target_stage",
+        "target_num_computed_tokens",
+        "occurrence_index",
+    }
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or not required.issubset(event):
+            raise ValueError(f"controlled preemption event {index} is incomplete")
+        rule = dict(event)
+        rule["rule_id"] = str(rule["rule_id"])
+        rule["victim_request_id"] = str(rule["victim_request_id"])
+        rule["target_stage"] = int(rule["target_stage"])
+        rule["target_num_computed_tokens"] = int(
+            rule["target_num_computed_tokens"]
+        )
+        rule["occurrence_index"] = int(rule["occurrence_index"])
+        if rule["target_stage"] < 0:
+            raise ValueError(f"controlled preemption event {index} has negative stage")
+        if rule["target_num_computed_tokens"] < 0:
+            raise ValueError(f"controlled preemption event {index} has negative progress")
+        if rule["occurrence_index"] < 0:
+            raise ValueError(f"controlled preemption event {index} has negative occurrence")
+        normalized.append(rule)
+    rule_ids = [rule["rule_id"] for rule in normalized]
+    if len(rule_ids) != len(set(rule_ids)):
+        raise ValueError("controlled preemption rule_id values must be unique")
+    return normalized
 
 
 @dataclass
@@ -81,6 +145,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
         self._initialize_baseline_scheduling()
+        self._controlled_preemption_rules = [
+            rule
+            for rule in _load_controlled_preemption_rules()
+            if rule["target_stage"] == int(self._omni_stage_id_for_trace())
+        ]
+        self._controlled_preemption_fired_rule_ids: set[str] = set()
+        self._omni_preemption_causes_pending: dict[str, str] = {}
+        self._omni_preemption_progress_pending: dict[str, int] = {}
+        self._omni_preemption_rule_ids_pending: dict[str, str] = {}
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -91,6 +164,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """Mark the old physical execution invalid until the orchestrator aborts it."""
         discarded_output_tokens = len(request._output_token_ids)
         discarded_computed_tokens = request.num_computed_tokens
+        preemption_cause = str(
+            getattr(request, "_omni_next_preemption_cause", "allocation_failure")
+        )
+        rule_id = getattr(request, "_omni_next_preemption_rule_id", None)
+        if hasattr(request, "_omni_next_preemption_cause"):
+            del request._omni_next_preemption_cause
+        if hasattr(request, "_omni_next_preemption_rule_id"):
+            del request._omni_next_preemption_rule_id
         old_output_connector_req_id = (
             getattr(request, "output_connector_req_id", None)
             or getattr(request, "connector_req_id", None)
@@ -113,6 +194,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         request._omni_execution_attempt = (
             getattr(request, "_omni_execution_attempt", 0) + 1
         )
+        self._omni_preemption_causes_pending[request.request_id] = preemption_cause
+        self._omni_preemption_progress_pending[request.request_id] = (
+            discarded_computed_tokens
+        )
+        if rule_id is not None:
+            self._omni_preemption_rule_ids_pending[request.request_id] = str(rule_id)
         if self.chunk_transfer_adapter is not None:
             self.chunk_transfer_adapter.abandon_sender(
                 str(old_output_connector_req_id)
@@ -124,7 +211,53 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             discarded_output_tokens=discarded_output_tokens,
             discarded_computed_tokens=discarded_computed_tokens,
             connector_req_id=old_output_connector_req_id,
+            preemption_cause=preemption_cause,
+            controlled_rule_id=rule_id,
         )
+
+    def _inject_controlled_preemptions(self, timestamp: float) -> set[str]:
+        """Preempt pre-registered victims once their absolute progress is met."""
+        if not self._controlled_preemption_rules:
+            return set()
+
+        injected: set[str] = set()
+        running_by_logical_id = {
+            _logical_request_id(str(request.request_id)): request
+            for request in list(self.running)
+        }
+        for rule in self._controlled_preemption_rules:
+            rule_id = rule["rule_id"]
+            if rule_id in self._controlled_preemption_fired_rule_ids:
+                continue
+            request = running_by_logical_id.get(rule["victim_request_id"])
+            if request is None:
+                continue
+            physical_request_id = str(request.request_id)
+            if _pipeline_occurrence(physical_request_id) != rule["occurrence_index"]:
+                continue
+            progress = self._get_confirmed_num_computed_tokens(request)
+            if progress < rule["target_num_computed_tokens"]:
+                continue
+
+            self.running.remove(request)
+            request._omni_next_preemption_cause = "controlled_restart"
+            request._omni_next_preemption_rule_id = rule_id
+            self._preempt_request(request, timestamp)
+            self._controlled_preemption_fired_rule_ids.add(rule_id)
+            injected.add(physical_request_id)
+            emit_stage_event(
+                "controlled_preemption_injected",
+                stage_id=self._omni_stage_id_for_trace(),
+                request_id=physical_request_id,
+                controlled_rule_id=rule_id,
+                victim_request_id=rule["victim_request_id"],
+                occurrence_index=rule["occurrence_index"],
+                target_num_computed_tokens=rule["target_num_computed_tokens"],
+                actual_num_computed_tokens=progress,
+                injection_cause="controlled_restart",
+                injection_succeeded=True,
+            )
+        return injected
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -258,6 +391,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request._omni_first_real_chunk_handled = True
 
         self._baseline_prepare_schedule()
+        controlled_preempted_req_ids = self._inject_controlled_preemptions(
+            schedule_start
+        )
 
         try:
             with (
@@ -272,6 +408,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 nvtx_range("omni:base_schedule"),
             ):
                 scheduler_output = super().schedule()
+            scheduler_output.preempted_req_ids = set(
+                scheduler_output.preempted_req_ids
+            ) | controlled_preempted_req_ids
+            scheduler_output.stage_preemption_causes = {
+                request_id: self._omni_preemption_causes_pending[request_id]
+                for request_id in scheduler_output.preempted_req_ids
+                if request_id in self._omni_preemption_causes_pending
+            }
+            scheduler_output.stage_preemption_progress = {
+                request_id: self._omni_preemption_progress_pending[request_id]
+                for request_id in scheduler_output.preempted_req_ids
+                if request_id in self._omni_preemption_progress_pending
+            }
+            scheduler_output.stage_preemption_rule_ids = {
+                request_id: self._omni_preemption_rule_ids_pending[request_id]
+                for request_id in scheduler_output.preempted_req_ids
+                if request_id in self._omni_preemption_rule_ids_pending
+            }
             for rid, ntok in scheduler_output.num_scheduled_tokens.items():
                 nvtx_mark(f"scheduler_scheduled:req={str(rid)[-8:]}:ntok={ntok}")
             self._trace_scheduler_output(
@@ -327,14 +481,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
         nvtx_mark("omni_ar:schedule_end")
-        return OmniSchedulerOutput(
+        omni_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
             request_execution_attempts={
                 request_id: getattr(self.requests.get(request_id), "_omni_execution_attempt", 0)
                 for request_id in scheduler_output.num_scheduled_tokens
             },
+            stage_preemption_causes=dict(
+                getattr(scheduler_output, "stage_preemption_causes", {})
+            ),
+            stage_preemption_progress=dict(
+                getattr(scheduler_output, "stage_preemption_progress", {})
+            ),
+            stage_preemption_rule_ids=dict(
+                getattr(scheduler_output, "stage_preemption_rule_ids", {})
+            ),
         )
+        for request_id in omni_output.preempted_req_ids:
+            self._omni_preemption_causes_pending.pop(request_id, None)
+            self._omni_preemption_progress_pending.pop(request_id, None)
+            self._omni_preemption_rule_ids_pending.pop(request_id, None)
+        return omni_output
 
     def update_from_output(
         self,
@@ -715,6 +883,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         )
                     )
                     for req_id in request_ids
+                }
+                eco.stage_preemption_causes = {
+                    req_id: getattr(
+                        scheduler_output, "stage_preemption_causes", {}
+                    ).get(req_id, "allocation_failure")
+                    for req_id in request_ids
+                }
+                eco.stage_preemption_progress = {
+                    req_id: int(
+                        getattr(
+                            scheduler_output, "stage_preemption_progress", {}
+                        ).get(req_id, 0)
+                    )
+                    for req_id in request_ids
+                }
+                eco.stage_preemption_rule_ids = {
+                    req_id: rule_id
+                    for req_id in request_ids
+                    if (
+                        rule_id := getattr(
+                            scheduler_output, "stage_preemption_rule_ids", {}
+                        ).get(req_id)
+                    )
+                    is not None
                 }
 
             finished_req_ids = self.finished_req_ids_dict

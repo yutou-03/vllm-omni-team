@@ -605,6 +605,18 @@ class OmniSchedulerMixin:
                 getattr(scheduler_output, "preempted_req_ids", set()) or set()
             )
         }
+        preemption_causes = dict(
+            getattr(scheduler_output, "stage_preemption_causes", {}) or {}
+        )
+        preemption_progress = dict(
+            getattr(scheduler_output, "stage_preemption_progress", {}) or {}
+        )
+        allocation_failure_req_ids = sorted(
+            request_id
+            for request_id in preempted_req_ids
+            if preemption_causes.get(request_id, "allocation_failure")
+            == "allocation_failure"
+        )
         pending_resume = self._baseline_preempted_pending_resume
         resumed_preempted_req_ids = [
             request_id
@@ -719,12 +731,16 @@ class OmniSchedulerMixin:
                     self._baseline_waiting_queue_choices
                 ),
                 queue_orders_after_schedule=queue_orders_after_schedule,
-                kv_allocation_failed=bool(preempted_req_ids),
-                kv_allocation_failure_victim_req_ids=preempted_requeue_order,
+                kv_allocation_failed=bool(allocation_failure_req_ids),
+                kv_allocation_failure_victim_req_ids=allocation_failure_req_ids,
                 preempted_num_computed_tokens_before={
-                    request_id: computed_tokens_before.get(request_id)
-                    for request_id in preempted_requeue_order
+                    request_id: preemption_progress.get(
+                        request_id,
+                        computed_tokens_before.get(request_id),
+                    )
+                    for request_id in preempted_req_ids
                 },
+                preemption_causes=preemption_causes,
                 preempted_requeue_order=preempted_requeue_order,
                 resumed_preempted_req_ids=resumed_preempted_req_ids,
             )
@@ -761,15 +777,19 @@ class OmniSchedulerMixin:
             scheduled_req_ids=scheduled_req_ids,
             preempted_req_ids=sorted(preempted_req_ids),
             kv_cache_usage=getattr(self.kv_cache_manager, "usage", None),
-            kv_allocation_failed=bool(preempted_req_ids),
-            kv_allocation_failure_victim_req_ids=preempted_requeue_order,
+            kv_allocation_failed=bool(allocation_failure_req_ids),
+            kv_allocation_failure_victim_req_ids=allocation_failure_req_ids,
             preempted_num_computed_tokens_before={
-                request_id: conformance.get(
-                    "request_num_computed_tokens_before",
-                    {},
-                ).get(request_id)
-                for request_id in preempted_requeue_order
+                request_id: preemption_progress.get(
+                    request_id,
+                    conformance.get(
+                        "request_num_computed_tokens_before",
+                        {},
+                    ).get(request_id),
+                )
+                for request_id in preempted_req_ids
             },
+            preemption_causes=preemption_causes,
             preempted_requeue_order=preempted_requeue_order,
             resumed_preempted_req_ids=resumed_preempted_req_ids,
             queue_orders_after_schedule=queue_orders_after_schedule,

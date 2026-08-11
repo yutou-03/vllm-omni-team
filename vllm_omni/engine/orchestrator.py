@@ -216,6 +216,10 @@ class OrchestratorRequestState:
     pending_restart_stages: set[int] = field(default_factory=set)
     execution_attempt: int = 0
     current_execution_id: str | None = None
+    recovery_target_stage_id: int | None = None
+    recovery_target_progress: int | None = None
+    recovery_preemption_cause: str | None = None
+    recovery_controlled_rule_id: str | None = None
 
 
 @dataclass
@@ -862,6 +866,9 @@ class Orchestrator:
                 stage_id,
                 list(getattr(raw_outputs, "stage_preempted_request_ids", []) or []),
                 dict(getattr(raw_outputs, "stage_preempted_connector_req_ids", {}) or {}),
+                dict(getattr(raw_outputs, "stage_preemption_causes", {}) or {}),
+                dict(getattr(raw_outputs, "stage_preemption_progress", {}) or {}),
+                dict(getattr(raw_outputs, "stage_preemption_rule_ids", {}) or {}),
             )
             if raw_outputs.outputs:
                 physical_to_logical = getattr(
@@ -1008,6 +1015,9 @@ class Orchestrator:
         stage_id: int,
         request_ids: list[str],
         connector_req_ids: dict[str, str] | None = None,
+        preemption_causes: dict[str, str] | None = None,
+        preemption_progress: dict[str, int] | None = None,
+        preemption_rule_ids: dict[str, str] | None = None,
     ) -> None:
         """Invalidate the old pipeline and submit a new execution from Stage 0."""
         if not request_ids:
@@ -1029,6 +1039,15 @@ class Orchestrator:
                 f"{request_id}__execution{req_state.execution_attempt}"
             )
             cutoff = _time.monotonic()
+            preemption_cause = (preemption_causes or {}).get(
+                physical_request_id, "allocation_failure"
+            )
+            discarded_progress = int(
+                (preemption_progress or {}).get(physical_request_id, 0)
+            )
+            controlled_rule_id = (preemption_rule_ids or {}).get(
+                physical_request_id
+            )
 
             final_stage_id = req_state.final_stage_id
             emitted = req_state.final_outputs_emitted.get(final_stage_id, 0)
@@ -1055,6 +1074,10 @@ class Orchestrator:
                 for pipeline_stage_id in range(final_stage_id + 1)
             }
             req_state.current_execution_id = new_execution_id
+            req_state.recovery_target_stage_id = stage_id
+            req_state.recovery_target_progress = discarded_progress
+            req_state.recovery_preemption_cause = preemption_cause
+            req_state.recovery_controlled_rule_id = controlled_rule_id
             physical_to_logical[new_execution_id] = request_id
 
             stage0_request = copy.deepcopy(req_state.stage0_request_template)
@@ -1081,6 +1104,9 @@ class Orchestrator:
                 new_execution_id=new_execution_id,
                 restarted_stage_ids=list(range(final_stage_id + 1)),
                 replay_outputs_to_drop=dict(req_state.replay_outputs_to_drop),
+                preemption_cause=preemption_cause,
+                controlled_rule_id=controlled_rule_id,
+                discarded_num_computed_tokens=discarded_progress,
             )
             self._bump_drain_epoch()
 

@@ -137,3 +137,6 @@ class OmniEngineCoreOutputs(EngineCoreOutputs):
     # stages can invalidate data derived from the discarded attempt.
     stage_preempted_request_ids: list[str] = []
     stage_preempted_connector_req_ids: dict[str, str] = {}
+    stage_preemption_causes: dict[str, str] = {}
+    stage_preemption_progress: dict[str, int] = {}
+    stage_preemption_rule_ids: dict[str, str] = {}
