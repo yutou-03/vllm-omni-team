@@ -113,7 +113,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             connector_req_id=old_output_connector_req_id,
             preemption_cause=preemption_cause,
             controlled_rule_id=rule_id,
-            progress_metric="cumulative_processed_codec_tokens",
+            progress_metric="completed_streaming_chunks",
         )
 
     def _record_cumulative_confirmed_progress(
@@ -123,7 +123,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     ) -> int:
         request_id = str(request.request_id)
         progress = self._omni_cumulative_confirmed_tokens.get(request_id, 0)
-        progress += int(num_tokens_scheduled)
+        # prompt_token_ids includes the left context replayed for Code2Wav.
+        # Counting scheduled tokens would therefore count the same codec frame
+        # repeatedly. One returned generation step corresponds to one newly
+        # completed streaming chunk, which is the monotonic Stage-2 progress
+        # unit used by the controlled experiment.
+        progress += 1
         self._omni_cumulative_confirmed_tokens[request_id] = progress
         request._omni_cumulative_confirmed_tokens = progress
         return progress
@@ -172,7 +177,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 actual_num_computed_tokens=progress,
                 injection_cause="controlled_restart",
                 injection_succeeded=True,
-                progress_metric="cumulative_processed_codec_tokens",
+                progress_metric="completed_streaming_chunks",
             )
             return True
         return False

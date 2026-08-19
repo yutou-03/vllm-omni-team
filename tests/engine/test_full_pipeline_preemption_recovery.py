@@ -301,7 +301,7 @@ def test_generation_stage_controlled_preemption_uses_cumulative_progress(
             "rule_id": "s2-half",
             "victim_request_id": "logical",
             "target_stage": 2,
-            "target_num_computed_tokens": 1200,
+            "target_num_computed_tokens": 8,
             "occurrence_index": 0,
         }
     ]
@@ -309,12 +309,12 @@ def test_generation_stage_controlled_preemption_uses_cumulative_progress(
     scheduler._omni_preemption_causes_pending = {}
     scheduler._omni_preemption_progress_pending = {}
     scheduler._omni_preemption_rule_ids_pending = {}
-    scheduler._omni_cumulative_confirmed_tokens = {"logical": 1600}
+    scheduler._omni_cumulative_confirmed_tokens = {"logical": 10}
     request = SimpleNamespace(
         request_id="logical",
         _output_token_ids=[],
         num_computed_tokens=0,
-        _omni_cumulative_confirmed_tokens=1600,
+        _omni_cumulative_confirmed_tokens=10,
         output_connector_req_id="logical",
         connector_req_id="logical",
         external_req_id="logical",
@@ -340,7 +340,7 @@ def test_generation_stage_controlled_preemption_uses_cumulative_progress(
     assert injected is True
     assert scheduler.running == []
     assert scheduler.waiting.requests == []
-    assert scheduler._omni_preemption_progress_pending == {"logical": 1600}
+    assert scheduler._omni_preemption_progress_pending == {"logical": 10}
     assert scheduler._omni_preemption_rule_ids_pending == {
         "logical": "s2-half"
     }
@@ -349,7 +349,7 @@ def test_generation_stage_controlled_preemption_uses_cumulative_progress(
         "controlled_preemption_injected",
     ]
     assert events[0][1]["progress_metric"] == (
-        "cumulative_processed_codec_tokens"
+        "completed_streaming_chunks"
     )
 
 
@@ -586,7 +586,7 @@ def test_generation_recovery_catchup_uses_cumulative_progress(monkeypatch):
             "logical_request_id": "logical",
             "pipeline_attempt_id": 1,
             "recovery_target_stage_id": 2,
-            "recovery_target_num_computed_tokens": 1600,
+            "recovery_target_num_computed_tokens": 10,
             "preemption_cause": "controlled_restart",
             "controlled_rule_id": "s2-half",
         }
@@ -596,7 +596,7 @@ def test_generation_recovery_catchup_uses_cumulative_progress(monkeypatch):
     request = SimpleNamespace(
         request_id="logical__execution1",
         num_computed_tokens=0,
-        _omni_cumulative_confirmed_tokens=1600,
+        _omni_cumulative_confirmed_tokens=10,
     )
     events = []
     monkeypatch.setattr(
@@ -613,7 +613,7 @@ def test_generation_recovery_catchup_uses_cumulative_progress(monkeypatch):
         "first_recomputed_progress",
         "full_pipeline_progress_caught_up",
     ]
-    assert events[1][1]["confirmed_num_computed_tokens"] == 1600
+    assert events[1][1]["confirmed_num_computed_tokens"] == 10
 
 
 def test_delayed_preemption_from_retired_execution_is_ignored(monkeypatch):
