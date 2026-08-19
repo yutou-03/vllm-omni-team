@@ -648,7 +648,17 @@ class OmniSchedulerMixin:
         if not recovery_fields:
             return
         stage_id = int(self._omni_stage_id_for_trace())
-        confirmed_progress = int(request.num_computed_tokens)
+        # AR stages expose monotonic progress through num_computed_tokens.
+        # Streaming generation stages replace their prompt on every upstream
+        # chunk, so that counter returns to zero. Those schedulers attach a
+        # cumulative confirmed counter to the request instead.
+        confirmed_progress = int(
+            getattr(
+                request,
+                "_omni_cumulative_confirmed_tokens",
+                request.num_computed_tokens,
+            )
+        )
         if request_id not in self._omni_first_recovery_progress_seen:
             self._omni_first_recovery_progress_seen.add(request_id)
             emit_stage_event(

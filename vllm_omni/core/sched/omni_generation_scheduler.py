@@ -24,6 +24,11 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_ar_scheduler import (
+    _load_controlled_preemption_rules,
+    _logical_request_id,
+    _pipeline_occurrence,
+)
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -46,6 +51,131 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         self._initialize_baseline_scheduling()
+        self._controlled_preemption_rules = [
+            rule
+            for rule in _load_controlled_preemption_rules()
+            if rule["target_stage"] == int(self._omni_stage_id_for_trace())
+        ]
+        self._controlled_preemption_fired_rule_ids: set[str] = set()
+        self._omni_preemption_causes_pending: dict[str, str] = {}
+        self._omni_preemption_progress_pending: dict[str, int] = {}
+        self._omni_preemption_rule_ids_pending: dict[str, str] = {}
+        self._omni_cumulative_confirmed_tokens: dict[str, int] = {}
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Retire a streaming generation execution for full-pipeline replay."""
+        discarded_output_tokens = len(request._output_token_ids)
+        discarded_progress = int(
+            getattr(request, "_omni_cumulative_confirmed_tokens", 0)
+        )
+        preemption_cause = str(
+            getattr(request, "_omni_next_preemption_cause", "allocation_failure")
+        )
+        rule_id = getattr(request, "_omni_next_preemption_rule_id", None)
+        if hasattr(request, "_omni_next_preemption_cause"):
+            del request._omni_next_preemption_cause
+        if hasattr(request, "_omni_next_preemption_rule_id"):
+            del request._omni_next_preemption_rule_id
+        old_output_connector_req_id = (
+            getattr(request, "output_connector_req_id", None)
+            or getattr(request, "connector_req_id", None)
+            or getattr(request, "external_req_id", None)
+            or request.request_id
+        )
+
+        super()._preempt_request(request, timestamp)
+        # Full-pipeline recovery creates a replacement physical request from
+        # Stage 0. The retired Stage-2 request must not resume locally.
+        self.waiting.remove_requests([request])
+        request._omni_execution_attempt = (
+            getattr(request, "_omni_execution_attempt", 0) + 1
+        )
+        self._omni_preemption_causes_pending[request.request_id] = (
+            preemption_cause
+        )
+        self._omni_preemption_progress_pending[request.request_id] = (
+            discarded_progress
+        )
+        if rule_id is not None:
+            self._omni_preemption_rule_ids_pending[request.request_id] = str(
+                rule_id
+            )
+        if self.chunk_transfer_adapter is not None:
+            self.chunk_transfer_adapter.abandon_sender(
+                str(old_output_connector_req_id)
+            )
+        emit_stage_event(
+            "full_pipeline_restart_requested",
+            stage_id=self._omni_stage_id_for_trace(),
+            request_id=request.request_id,
+            discarded_output_tokens=discarded_output_tokens,
+            discarded_computed_tokens=discarded_progress,
+            connector_req_id=old_output_connector_req_id,
+            preemption_cause=preemption_cause,
+            controlled_rule_id=rule_id,
+            progress_metric="cumulative_processed_codec_tokens",
+        )
+
+    def _record_cumulative_confirmed_progress(
+        self,
+        request: Request,
+        num_tokens_scheduled: int,
+    ) -> int:
+        request_id = str(request.request_id)
+        progress = self._omni_cumulative_confirmed_tokens.get(request_id, 0)
+        progress += int(num_tokens_scheduled)
+        self._omni_cumulative_confirmed_tokens[request_id] = progress
+        request._omni_cumulative_confirmed_tokens = progress
+        return progress
+
+    def _inject_controlled_preemption_after_output(
+        self,
+        request: Request,
+        timestamp: float,
+    ) -> bool:
+        """Inject after a complete Stage-2 chunk reaches its progress gate."""
+        if not self._controlled_preemption_rules:
+            return False
+        physical_request_id = str(request.request_id)
+        logical_request_id = _logical_request_id(physical_request_id)
+        occurrence = _pipeline_occurrence(physical_request_id)
+        progress = int(
+            getattr(request, "_omni_cumulative_confirmed_tokens", 0)
+        )
+        for rule in self._controlled_preemption_rules:
+            rule_id = rule["rule_id"]
+            if rule_id in self._controlled_preemption_fired_rule_ids:
+                continue
+            if rule["victim_request_id"] != logical_request_id:
+                continue
+            if rule["occurrence_index"] != occurrence:
+                continue
+            if progress < rule["target_num_computed_tokens"]:
+                continue
+
+            if request in self.running:
+                self.running.remove(request)
+            request._omni_next_preemption_cause = "controlled_restart"
+            request._omni_next_preemption_rule_id = rule_id
+            self._preempt_request(request, timestamp)
+            self._controlled_preemption_fired_rule_ids.add(rule_id)
+            emit_stage_event(
+                "controlled_preemption_injected",
+                stage_id=self._omni_stage_id_for_trace(),
+                request_id=physical_request_id,
+                controlled_rule_id=rule_id,
+                victim_request_id=rule["victim_request_id"],
+                occurrence_index=rule["occurrence_index"],
+                target_num_computed_tokens=rule[
+                    "target_num_computed_tokens"
+                ],
+                actual_num_computed_tokens=progress,
+                injection_cause="controlled_restart",
+                injection_succeeded=True,
+                progress_metric="cumulative_processed_codec_tokens",
+            )
+            return True
+        return False
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -404,7 +534,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         result = super().finish_requests(request_ids, finished_status)
         self._baseline_forget_request_ids(request_ids)
+        if request_ids is None:
+            self._omni_cumulative_confirmed_tokens.clear()
+        else:
+            for request_id in request_ids:
+                self._omni_cumulative_confirmed_tokens.pop(
+                    str(request_id), None
+                )
         return result
+
+    def _free_request(self, request: Request, *args, **kwargs):
+        try:
+            return super()._free_request(request, *args, **kwargs)
+        finally:
+            self._omni_cumulative_confirmed_tokens.pop(
+                str(request.request_id), None
+            )
 
     """
     Scheduler for the diffusion model.
@@ -467,6 +612,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        controlled_preempted_req_ids: set[str] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -518,10 +664,23 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
+            self._record_cumulative_confirmed_progress(
+                request,
+                num_tokens_scheduled,
+            )
             self._trace_recovery_progress_after_output(
                 request,
                 num_tokens_scheduled=num_tokens_scheduled,
             )
+            if self._inject_controlled_preemption_after_output(
+                request,
+                update_timestamp_start,
+            ):
+                controlled_preempted_req_ids.add(req_id)
+                # This completed chunk crossed the gate but belongs to the
+                # invalidated execution. It will be replayed under the new
+                # execution id, so do not publish the retired output.
+                continue
 
             # Diffusion request: completes in one step; mark finished and free resources
             if (
@@ -675,6 +834,49 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
         engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
+        preempted_by_client: dict[int, list[str]] = defaultdict(list)
+        for req_id in controlled_preempted_req_ids:
+            request = self.requests.get(req_id)
+            client_index = request.client_index if request is not None else 0
+            preempted_by_client[client_index].append(req_id)
+        for client_index, request_ids in preempted_by_client.items():
+            if (eco := engine_core_outputs.get(client_index)) is None:
+                engine_core_outputs[client_index] = eco = EngineCoreOutputs()
+            eco.stage_preempted_request_ids = sorted(request_ids)
+            eco.stage_preempted_connector_req_ids = {
+                req_id: str(
+                    getattr(
+                        self.requests.get(req_id),
+                        "output_connector_req_id",
+                        req_id,
+                    )
+                )
+                for req_id in request_ids
+            }
+            eco.stage_preemption_causes = {
+                req_id: self._omni_preemption_causes_pending.get(
+                    req_id, "controlled_restart"
+                )
+                for req_id in request_ids
+            }
+            eco.stage_preemption_progress = {
+                req_id: self._omni_preemption_progress_pending.get(req_id, 0)
+                for req_id in request_ids
+            }
+            eco.stage_preemption_rule_ids = {
+                req_id: rule_id
+                for req_id in request_ids
+                if (
+                    rule_id := self._omni_preemption_rule_ids_pending.get(
+                        req_id
+                    )
+                )
+                is not None
+            }
+        for req_id in controlled_preempted_req_ids:
+            self._omni_preemption_causes_pending.pop(req_id, None)
+            self._omni_preemption_progress_pending.pop(req_id, None)
+            self._omni_preemption_rule_ids_pending.pop(req_id, None)
         if str(stage_id) == "2":
             for outs in outputs.values():
                 for output in outs:

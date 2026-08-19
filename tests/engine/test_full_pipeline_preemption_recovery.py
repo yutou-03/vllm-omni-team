@@ -9,6 +9,9 @@ from vllm_omni.core.sched.omni_ar_scheduler import (
     _load_controlled_preemption_rules,
     _load_slo_active_preemption_config,
 )
+from vllm_omni.core.sched.omni_generation_scheduler import (
+    OmniGenerationScheduler,
+)
 from vllm_omni.core.sched.omni_scheduler_mixin import (
     extract_request_recovery_trace_fields,
 )
@@ -286,6 +289,70 @@ def test_controlled_preemption_file_contract(tmp_path, monkeypatch):
     ]
 
 
+def test_generation_stage_controlled_preemption_uses_cumulative_progress(
+    monkeypatch,
+):
+    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler.waiting = _Waiting()
+    scheduler.chunk_transfer_adapter = None
+    scheduler._omni_stage_id_for_trace = lambda: 2
+    scheduler._controlled_preemption_rules = [
+        {
+            "rule_id": "s2-half",
+            "victim_request_id": "logical",
+            "target_stage": 2,
+            "target_num_computed_tokens": 1200,
+            "occurrence_index": 0,
+        }
+    ]
+    scheduler._controlled_preemption_fired_rule_ids = set()
+    scheduler._omni_preemption_causes_pending = {}
+    scheduler._omni_preemption_progress_pending = {}
+    scheduler._omni_preemption_rule_ids_pending = {}
+    scheduler._omni_cumulative_confirmed_tokens = {"logical": 1600}
+    request = SimpleNamespace(
+        request_id="logical",
+        _output_token_ids=[],
+        num_computed_tokens=0,
+        _omni_cumulative_confirmed_tokens=1600,
+        output_connector_req_id="logical",
+        connector_req_id="logical",
+        external_req_id="logical",
+        _omni_execution_attempt=0,
+    )
+    scheduler.running = [request]
+
+    def _base_preempt(self, victim, _timestamp):
+        victim.num_computed_tokens = 0
+        self.waiting.prepend_request(victim)
+
+    events = []
+    monkeypatch.setattr(Scheduler, "_preempt_request", _base_preempt)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_generation_scheduler.emit_stage_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+
+    injected = scheduler._inject_controlled_preemption_after_output(
+        request, 1.0
+    )
+
+    assert injected is True
+    assert scheduler.running == []
+    assert scheduler.waiting.requests == []
+    assert scheduler._omni_preemption_progress_pending == {"logical": 1600}
+    assert scheduler._omni_preemption_rule_ids_pending == {
+        "logical": "s2-half"
+    }
+    assert [event for event, _ in events] == [
+        "full_pipeline_restart_requested",
+        "controlled_preemption_injected",
+    ]
+    assert events[0][1]["progress_metric"] == (
+        "cumulative_processed_codec_tokens"
+    )
+
+
 def test_slo_active_preemption_config_contract(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_SLO_ACTIVE_PREEMPTION", "true")
     monkeypatch.setenv("VLLM_OMNI_SLO_ACTIVE_STAGES", "0,1")
@@ -509,6 +576,44 @@ def test_recovery_progress_events_are_confirmed_once(monkeypatch):
     assert events[1][1]["target_num_computed_tokens"] == 37
     assert events[1][1]["confirmed_num_computed_tokens"] == 40
     assert events[1][1]["overshoot_num_computed_tokens"] == 3
+
+
+def test_generation_recovery_catchup_uses_cumulative_progress(monkeypatch):
+    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler._omni_stage_id_for_trace = lambda: 2
+    scheduler._omni_recovery_trace_by_request = {
+        "logical__execution1": {
+            "logical_request_id": "logical",
+            "pipeline_attempt_id": 1,
+            "recovery_target_stage_id": 2,
+            "recovery_target_num_computed_tokens": 1600,
+            "preemption_cause": "controlled_restart",
+            "controlled_rule_id": "s2-half",
+        }
+    }
+    scheduler._omni_first_recovery_progress_seen = set()
+    scheduler._omni_recovery_catchup_seen = set()
+    request = SimpleNamespace(
+        request_id="logical__execution1",
+        num_computed_tokens=0,
+        _omni_cumulative_confirmed_tokens=1600,
+    )
+    events = []
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_stage_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+
+    scheduler._trace_recovery_progress_after_output(
+        request,
+        num_tokens_scheduled=160,
+    )
+
+    assert [event for event, _ in events] == [
+        "first_recomputed_progress",
+        "full_pipeline_progress_caught_up",
+    ]
+    assert events[1][1]["confirmed_num_computed_tokens"] == 1600
 
 
 def test_delayed_preemption_from_retired_execution_is_ignored(monkeypatch):
