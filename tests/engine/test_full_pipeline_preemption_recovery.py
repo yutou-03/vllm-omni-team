@@ -97,6 +97,17 @@ def _orchestrator_with_request():
     return orchestrator, state, template
 
 
+def test_request_state_initializes_explicit_execution_ledger():
+    _, state, _ = _orchestrator_with_request()
+
+    assert state.execution_ledger is not None
+    assert state.execution_ledger.pipeline_attempt_id == 0
+    assert {
+        stage_id: ref.physical_request_id
+        for stage_id, ref in state.execution_ledger.current_stages.items()
+    } == {0: "logical", 1: "logical", 2: "logical"}
+
+
 def test_suppressed_replay_terminal_still_reaches_frontend(monkeypatch):
     orchestrator, state, _ = _orchestrator_with_request()
     orchestrator.output_async_queue = asyncio.Queue()
@@ -478,6 +489,12 @@ def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
     assert state.current_execution_id == execution_id
     assert state.execution_attempt == 1
     assert state.stage_request_ids == {0: execution_id, 1: execution_id, 2: execution_id}
+    assert state.execution_ledger is not None
+    assert state.execution_ledger.pipeline_attempt_id == 1
+    assert {
+        stage_id: ref.physical_request_id
+        for stage_id, ref in state.execution_ledger.current_stages.items()
+    } == {0: execution_id, 1: execution_id, 2: execution_id}
     assert state.stage_submit_ts.keys() == {0}
     assert state.streaming.bridge_states == {}
     assert state.replay_outputs_to_drop == {2: 7}
@@ -618,8 +635,22 @@ def test_generation_recovery_catchup_uses_cumulative_progress(monkeypatch):
 
 def test_delayed_preemption_from_retired_execution_is_ignored(monkeypatch):
     orchestrator, state, _ = _orchestrator_with_request()
-    state.stage_request_ids[1] = "logical__execution1"
+    assert state.execution_ledger is not None
+    state.execution_ledger.begin_full_restart(
+        physical_request_ids={
+            0: "logical__execution1",
+            1: "logical__execution1",
+            2: "logical__execution1",
+        },
+        started_monotonic_s=state.execution_ledger.current_stages[
+            0
+        ].started_monotonic_s,
+    )
+    state.stage_request_ids = {
+        stage_id: "logical__execution1" for stage_id in range(3)
+    }
     state.current_execution_id = "logical__execution1"
+    state.execution_attempt = 1
     orchestrator._physical_to_logical_request_ids["logical__execution1"] = "logical"
     monkeypatch.setattr(
         "vllm_omni.engine.orchestrator.emit_stage_event",
@@ -628,7 +659,8 @@ def test_delayed_preemption_from_retired_execution_is_ignored(monkeypatch):
 
     asyncio.run(orchestrator._handle_stage_preemptions(1, ["logical"]))
 
-    assert state.execution_attempt == 0
+    assert state.execution_attempt == 1
+    assert state.execution_ledger.pipeline_attempt_id == 1
     assert all(pool.aborted == [] for pool in orchestrator.stage_pools)
     assert orchestrator.stage_pools[0].submitted == []
 
@@ -647,6 +679,43 @@ def test_logical_completion_aborts_and_releases_all_executions():
     orchestrator._running_counter = None
 
     asyncio.run(orchestrator._cleanup_request_ids(["logical"]))
+
+    expected = {"logical", "logical__execution1", "logical__execution2"}
+    assert all(set(pool.released) == expected for pool in orchestrator.stage_pools)
+    assert all(set(pool.aborted) == expected for pool in orchestrator.stage_pools)
+    assert orchestrator.request_states == {}
+    assert orchestrator._physical_to_logical_request_ids == {}
+
+
+def test_cleanup_uses_ledger_history_when_registry_only_has_current_execution():
+    orchestrator, state, _ = _orchestrator_with_request()
+    assert state.execution_ledger is not None
+    start = state.execution_ledger.current_stages[0].started_monotonic_s
+    state.execution_ledger.begin_full_restart(
+        physical_request_ids={
+            0: "logical__execution1",
+            1: "logical__execution1",
+            2: "logical__execution1",
+        },
+        started_monotonic_s=start,
+    )
+    state.execution_ledger.begin_full_restart(
+        physical_request_ids={
+            0: "logical__execution2",
+            1: "logical__execution2",
+            2: "logical__execution2",
+        },
+        started_monotonic_s=start,
+    )
+    orchestrator._physical_to_logical_request_ids = {
+        "logical__execution2": "logical"
+    }
+    orchestrator._pd_kv_params = {}
+    orchestrator._omni_nvtx_s2_raw_output_seen = set()
+    orchestrator._omni_nvtx_s2_route_seen = set()
+    orchestrator._running_counter = None
+
+    asyncio.run(orchestrator._cleanup_request_ids(["logical__execution2"]))
 
     expected = {"logical", "logical__execution1", "logical__execution2"}
     assert all(set(pool.released) == expected for pool in orchestrator.stage_pools)
