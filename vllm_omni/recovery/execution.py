@@ -20,6 +20,13 @@ class ExecutionStateError(ValueError):
     """Raised when an execution-state transition violates the contract."""
 
 
+class PreemptionRecoveryMode(str, Enum):
+    """Supported recovery actions after a scheduler resource preemption."""
+
+    FULL_PIPELINE_RESTART = "full_pipeline_restart"
+    STAGE_LOCAL_RECOMPUTE = "stage_local_recompute"
+
+
 class MessageDropReason(str, Enum):
     """Reason an asynchronous message does not belong to the current state."""
 

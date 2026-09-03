@@ -357,3 +357,106 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def test_stage_local_recompute_resets_runner_dynamic_state_only():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model_intermediate_buffer = {
+        "local": {"dynamic": 1},
+        "full": {"dynamic": 2},
+    }
+    runner.requests = {
+        "local": SimpleNamespace(additional_information_cpu=None),
+        "full": SimpleNamespace(additional_information_cpu=None),
+    }
+    runner._talker_mtp_generators = {"local": object(), "full": object()}
+    runner.model = SimpleNamespace(
+        reset_intermediate_state_for_recompute=lambda payload: {
+            "immutable": payload["dynamic"]
+        }
+    )
+    scheduler_output = SimpleNamespace(
+        preempted_req_ids={"local", "full"},
+        request_output_connector_req_ids={
+            "local": "local__stage1__attempt1",
+        },
+        stage_preemption_recovery_modes={
+            "local": "stage_local_recompute",
+            "full": "full_pipeline_restart",
+        },
+    )
+
+    runner._reset_stage_local_recompute_state(scheduler_output)
+
+    assert runner.model_intermediate_buffer == {
+        "local": {"immutable": 1},
+        "full": {"dynamic": 2},
+    }
+    assert runner.requests["local"].additional_information_cpu == {
+        "immutable": 1
+    }
+    assert (
+        runner.requests["local"].output_connector_req_id
+        == "local__stage1__attempt1"
+    )
+    assert runner.requests["full"].additional_information_cpu is None
+    assert set(runner._talker_mtp_generators) == {"full"}
+
+
+def test_qwen3_omni_talker_preemption_reset_keeps_only_thinker_inputs():
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
+        Qwen3OmniMoeForConditionalGeneration,
+    )
+
+    model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
+    model.model_stage = "talker"
+    fixed_hidden = torch.randn(3, 4)
+    fixed_prefill = torch.randn(3, 4)
+    cached_decode = torch.randn(8, 4)
+    payload = {
+        "global_request_id": "req-1",
+        "speaker": "ethan",
+        "meta": {
+            "decode_flag": True,
+            "num_processed_tokens": 1055,
+            "prefill_consumed_text_tokens": 1,
+            "eos_emitted": True,
+        },
+        "hidden_states": {
+            "output": fixed_hidden,
+            "last": torch.randn(1, 4),
+            "trailing_text": torch.randn(2, 4),
+        },
+        "embed": {
+            "prefill": fixed_prefill,
+            "cached_decode": cached_decode,
+            "tts_bos": torch.randn(1, 4),
+            "tts_pad_projected": torch.randn(1, 4),
+        },
+        "codes": {"audio": torch.ones(16, 4, dtype=torch.long)},
+        "mtp_inputs": (torch.randn(1, 4), torch.randn(1, 4)),
+    }
+
+    reset = model.reset_intermediate_state_for_recompute(payload)
+
+    assert reset["global_request_id"] == "req-1"
+    assert reset["speaker"] == "ethan"
+    assert reset["meta"] == {}
+    assert reset["hidden_states"] == {"output": fixed_hidden}
+    assert reset["embed"]["prefill"] is fixed_prefill
+    assert reset["embed"]["cached_decode"] is cached_decode
+    assert "tts_pad_projected" not in reset["embed"]
+    assert "codes" not in reset
+    assert "mtp_inputs" not in reset
+
+
+def test_qwen3_omni_non_talker_preemption_reset_is_noop():
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
+        Qwen3OmniMoeForConditionalGeneration,
+    )
+
+    model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
+    model.model_stage = "thinker"
+    payload = {"meta": {"num_processed_tokens": 12}}
+
+    assert model.reset_intermediate_state_for_recompute(payload) is payload

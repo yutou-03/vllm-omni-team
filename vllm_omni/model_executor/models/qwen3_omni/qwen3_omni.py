@@ -659,6 +659,47 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         return {"hidden_states": {"last": hidden_states[-1, :].detach()}}
 
+    def reset_intermediate_state_for_recompute(
+        self,
+        payload: OmniPayload,
+    ) -> OmniPayload:
+        """Keep immutable Thinker input and discard all Talker dynamic state."""
+
+        if self.model_stage != "talker":
+            return payload
+
+        reset: OmniPayload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"meta", "hidden_states", "embed", "codes", "mtp_inputs"}
+        }
+
+        hidden_states = payload.get("hidden_states", {})
+        if isinstance(hidden_states, dict) and "output" in hidden_states:
+            reset["hidden_states"] = {"output": hidden_states["output"]}
+
+        embeddings = payload.get("embed", {})
+        if isinstance(embeddings, dict):
+            retained_embeddings = {
+                key: value
+                for key, value in embeddings.items()
+                if key
+                in {
+                    "prefill",
+                    "tts_bos",
+                    "tts_eos",
+                    "tts_pad",
+                    "cached_decode",
+                    "decode",
+                }
+            }
+            if retained_embeddings:
+                reset["embed"] = retained_embeddings
+
+        # Reset decode cursors, EOS flags and processed-token counters.
+        reset["meta"] = {}
+        return reset
+
     def talker_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         """
         Preprocess talker embeds. Noted that we set the MTP here.

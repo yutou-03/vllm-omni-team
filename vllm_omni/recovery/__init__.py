@@ -10,6 +10,7 @@ from .execution import (
     OutputCommitLedger,
     OutputCommitState,
     OutputDecision,
+    PreemptionRecoveryMode,
     StageExecutionRef,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "OutputCommitLedger",
     "OutputCommitState",
     "OutputDecision",
+    "PreemptionRecoveryMode",
     "StageExecutionRef",
 ]

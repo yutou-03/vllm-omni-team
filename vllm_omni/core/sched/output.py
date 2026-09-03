@@ -76,6 +76,8 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     request_execution_attempts: dict[str, int] = field(default_factory=dict)
+    request_output_connector_req_ids: dict[str, str] = field(default_factory=dict)
     stage_preemption_causes: dict[str, str] = field(default_factory=dict)
     stage_preemption_progress: dict[str, int] = field(default_factory=dict)
     stage_preemption_rule_ids: dict[str, str] = field(default_factory=dict)
+    stage_preemption_recovery_modes: dict[str, str] = field(default_factory=dict)

@@ -39,7 +39,7 @@ from vllm_omni.profiling.nvtx import (
     nvtx_range,
 )
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
-from vllm_omni.recovery.execution import ExecutionLedger
+from vllm_omni.recovery import ExecutionLedger, PreemptionRecoveryMode
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     merge_scheduling_metadata_into_additional_information,
@@ -957,6 +957,14 @@ class Orchestrator:
                 dict(getattr(raw_outputs, "stage_preemption_causes", {}) or {}),
                 dict(getattr(raw_outputs, "stage_preemption_progress", {}) or {}),
                 dict(getattr(raw_outputs, "stage_preemption_rule_ids", {}) or {}),
+                dict(
+                    getattr(
+                        raw_outputs,
+                        "stage_preemption_recovery_modes",
+                        {},
+                    )
+                    or {}
+                ),
             )
             if raw_outputs.outputs:
                 physical_to_logical = getattr(
@@ -1116,8 +1124,9 @@ class Orchestrator:
         preemption_causes: dict[str, str] | None = None,
         preemption_progress: dict[str, int] | None = None,
         preemption_rule_ids: dict[str, str] | None = None,
+        recovery_modes: dict[str, str] | None = None,
     ) -> None:
-        """Invalidate the old pipeline and submit a new execution from Stage 0."""
+        """Dispatch each preemption to its explicitly selected recovery path."""
         if not request_ids:
             return
 
@@ -1140,6 +1149,119 @@ class Orchestrator:
             )
             if physical_request_id != current_stage_request_id:
                 # A delayed preemption envelope from a retired execution.
+                continue
+
+            requested_mode = (recovery_modes or {}).get(
+                physical_request_id,
+                PreemptionRecoveryMode.FULL_PIPELINE_RESTART.value,
+            )
+            if (
+                requested_mode
+                == PreemptionRecoveryMode.STAGE_LOCAL_RECOMPUTE.value
+                and stage_id == 1
+                and stage_id < req_state.final_stage_id
+                and execution_ledger is not None
+            ):
+                cutoff = _time.monotonic()
+                preemption_cause = (preemption_causes or {}).get(
+                    physical_request_id, "allocation_failure"
+                )
+                discarded_progress = int(
+                    (preemption_progress or {}).get(physical_request_id, 0)
+                )
+                controlled_rule_id = (preemption_rule_ids or {}).get(
+                    physical_request_id
+                )
+                connector_req_id = (connector_req_ids or {}).get(
+                    physical_request_id,
+                    physical_request_id,
+                )
+                final_stage_id = req_state.final_stage_id
+                affected_request_ids = {stage_id: physical_request_id}
+                for downstream_stage_id in range(stage_id + 1, final_stage_id + 1):
+                    next_attempt = (
+                        execution_ledger.current_stages[
+                            downstream_stage_id
+                        ].stage_attempt_id
+                        + 1
+                    )
+                    affected_request_ids[downstream_stage_id] = (
+                        f"{request_id}__pipeline"
+                        f"{execution_ledger.pipeline_attempt_id}"
+                        f"__stage{downstream_stage_id}"
+                        f"__attempt{next_attempt}"
+                    )
+
+                retired = execution_ledger.begin_stage_recompute(
+                    stage_id=stage_id,
+                    physical_request_ids=affected_request_ids,
+                    started_monotonic_s=cutoff,
+                )
+                req_state.stage_request_ids = {
+                    pipeline_stage_id: ref.physical_request_id
+                    for pipeline_stage_id, ref in (
+                        execution_ledger.current_stages.items()
+                    )
+                }
+                req_state.execution_attempt = execution_ledger.pipeline_attempt_id
+                req_state.recovery_target_stage_id = stage_id
+                req_state.recovery_target_progress = discarded_progress
+                req_state.recovery_preemption_cause = preemption_cause
+                req_state.recovery_controlled_rule_id = controlled_rule_id
+
+                qwen_bridge_states = req_state.streaming.bridge_states.get(
+                    "qwen3_omni"
+                )
+                if isinstance(qwen_bridge_states, dict):
+                    qwen_bridge_states.pop(request_id, None)
+
+                for affected_stage_id in range(stage_id, final_stage_id + 1):
+                    req_state.discard_stage_outputs_before[affected_stage_id] = cutoff
+                for downstream_stage_id in range(stage_id + 1, final_stage_id + 1):
+                    retired_request_id = retired[
+                        downstream_stage_id
+                    ].physical_request_id
+                    downstream_pool = self.stage_pools[downstream_stage_id]
+                    if downstream_pool.final_output:
+                        emitted = req_state.final_outputs_emitted.get(
+                            downstream_stage_id, 0
+                        )
+                        req_state.replay_outputs_to_drop[downstream_stage_id] = (
+                            emitted
+                        )
+                    await downstream_pool.abort_requests([retired_request_id])
+                    downstream_pool.release_binding(retired_request_id)
+                    req_state.stage_submit_ts.pop(downstream_stage_id, None)
+                    replacement_id = affected_request_ids[downstream_stage_id]
+                    physical_to_logical[replacement_id] = request_id
+
+                if self.async_chunk:
+                    await self._prewarm_async_chunk_stages(
+                        request_id,
+                        req_state.stage0_request_template,
+                        req_state,
+                        start_stage_id=stage_id + 1,
+                        recovery=True,
+                        connector_req_id=connector_req_id,
+                    )
+
+                emit_stage_event(
+                    "stage_local_recompute_reset",
+                    stage_id=stage_id,
+                    request_id=request_id,
+                    pipeline_attempt_id=execution_ledger.pipeline_attempt_id,
+                    stage_attempt_id=(
+                        execution_ledger.current_stages[stage_id].stage_attempt_id
+                    ),
+                    downstream_stage_ids=list(
+                        range(stage_id + 1, final_stage_id + 1)
+                    ),
+                    replay_outputs_to_drop=dict(req_state.replay_outputs_to_drop),
+                    preemption_cause=preemption_cause,
+                    controlled_rule_id=controlled_rule_id,
+                    discarded_num_computed_tokens=discarded_progress,
+                )
+                self._bump_drain_epoch()
                 continue
 
             next_execution_attempt = (

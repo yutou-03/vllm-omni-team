@@ -250,6 +250,54 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 mrope_pos_ptr += completion_part_len
 
+    def _reset_stage_local_recompute_state(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Discard model state not represented by a preempted request's KV."""
+
+        for req_id, output_connector_req_id in getattr(
+            scheduler_output,
+            "request_output_connector_req_ids",
+            {},
+        ).items():
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                setattr(
+                    req_state,
+                    "output_connector_req_id",
+                    output_connector_req_id,
+                )
+
+        # Talker owns recurrent codec state outside vLLM's KV cache.  A
+        # stage-local recompute must discard that dynamic state before the
+        # preempted request can resume from its immutable stage input.
+        recovery_modes = getattr(
+            scheduler_output,
+            "stage_preemption_recovery_modes",
+            {},
+        )
+        for req_id in getattr(scheduler_output, "preempted_req_ids", set()) or set():
+            if recovery_modes.get(req_id) != "stage_local_recompute":
+                continue
+            existing = self.model_intermediate_buffer.get(req_id)
+            resetter = getattr(
+                self.model,
+                "reset_intermediate_state_for_recompute",
+                None,
+            )
+            if existing is not None and callable(resetter):
+                reset = resetter(existing)
+                if reset:
+                    self.model_intermediate_buffer[req_id] = reset
+                    req_state = self.requests.get(req_id)
+                    if req_state is not None:
+                        setattr(req_state, "additional_information_cpu", reset)
+                else:
+                    self.model_intermediate_buffer.pop(req_id, None)
+            if hasattr(self, "_talker_mtp_generators"):
+                self._talker_mtp_generators.pop(req_id, None)
+
     def _update_states(self, scheduler_output: "SchedulerOutput"):
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -263,6 +311,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Used for prefix cache
         if self.omni_prefix_cache is not None:
             self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
+
+        self._reset_stage_local_recompute_state(scheduler_output)
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:

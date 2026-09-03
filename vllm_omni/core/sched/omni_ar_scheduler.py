@@ -31,6 +31,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
+from vllm_omni.recovery import PreemptionRecoveryMode
 from vllm_omni.scheduling.policy import request_scheduling_metadata
 
 logger = init_logger(__name__)
@@ -40,6 +41,7 @@ _SLO_ACTIVE_PREEMPTION_ENV = "VLLM_OMNI_SLO_ACTIVE_PREEMPTION"
 _SLO_ACTIVE_STAGES_ENV = "VLLM_OMNI_SLO_ACTIVE_STAGES"
 _SLO_ACTIVE_GUARD_MS_ENV = "VLLM_OMNI_SLO_ACTIVE_GUARD_MS"
 _SLO_PRIORITY_TRACE_ENV = "VLLM_OMNI_SLO_PRIORITY_TRACE"
+_PREEMPTION_RECOVERY_MODE_ENV = "VLLM_OMNI_PREEMPTION_RECOVERY_MODE"
 
 
 def _logical_request_id(request_id: str) -> str:
@@ -136,6 +138,22 @@ def _load_slo_active_preemption_config() -> tuple[bool, set[int], float, bool]:
     return enabled, stages, guard_ms, trace_enabled
 
 
+def _load_preemption_recovery_mode() -> PreemptionRecoveryMode:
+    """Load the recovery policy, preserving full restart as the default."""
+
+    raw_mode = os.environ.get(
+        _PREEMPTION_RECOVERY_MODE_ENV,
+        PreemptionRecoveryMode.FULL_PIPELINE_RESTART.value,
+    ).strip().lower()
+    try:
+        return PreemptionRecoveryMode(raw_mode)
+    except ValueError as error:
+        choices = ", ".join(mode.value for mode in PreemptionRecoveryMode)
+        raise ValueError(
+            f"{_PREEMPTION_RECOVERY_MODE_ENV} must be one of: {choices}"
+        ) from error
+
+
 @dataclass
 class KVCacheTransferData:
     request_id: str
@@ -194,6 +212,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omni_preemption_causes_pending: dict[str, str] = {}
         self._omni_preemption_progress_pending: dict[str, int] = {}
         self._omni_preemption_rule_ids_pending: dict[str, str] = {}
+        self._omni_preemption_recovery_modes_pending: dict[str, str] = {}
+        self._preemption_recovery_mode = _load_preemption_recovery_mode()
         (
             self._slo_active_preemption_enabled,
             self._slo_active_preemption_stages,
@@ -208,7 +228,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return request.num_computed_tokens - request.num_output_placeholders
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
-        """Mark the old physical execution invalid until the orchestrator aborts it."""
+        """Apply the configured safe recovery action after resource preemption."""
         discarded_output_tokens = len(request._output_token_ids)
         discarded_computed_tokens = request.num_computed_tokens
         preemption_cause = str(
@@ -227,6 +247,68 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         super()._preempt_request(request, timestamp)
+
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        configured_mode = getattr(
+            self,
+            "_preemption_recovery_mode",
+            PreemptionRecoveryMode.FULL_PIPELINE_RESTART,
+        )
+        restart_talker_locally = (
+            configured_mode is PreemptionRecoveryMode.STAGE_LOCAL_RECOMPUTE
+            and getattr(model_config, "model_stage", None) == "talker"
+        )
+        actual_mode = (
+            PreemptionRecoveryMode.STAGE_LOCAL_RECOMPUTE
+            if restart_talker_locally
+            else PreemptionRecoveryMode.FULL_PIPELINE_RESTART
+        )
+        recovery_modes = getattr(
+            self, "_omni_preemption_recovery_modes_pending", None
+        )
+        if recovery_modes is not None:
+            recovery_modes[request.request_id] = actual_mode.value
+
+        if restart_talker_locally:
+            del request._all_token_ids[request.num_prompt_tokens :]
+            request._output_token_ids.clear()
+            request.num_output_placeholders = 0
+            request.discard_latest_async_tokens = False
+            request._omni_execution_attempt = (
+                getattr(request, "_omni_execution_attempt", 0) + 1
+            )
+            request.stop_reason = None
+            request.output_connector_req_id = (
+                f"{request.request_id}__stage{self._omni_stage_id_for_trace()}"
+                f"__attempt{request.num_preemptions}"
+            )
+            self._omni_preemption_causes_pending[request.request_id] = (
+                preemption_cause
+            )
+            self._omni_preemption_progress_pending[request.request_id] = (
+                discarded_computed_tokens
+            )
+            if rule_id is not None:
+                self._omni_preemption_rule_ids_pending[request.request_id] = str(
+                    rule_id
+                )
+            if self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.abandon_sender(
+                    str(old_output_connector_req_id)
+                )
+            emit_stage_event(
+                "stage_local_dynamic_state_discarded",
+                stage_id=self._omni_stage_id_for_trace(),
+                request_id=request.request_id,
+                discarded_output_tokens=discarded_output_tokens,
+                discarded_computed_tokens=discarded_computed_tokens,
+                retained_prompt_tokens=request.num_prompt_tokens,
+                connector_req_id=request.output_connector_req_id,
+                preemption_cause=preemption_cause,
+                controlled_rule_id=rule_id,
+                recovery_mode=actual_mode.value,
+            )
+            return
 
         # The upstream implementation immediately prepends the victim to the
         # waiting queue.  Full-pipeline recovery must never let that retired
@@ -602,6 +684,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 for request_id in scheduler_output.preempted_req_ids
                 if request_id in self._omni_preemption_rule_ids_pending
             }
+            scheduler_output.stage_preemption_recovery_modes = {
+                request_id: self._omni_preemption_recovery_modes_pending[request_id]
+                for request_id in scheduler_output.preempted_req_ids
+                if request_id in self._omni_preemption_recovery_modes_pending
+            }
             for rid, ntok in scheduler_output.num_scheduled_tokens.items():
                 nvtx_mark(f"scheduler_scheduled:req={str(rid)[-8:]}:ntok={ntok}")
             self._trace_scheduler_output(
@@ -657,12 +744,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
         nvtx_mark("omni_ar:schedule_end")
+        request_ids_with_connector_state = set(
+            scheduler_output.num_scheduled_tokens
+        ) | set(scheduler_output.preempted_req_ids)
         omni_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
             request_execution_attempts={
                 request_id: getattr(self.requests.get(request_id), "_omni_execution_attempt", 0)
                 for request_id in scheduler_output.num_scheduled_tokens
+            },
+            request_output_connector_req_ids={
+                request_id: str(output_connector_req_id)
+                for request_id in request_ids_with_connector_state
+                if (request := self.requests.get(request_id)) is not None
+                and (
+                    output_connector_req_id := getattr(
+                        request,
+                        "output_connector_req_id",
+                        None,
+                    )
+                )
+                is not None
             },
             stage_preemption_causes=dict(
                 getattr(scheduler_output, "stage_preemption_causes", {})
@@ -673,11 +776,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stage_preemption_rule_ids=dict(
                 getattr(scheduler_output, "stage_preemption_rule_ids", {})
             ),
+            stage_preemption_recovery_modes=dict(
+                getattr(scheduler_output, "stage_preemption_recovery_modes", {})
+            ),
         )
         for request_id in omni_output.preempted_req_ids:
             self._omni_preemption_causes_pending.pop(request_id, None)
             self._omni_preemption_progress_pending.pop(request_id, None)
             self._omni_preemption_rule_ids_pending.pop(request_id, None)
+            self._omni_preemption_recovery_modes_pending.pop(request_id, None)
         return omni_output
 
     def update_from_output(
@@ -1089,6 +1196,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         ).get(req_id)
                     )
                     is not None
+                }
+                eco.stage_preemption_recovery_modes = {
+                    req_id: getattr(
+                        scheduler_output,
+                        "stage_preemption_recovery_modes",
+                        {},
+                    ).get(
+                        req_id,
+                        PreemptionRecoveryMode.FULL_PIPELINE_RESTART.value,
+                    )
+                    for req_id in request_ids
                 }
 
             finished_req_ids = self.finished_req_ids_dict

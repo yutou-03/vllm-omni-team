@@ -140,3 +140,4 @@ class OmniEngineCoreOutputs(EngineCoreOutputs):
     stage_preemption_causes: dict[str, str] = {}
     stage_preemption_progress: dict[str, int] = {}
     stage_preemption_rule_ids: dict[str, str] = {}
+    stage_preemption_recovery_modes: dict[str, str] = {}

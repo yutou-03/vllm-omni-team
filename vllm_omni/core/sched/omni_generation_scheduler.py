@@ -39,6 +39,7 @@ from vllm_omni.profiling.stage_queue_trace import (
     emit_stage_duration_event,
     emit_stage_event,
 )
+from vllm_omni.recovery import PreemptionRecoveryMode
 
 logger = init_logger(__name__)
 
@@ -60,6 +61,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omni_preemption_causes_pending: dict[str, str] = {}
         self._omni_preemption_progress_pending: dict[str, int] = {}
         self._omni_preemption_rule_ids_pending: dict[str, str] = {}
+        self._omni_preemption_recovery_modes_pending: dict[str, str] = {}
         self._omni_cumulative_confirmed_tokens: dict[str, int] = {}
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
@@ -99,6 +101,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if rule_id is not None:
             self._omni_preemption_rule_ids_pending[request.request_id] = str(
                 rule_id
+            )
+        recovery_modes = getattr(
+            self, "_omni_preemption_recovery_modes_pending", None
+        )
+        if recovery_modes is not None:
+            recovery_modes[request.request_id] = (
+                PreemptionRecoveryMode.FULL_PIPELINE_RESTART.value
             )
         if self.chunk_transfer_adapter is not None:
             self.chunk_transfer_adapter.abandon_sender(
@@ -878,10 +887,26 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
                 is not None
             }
+            eco.stage_preemption_recovery_modes = {
+                req_id: getattr(
+                    self,
+                    "_omni_preemption_recovery_modes_pending",
+                    {},
+                ).get(
+                    req_id,
+                    PreemptionRecoveryMode.FULL_PIPELINE_RESTART.value,
+                )
+                for req_id in request_ids
+            }
         for req_id in controlled_preempted_req_ids:
             self._omni_preemption_causes_pending.pop(req_id, None)
             self._omni_preemption_progress_pending.pop(req_id, None)
             self._omni_preemption_rule_ids_pending.pop(req_id, None)
+            getattr(
+                self,
+                "_omni_preemption_recovery_modes_pending",
+                {},
+            ).pop(req_id, None)
         if str(stage_id) == "2":
             for outs in outputs.values():
                 for output in outs:
