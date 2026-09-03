@@ -5,7 +5,7 @@ import pytest
 
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.recovery import OutputDecision
+from vllm_omni.recovery import MessageDropReason, OutputDecision
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -154,3 +154,42 @@ def test_replay_dedup_is_independent_for_text_and_audio(monkeypatch):
     assert orchestrator.output_async_queue.empty()
     assert queued["engine_outputs"] is fresh_audio
     assert state.final_outputs_emitted == {0: 1, 2: 2}
+
+
+def test_retired_and_pre_attempt_stage_outputs_are_classified():
+    orchestrator, state = _runtime()
+    assert state.execution_ledger is not None
+    start = state.execution_ledger.current_stages[0].started_monotonic_s + 1.0
+    state.execution_ledger.begin_full_restart(
+        physical_request_ids={
+            0: "req__execution1",
+            1: "req__execution1",
+            2: "req__execution1",
+        },
+        started_monotonic_s=start,
+    )
+    state.stage_request_ids = {
+        stage_id: "req__execution1" for stage_id in range(3)
+    }
+    orchestrator._physical_to_logical_request_ids["req__execution1"] = "req"
+
+    assert (
+        orchestrator._classify_stage_output(2, "req", start + 1.0)
+        is MessageDropReason.RETIRED_PHYSICAL_REQUEST
+    )
+    assert (
+        orchestrator._classify_stage_output(
+            2,
+            "req__execution1",
+            start - 0.5,
+        )
+        is MessageDropReason.EVENT_BEFORE_ATTEMPT_START
+    )
+    assert (
+        orchestrator._classify_stage_output(
+            2,
+            "req__execution1",
+            start,
+        )
+        is None
+    )
