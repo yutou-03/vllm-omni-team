@@ -1,4 +1,5 @@
 from collections import defaultdict
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,11 @@ def test_chunk_poll_keeps_policy_metadata_when_runtime_payload_replaces_it(
     adapter.request_payload = {}
     adapter.finished_requests = set()
     adapter._finished_load_reqs = set()
+    # The real adapter initializes these fields in OmniTransferAdapterBase.
+    # This focused test bypasses __init__ to avoid starting background threads,
+    # so keep the fixture aligned with the base-class state contract.
+    adapter._drain_state_lock = Lock()
+    adapter._cancelled_load_reqs = set()
 
     request = SimpleNamespace(
         request_id="engine-1",
