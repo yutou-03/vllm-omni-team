@@ -66,7 +66,7 @@ class _Waiting:
                 self.requests.remove(request)
 
 
-def _orchestrator_with_request():
+def _orchestrator_with_request(*, emitted_audio_outputs=7):
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [_Pool(), _Pool(), _Pool(final_output=True)]
     orchestrator.async_chunk = True
@@ -90,7 +90,8 @@ def _orchestrator_with_request():
         current_execution_id="logical",
     )
     state.stage_submit_ts = {0: 1.0, 1: 2.0, 2: 3.0}
-    state.final_outputs_emitted = {2: 7}
+    for _ in range(emitted_audio_outputs):
+        state.classify_and_commit_output(2)
     state.streaming.bridge_states = {"qwen3_omni": {"dirty": True}}
     orchestrator.request_states = {"logical": state}
     orchestrator._physical_to_logical_request_ids = {"logical": "logical"}
@@ -109,7 +110,9 @@ def test_request_state_initializes_explicit_execution_ledger():
 
 
 def test_suppressed_replay_terminal_still_reaches_frontend(monkeypatch):
-    orchestrator, state, _ = _orchestrator_with_request()
+    orchestrator, state, _ = _orchestrator_with_request(
+        emitted_audio_outputs=5
+    )
     orchestrator.output_async_queue = asyncio.Queue()
     orchestrator._cfg_tracker = SimpleNamespace(
         is_companion=lambda _request_id: False,
@@ -119,7 +122,7 @@ def test_suppressed_replay_terminal_still_reaches_frontend(monkeypatch):
     orchestrator._omni_nvtx_s2_route_seen = set()
     state.execution_attempt = 1
     state.current_execution_id = "logical__execution1"
-    state.replay_outputs_to_drop = {2: 5}
+    state.begin_output_replay([2])
     cleanup_calls = []
     events = []
 

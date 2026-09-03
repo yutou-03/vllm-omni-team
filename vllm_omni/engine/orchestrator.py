@@ -39,7 +39,13 @@ from vllm_omni.profiling.nvtx import (
     nvtx_range,
 )
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
-from vllm_omni.recovery import ExecutionLedger, PreemptionRecoveryMode
+from vllm_omni.recovery import (
+    ExecutionLedger,
+    MessageDropReason,
+    OutputCommitLedger,
+    OutputDecision,
+    PreemptionRecoveryMode,
+)
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     merge_scheduling_metadata_into_additional_information,
@@ -291,23 +297,88 @@ class OrchestratorRequestState:
     recovery_preemption_cause: str | None = None
     recovery_controlled_rule_id: str | None = None
     execution_ledger: ExecutionLedger | None = None
+    output_commit_ledger: OutputCommitLedger | None = None
+    output_attempt_sequences: dict[int, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Create the explicit execution ledger for a valid pipeline request."""
 
-        if self.execution_ledger is not None or self.final_stage_id < 0:
+        if self.final_stage_id < 0:
             return
-        initial_physical_id = self.current_execution_id or self.request_id
-        physical_request_ids = {
-            stage_id: self.stage_request_ids.get(stage_id, initial_physical_id)
-            for stage_id in range(self.final_stage_id + 1)
-        }
-        self.execution_ledger = ExecutionLedger.initialize(
-            logical_request_id=self.request_id,
-            final_stage_id=self.final_stage_id,
-            physical_request_ids=physical_request_ids,
-            started_monotonic_s=_time.monotonic(),
+        if self.execution_ledger is None:
+            initial_physical_id = self.current_execution_id or self.request_id
+            physical_request_ids = {
+                stage_id: self.stage_request_ids.get(stage_id, initial_physical_id)
+                for stage_id in range(self.final_stage_id + 1)
+            }
+            self.execution_ledger = ExecutionLedger.initialize(
+                logical_request_id=self.request_id,
+                final_stage_id=self.final_stage_id,
+                physical_request_ids=physical_request_ids,
+                started_monotonic_s=_time.monotonic(),
+            )
+        if self.output_commit_ledger is None:
+            self.output_commit_ledger = OutputCommitLedger.create(
+                self._output_stream_id(stage_id)
+                for stage_id in range(self.final_stage_id + 1)
+            )
+        for stage_id in range(self.final_stage_id + 1):
+            self.output_attempt_sequences.setdefault(stage_id, 0)
+
+    @staticmethod
+    def _output_stream_id(stage_id: int) -> str:
+        return f"stage:{stage_id}"
+
+    def begin_output_replay(self, stage_ids: list[int]) -> None:
+        """Snapshot frontend commits and reset per-attempt output sequences."""
+
+        if self.output_commit_ledger is None:
+            return
+        replay_stream_ids = []
+        for stage_id in dict.fromkeys(stage_ids):
+            stream_id = self._output_stream_id(stage_id)
+            stream_state = self.output_commit_ledger.states[stream_id]
+            emitted = stream_state.committed_sequence + 1
+            self.replay_outputs_to_drop[stage_id] = emitted
+            self.output_attempt_sequences[stage_id] = 0
+            if not stream_state.terminal_committed:
+                replay_stream_ids.append(stream_id)
+        if replay_stream_ids:
+            self.output_commit_ledger.begin_replay(replay_stream_ids)
+
+    def classify_and_commit_output(
+        self,
+        stage_id: int,
+        *,
+        finished: bool = False,
+    ) -> OutputDecision:
+        """Classify the next output from the current stage attempt."""
+
+        if self.output_commit_ledger is None:
+            return OutputDecision.COMMIT
+        sequence = self.output_attempt_sequences.get(stage_id, 0)
+        self.output_attempt_sequences[stage_id] = sequence + 1
+        decision = self.output_commit_ledger.classify_and_commit(
+            self._output_stream_id(stage_id),
+            sequence,
+            finished=finished,
         )
+        if decision in {
+            OutputDecision.DROP_REPLAY_DUPLICATE,
+            OutputDecision.COMMIT_TERMINAL_ONLY,
+        }:
+            self.replay_outputs_to_drop[stage_id] = max(
+                0,
+                self.replay_outputs_to_drop.get(stage_id, 0) - 1,
+            )
+        elif decision is OutputDecision.COMMIT:
+            self.final_outputs_emitted[stage_id] = (
+                self.output_commit_ledger.states[
+                    self._output_stream_id(stage_id)
+                ].committed_sequence
+                + 1
+            )
+        return decision
 
 
 @dataclass
@@ -967,39 +1038,21 @@ class Orchestrator:
                 ),
             )
             if raw_outputs.outputs:
-                physical_to_logical = getattr(
-                    self, "_physical_to_logical_request_ids", {}
-                )
                 kept_outputs = []
                 for eco in raw_outputs.outputs:
                     physical_req_id = getattr(eco, "request_id", None)
-                    logical_req_id = physical_to_logical.get(
-                        physical_req_id, physical_req_id
+                    drop_reason = self._classify_stage_output(
+                        stage_id,
+                        physical_req_id,
+                        float(raw_outputs.timestamp),
                     )
-                    req_state = self.request_states.get(logical_req_id)
-                    current_stage_ref = (
-                        req_state.execution_ledger.current_stages.get(stage_id)
-                        if req_state is not None
-                        and req_state.execution_ledger is not None
-                        else None
-                    )
-                    current_stage_req_id = (
-                        current_stage_ref.physical_request_id
-                        if current_stage_ref is not None
-                        else (
-                            req_state.stage_request_ids.get(stage_id)
-                            if req_state is not None
-                            else None
+                    if drop_reason is not None:
+                        emit_stage_event(
+                            "stage_output_version_rejected",
+                            stage_id=stage_id,
+                            request_id=physical_req_id,
+                            drop_reason=drop_reason.value,
                         )
-                    )
-                    if current_stage_req_id is not None and physical_req_id != current_stage_req_id:
-                        continue
-                    cutoff = (
-                        req_state.discard_stage_outputs_before.get(stage_id)
-                        if req_state is not None
-                        else None
-                    )
-                    if cutoff is not None and float(raw_outputs.timestamp) <= cutoff:
                         continue
                     kept_outputs.append(eco)
                 raw_outputs.outputs = kept_outputs
@@ -1096,6 +1149,39 @@ class Orchestrator:
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+
+    def _classify_stage_output(
+        self,
+        stage_id: int,
+        physical_request_id: str,
+        event_monotonic_s: float,
+    ) -> MessageDropReason | None:
+        """Return why a raw stage output is stale, or ``None`` if current."""
+
+        physical_to_logical = getattr(
+            self,
+            "_physical_to_logical_request_ids",
+            {},
+        )
+        logical_request_id = physical_to_logical.get(
+            physical_request_id,
+            physical_request_id,
+        )
+        req_state = self.request_states.get(logical_request_id)
+        if req_state is None or req_state.execution_ledger is None:
+            return MessageDropReason.UNKNOWN_LOGICAL_REQUEST
+        execution_ledger = req_state.execution_ledger
+        current_stage_ref = execution_ledger.current_stages.get(stage_id)
+        if current_stage_ref is None:
+            return MessageDropReason.INVALID_STAGE
+        return execution_ledger.classify_message(
+            logical_request_id=logical_request_id,
+            pipeline_attempt_id=execution_ledger.pipeline_attempt_id,
+            stage_id=stage_id,
+            stage_attempt_id=current_stage_ref.stage_attempt_id,
+            physical_request_id=physical_request_id,
+            event_monotonic_s=event_monotonic_s,
+        )
 
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
@@ -1217,18 +1303,19 @@ class Orchestrator:
 
                 for affected_stage_id in range(stage_id, final_stage_id + 1):
                     req_state.discard_stage_outputs_before[affected_stage_id] = cutoff
+                replay_stage_ids = [
+                    downstream_stage_id
+                    for downstream_stage_id in range(
+                        stage_id + 1, final_stage_id + 1
+                    )
+                    if self.stage_pools[downstream_stage_id].final_output
+                ]
+                req_state.begin_output_replay(replay_stage_ids)
                 for downstream_stage_id in range(stage_id + 1, final_stage_id + 1):
                     retired_request_id = retired[
                         downstream_stage_id
                     ].physical_request_id
                     downstream_pool = self.stage_pools[downstream_stage_id]
-                    if downstream_pool.final_output:
-                        emitted = req_state.final_outputs_emitted.get(
-                            downstream_stage_id, 0
-                        )
-                        req_state.replay_outputs_to_drop[downstream_stage_id] = (
-                            emitted
-                        )
                     await downstream_pool.abort_requests([retired_request_id])
                     downstream_pool.release_binding(retired_request_id)
                     req_state.stage_submit_ts.pop(downstream_stage_id, None)
@@ -1283,8 +1370,12 @@ class Orchestrator:
             )
 
             final_stage_id = req_state.final_stage_id
-            emitted = req_state.final_outputs_emitted.get(final_stage_id, 0)
-            req_state.replay_outputs_to_drop[final_stage_id] = emitted
+            replay_stage_ids = [
+                pipeline_stage_id
+                for pipeline_stage_id in range(final_stage_id + 1)
+                if self.stage_pools[pipeline_stage_id].final_output
+            ]
+            req_state.begin_output_replay(replay_stage_ids)
             for pipeline_stage_id in range(final_stage_id + 1):
                 req_state.discard_stage_outputs_before[pipeline_stage_id] = cutoff
 
@@ -1541,17 +1632,22 @@ class Orchestrator:
             return
 
         if self.stage_pools[stage_id].final_output:
-            outputs_to_drop = req_state.replay_outputs_to_drop.get(stage_id, 0)
+            output_decision = req_state.classify_and_commit_output(
+                stage_id,
+                finished=bool(finished),
+            )
             terminal_only_output = None
-            if outputs_to_drop > 0:
-                req_state.replay_outputs_to_drop[stage_id] = outputs_to_drop - 1
+            if output_decision in {
+                OutputDecision.DROP_REPLAY_DUPLICATE,
+                OutputDecision.COMMIT_TERMINAL_ONLY,
+            }:
                 emit_stage_event(
                     "stage_replay_output_suppressed",
                     stage_id=stage_id,
                     request_id=req_id,
                     remaining=req_state.replay_outputs_to_drop[stage_id],
                 )
-                if finished:
+                if output_decision is OutputDecision.COMMIT_TERMINAL_ONLY:
                     # The replay may finish before reproducing every output that
                     # the retired execution already sent.  Suppressing its final
                     # output in that case also suppresses the frontend completion
@@ -1580,9 +1676,12 @@ class Orchestrator:
                             req_state.replay_outputs_to_drop[stage_id]
                         ),
                     )
-            else:
-                req_state.final_outputs_emitted[stage_id] = (
-                    req_state.final_outputs_emitted.get(stage_id, 0) + 1
+            elif output_decision is not OutputDecision.COMMIT:
+                emit_stage_event(
+                    "stage_output_commit_rejected",
+                    stage_id=stage_id,
+                    request_id=req_id,
+                    output_decision=output_decision.value,
                 )
             queue_payload = {
                 "type": "output",
@@ -1596,7 +1695,7 @@ class Orchestrator:
             }
             if terminal_only_output is not None:
                 await self.output_async_queue.put(queue_payload)
-            elif outputs_to_drop > 0:
+            elif output_decision is not OutputDecision.COMMIT:
                 pass
             elif stage_id == 2 and req_id not in self._omni_nvtx_s2_route_seen:
                 self._omni_nvtx_s2_route_seen.add(req_id)

@@ -61,7 +61,8 @@ def _orchestrator_with_request():
         current_execution_id="logical",
     )
     state.stage_submit_ts = {0: 1.0, 1: 2.0, 2: 3.0}
-    state.final_outputs_emitted = {2: 7}
+    for _ in range(7):
+        state.classify_and_commit_output(2)
     orchestrator.request_states = {"logical": state}
     orchestrator._physical_to_logical_request_ids = {"logical": "logical"}
     return orchestrator, state, template
