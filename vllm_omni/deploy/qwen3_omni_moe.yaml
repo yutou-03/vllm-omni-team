@@ -13,6 +13,13 @@
 #     cudagraph support differs.
 async_chunk: true
 
+slo_scheduling:
+  enabled: false
+  mode: native
+  recovery:
+    mode: full_pipeline_restart
+    allowed_modes: [full_pipeline_restart]
+
 connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector

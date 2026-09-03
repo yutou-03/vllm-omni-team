@@ -55,7 +55,10 @@ def test_disabled_master_switch_forces_baseline_recovery():
             "mode": "adaptive_recovery",
             "recovery": {
                 "mode": "stage_local_recompute",
-                "allowed_modes": ["stage_local_recompute"],
+                "allowed_modes": [
+                    "full_pipeline_restart",
+                    "stage_local_recompute",
+                ],
             },
         }
     )
@@ -82,6 +85,10 @@ def test_disabled_master_switch_forces_baseline_recovery():
         (
             {"recovery": {"allowed_modes": []}},
             "allowed_modes must not be empty",
+        ),
+        (
+            {"recovery": {"allowed_modes": ["stage_local_recompute"]}},
+            "must include full_pipeline_restart",
         ),
     ],
 )
@@ -128,7 +135,10 @@ def test_vllm_config_resolves_typed_recovery_mode():
                 "mode": "adaptive_recovery",
                 "recovery": {
                     "mode": "stage_local_recompute",
-                    "allowed_modes": ["stage_local_recompute"],
+                    "allowed_modes": [
+                        "full_pipeline_restart",
+                        "stage_local_recompute",
+                    ],
                 },
             }
         }

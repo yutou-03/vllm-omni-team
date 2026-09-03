@@ -14,6 +14,13 @@
 #     routing is handled by StagePool with request-level affinity.
 async_chunk: true
 
+slo_scheduling:
+  enabled: false
+  mode: native
+  recovery:
+    mode: full_pipeline_restart
+    allowed_modes: [full_pipeline_restart]
+
 connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector

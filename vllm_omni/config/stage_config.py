@@ -18,6 +18,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.scheduling.config import SloSchedulingConfig
 
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "model_executor" / "models"
 
@@ -461,6 +462,9 @@ class DeployConfig:
     platforms: dict[str, Any] | None = None
     # Overrides the auto-detected pipeline registry key for structural variants.
     pipeline: str | None = None
+    slo_scheduling: SloSchedulingConfig = field(
+        default_factory=SloSchedulingConfig
+    )
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool | None = None
@@ -616,6 +620,9 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
+        "slo_scheduling": SloSchedulingConfig.from_mapping(
+            raw_dict.get("slo_scheduling")
+        ),
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
@@ -788,6 +795,9 @@ def _build_engine_args(
     engine_args["async_chunk"] = bool(deploy.async_chunk)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
+    additional_config = dict(engine_args.get("additional_config") or {})
+    additional_config["slo_scheduling"] = deploy.slo_scheduling.to_dict()
+    engine_args["additional_config"] = additional_config
     return engine_args
 
 

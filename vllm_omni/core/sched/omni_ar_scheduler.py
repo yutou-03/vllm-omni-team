@@ -32,6 +32,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 from vllm_omni.recovery import PreemptionRecoveryMode
+from vllm_omni.scheduling.config import effective_preemption_recovery_mode
 from vllm_omni.scheduling.policy import request_scheduling_metadata
 
 logger = init_logger(__name__)
@@ -138,13 +139,15 @@ def _load_slo_active_preemption_config() -> tuple[bool, set[int], float, bool]:
     return enabled, stages, guard_ms, trace_enabled
 
 
-def _load_preemption_recovery_mode() -> PreemptionRecoveryMode:
+def _load_preemption_recovery_mode(
+    vllm_config: Any | None = None,
+) -> PreemptionRecoveryMode:
     """Load the recovery policy, preserving full restart as the default."""
 
-    raw_mode = os.environ.get(
-        _PREEMPTION_RECOVERY_MODE_ENV,
-        PreemptionRecoveryMode.FULL_PIPELINE_RESTART.value,
-    ).strip().lower()
+    raw_override = os.environ.get(_PREEMPTION_RECOVERY_MODE_ENV)
+    if raw_override is None:
+        return effective_preemption_recovery_mode(vllm_config)
+    raw_mode = raw_override.strip().lower()
     try:
         return PreemptionRecoveryMode(raw_mode)
     except ValueError as error:
@@ -213,7 +216,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omni_preemption_progress_pending: dict[str, int] = {}
         self._omni_preemption_rule_ids_pending: dict[str, str] = {}
         self._omni_preemption_recovery_modes_pending: dict[str, str] = {}
-        self._preemption_recovery_mode = _load_preemption_recovery_mode()
+        self._preemption_recovery_mode = _load_preemption_recovery_mode(
+            self.vllm_config
+        )
         (
             self._slo_active_preemption_enabled,
             self._slo_active_preemption_stages,
