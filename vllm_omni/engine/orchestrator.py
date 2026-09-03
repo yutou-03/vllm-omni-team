@@ -39,6 +39,7 @@ from vllm_omni.profiling.nvtx import (
     nvtx_range,
 )
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
+from vllm_omni.recovery.execution import ExecutionLedger
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     merge_scheduling_metadata_into_additional_information,
@@ -289,6 +290,24 @@ class OrchestratorRequestState:
     recovery_target_progress: int | None = None
     recovery_preemption_cause: str | None = None
     recovery_controlled_rule_id: str | None = None
+    execution_ledger: ExecutionLedger | None = None
+
+    def __post_init__(self) -> None:
+        """Create the explicit execution ledger for a valid pipeline request."""
+
+        if self.execution_ledger is not None or self.final_stage_id < 0:
+            return
+        initial_physical_id = self.current_execution_id or self.request_id
+        physical_request_ids = {
+            stage_id: self.stage_request_ids.get(stage_id, initial_physical_id)
+            for stage_id in range(self.final_stage_id + 1)
+        }
+        self.execution_ledger = ExecutionLedger.initialize(
+            logical_request_id=self.request_id,
+            final_stage_id=self.final_stage_id,
+            physical_request_ids=physical_request_ids,
+            started_monotonic_s=_time.monotonic(),
+        )
 
 
 @dataclass
@@ -950,10 +969,20 @@ class Orchestrator:
                         physical_req_id, physical_req_id
                     )
                     req_state = self.request_states.get(logical_req_id)
-                    current_stage_req_id = (
-                        req_state.stage_request_ids.get(stage_id)
+                    current_stage_ref = (
+                        req_state.execution_ledger.current_stages.get(stage_id)
                         if req_state is not None
+                        and req_state.execution_ledger is not None
                         else None
+                    )
+                    current_stage_req_id = (
+                        current_stage_ref.physical_request_id
+                        if current_stage_ref is not None
+                        else (
+                            req_state.stage_request_ids.get(stage_id)
+                            if req_state is not None
+                            else None
+                        )
                     )
                     if current_stage_req_id is not None and physical_req_id != current_stage_req_id:
                         continue
@@ -1098,15 +1127,28 @@ class Orchestrator:
             req_state = self.request_states.get(request_id)
             if req_state is None:
                 continue
-            if physical_request_id != req_state.stage_request_ids.get(stage_id, request_id):
+            execution_ledger = req_state.execution_ledger
+            current_stage_ref = (
+                execution_ledger.current_stages.get(stage_id)
+                if execution_ledger is not None
+                else None
+            )
+            current_stage_request_id = (
+                current_stage_ref.physical_request_id
+                if current_stage_ref is not None
+                else req_state.stage_request_ids.get(stage_id, request_id)
+            )
+            if physical_request_id != current_stage_request_id:
                 # A delayed preemption envelope from a retired execution.
                 continue
 
-            req_state.execution_attempt += 1
-            old_execution_id = req_state.current_execution_id or physical_request_id
-            new_execution_id = (
-                f"{request_id}__execution{req_state.execution_attempt}"
+            next_execution_attempt = (
+                execution_ledger.pipeline_attempt_id + 1
+                if execution_ledger is not None
+                else req_state.execution_attempt + 1
             )
+            old_execution_id = req_state.current_execution_id or physical_request_id
+            new_execution_id = f"{request_id}__execution{next_execution_attempt}"
             cutoff = _time.monotonic()
             preemption_cause = (preemption_causes or {}).get(
                 physical_request_id, "allocation_failure"
@@ -1125,7 +1167,14 @@ class Orchestrator:
                 req_state.discard_stage_outputs_before[pipeline_stage_id] = cutoff
 
             old_stage_request_ids = list(
-                dict.fromkeys(req_state.stage_request_ids.values())
+                dict.fromkeys(
+                    (
+                        ref.physical_request_id
+                        for ref in execution_ledger.current_stages.values()
+                    )
+                    if execution_ledger is not None
+                    else req_state.stage_request_ids.values()
+                )
             )
             await self._abort_request_ids(old_stage_request_ids)
             self._release_request_bindings(old_stage_request_ids)
@@ -1138,10 +1187,25 @@ class Orchestrator:
             req_state.streaming.new_prompt_len_snapshot = None
             req_state.pd_prefill_multimodal_output = None
             req_state.stage_submit_ts.clear()
-            req_state.stage_request_ids = {
+            next_stage_request_ids = {
                 pipeline_stage_id: new_execution_id
                 for pipeline_stage_id in range(final_stage_id + 1)
             }
+            if execution_ledger is not None:
+                execution_ledger.begin_full_restart(
+                    physical_request_ids=next_stage_request_ids,
+                    started_monotonic_s=cutoff,
+                )
+                req_state.execution_attempt = execution_ledger.pipeline_attempt_id
+                req_state.stage_request_ids = {
+                    pipeline_stage_id: ref.physical_request_id
+                    for pipeline_stage_id, ref in (
+                        execution_ledger.current_stages.items()
+                    )
+                }
+            else:
+                req_state.execution_attempt = next_execution_attempt
+                req_state.stage_request_ids = next_stage_request_ids
             req_state.current_execution_id = new_execution_id
             req_state.recovery_target_stage_id = stage_id
             req_state.recovery_target_progress = discarded_progress
@@ -1255,10 +1319,19 @@ class Orchestrator:
             return
 
         physical_request_ids = list(request_ids)
-        logical_request_ids = set(request_ids)
         physical_to_logical = getattr(
             self, "_physical_to_logical_request_ids", {}
         )
+        logical_request_ids = {
+            physical_to_logical.get(request_id, request_id)
+            for request_id in request_ids
+        }
+        for logical_request_id in logical_request_ids:
+            req_state = self.request_states.get(logical_request_id)
+            if req_state is not None and req_state.execution_ledger is not None:
+                physical_request_ids.extend(
+                    req_state.execution_ledger.cleanup_physical_request_ids()
+                )
         for physical_id, logical_id in physical_to_logical.items():
             if logical_id in logical_request_ids:
                 physical_request_ids.append(physical_id)
@@ -1271,7 +1344,7 @@ class Orchestrator:
         if abort or has_recovery_attempts:
             await self._abort_request_ids(physical_request_ids)
         self._release_request_bindings(physical_request_ids)
-        for request_id in request_ids:
+        for request_id in logical_request_ids:
             self._pd_kv_params.pop(request_id, None)
             getattr(self, "_omni_nvtx_s2_raw_output_seen", set()).discard(request_id)
             getattr(self, "_omni_nvtx_s2_route_seen", set()).discard(request_id)
