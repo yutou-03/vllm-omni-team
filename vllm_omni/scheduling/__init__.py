@@ -1,7 +1,15 @@
 """Scheduling contracts shared by benchmark and serving components."""
 
+from vllm_omni.scheduling.contracts import (
+    RequestPath,
+    RequestSLOContract,
+    SLOMilestone,
+)
+
 from vllm_omni.scheduling.metadata import (
     CLIENT_SCHEDULING_FIELD,
+    CURRENT_SCHEDULING_SCHEMA_VERSION,
+    LEGACY_SCHEDULING_SCHEMA_VERSION,
     SCHEDULING_SCHEMA_VERSION,
     build_client_scheduling_metadata,
     build_server_scheduling_metadata,
@@ -27,6 +35,11 @@ from vllm_omni.scheduling.request_queue import (
 
 __all__ = [
     "CLIENT_SCHEDULING_FIELD",
+    "CURRENT_SCHEDULING_SCHEMA_VERSION",
+    "LEGACY_SCHEDULING_SCHEMA_VERSION",
+    "RequestPath",
+    "RequestSLOContract",
+    "SLOMilestone",
     "SCHEDULING_SCHEMA_VERSION",
     "BASELINE_POLICY_ENV",
     "BaselineSchedulingPolicy",

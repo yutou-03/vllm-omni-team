@@ -12,11 +12,21 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from vllm_omni.scheduling.contracts import (
+    RequestPath,
+    RequestSLOContract,
+    SLOMilestone,
+    normalize_milestone_values,
+)
+
 CLIENT_SCHEDULING_FIELD = "omni_scheduling"
-SCHEDULING_SCHEMA_VERSION = 1
+LEGACY_SCHEDULING_SCHEMA_VERSION = 1
+CURRENT_SCHEDULING_SCHEMA_VERSION = 2
+# Kept for callers which intentionally build the legacy benchmark contract.
+SCHEDULING_SCHEMA_VERSION = LEGACY_SCHEDULING_SCHEMA_VERSION
 NUM_BASELINE_STAGES = 3
 
-_CLIENT_FIELDS = frozenset(
+_CLIENT_FIELDS_V1 = frozenset(
     {
         "schema_version",
         "source_request_id",
@@ -25,6 +35,19 @@ _CLIENT_FIELDS = frozenset(
         "request_path",
         "predicted_stage_ms",
         "predicted_stage_work_units",
+    }
+)
+_CLIENT_FIELDS_V2 = frozenset(
+    {
+        "schema_version",
+        "source_request_id",
+        "ingress_order",
+        "request_path",
+        "service_class",
+        "milestone_slo_ms",
+        "text_consume_rate_tps",
+        "audio_consume_rate",
+        "max_preemptions",
     }
 )
 _REQUEST_PATHS = frozenset({"text", "audio"})
@@ -41,6 +64,12 @@ _SERVER_FIELDS = frozenset(
         "sched_request_path",
         "sched_predicted_stage_ms",
         "sched_predicted_stage_work_units",
+        "sched_logical_request_id",
+        "sched_service_class",
+        "sched_milestone_deadlines_monotonic_s",
+        "sched_text_consume_rate_tps",
+        "sched_audio_consume_rate",
+        "sched_max_preemptions",
     }
 )
 
@@ -129,25 +158,41 @@ def normalize_client_scheduling_metadata(
     *,
     context: str = CLIENT_SCHEDULING_FIELD,
 ) -> dict[str, Any]:
-    """Validate and normalize the version-1 client scheduling contract."""
+    """Validate and normalize a supported client scheduling contract."""
 
     if not isinstance(raw_metadata, Mapping):
         raise ValueError(f"{context} must be an object")
-    unknown_fields = set(raw_metadata) - _CLIENT_FIELDS
-    if unknown_fields:
-        raise ValueError(
-            f"{context}: unknown fields {sorted(unknown_fields)!r}"
-        )
 
     schema_version = _nonnegative_int(
         raw_metadata.get("schema_version"),
         field="schema_version",
         context=context,
     )
-    if schema_version != SCHEDULING_SCHEMA_VERSION:
+    if schema_version not in {
+        LEGACY_SCHEDULING_SCHEMA_VERSION,
+        CURRENT_SCHEDULING_SCHEMA_VERSION,
+    }:
         raise ValueError(
             f"{context}: unsupported schema_version {schema_version}; "
-            f"expected {SCHEDULING_SCHEMA_VERSION}"
+            "expected one of "
+            f"{[LEGACY_SCHEDULING_SCHEMA_VERSION, CURRENT_SCHEDULING_SCHEMA_VERSION]}"
+        )
+
+    allowed_fields = (
+        _CLIENT_FIELDS_V1
+        if schema_version == LEGACY_SCHEDULING_SCHEMA_VERSION
+        else _CLIENT_FIELDS_V2
+    )
+    unknown_fields = set(raw_metadata) - allowed_fields
+    if unknown_fields:
+        raise ValueError(
+            f"{context}: unknown fields {sorted(unknown_fields)!r}"
+        )
+
+    if schema_version == CURRENT_SCHEDULING_SCHEMA_VERSION:
+        return _normalize_client_scheduling_metadata_v2(
+            raw_metadata,
+            context=context,
         )
 
     if "source_request_id" not in raw_metadata:
@@ -222,6 +267,74 @@ def normalize_client_scheduling_metadata(
     return normalized
 
 
+def _normalize_client_scheduling_metadata_v2(
+    raw_metadata: Mapping[str, Any],
+    *,
+    context: str,
+) -> dict[str, Any]:
+    required = (
+        "source_request_id",
+        "ingress_order",
+        "request_path",
+        "service_class",
+        "milestone_slo_ms",
+        "max_preemptions",
+    )
+    for field in required:
+        if field not in raw_metadata:
+            raise ValueError(f"{context}: missing {field}")
+
+    source_request_id = str(raw_metadata["source_request_id"])
+    if not source_request_id.strip():
+        raise ValueError(f"{context}: source_request_id must not be empty")
+    ingress_order = _nonnegative_int(
+        raw_metadata["ingress_order"],
+        field="ingress_order",
+        context=context,
+    )
+    try:
+        request_path = RequestPath(str(raw_metadata["request_path"]).lower())
+    except ValueError as error:
+        raise ValueError(
+            f"{context}: request_path must be one of {sorted(_REQUEST_PATHS)!r}"
+        ) from error
+    service_class = str(raw_metadata["service_class"])
+    if not service_class.strip():
+        raise ValueError(f"{context}: service_class must not be empty")
+
+    milestone_values = normalize_milestone_values(
+        raw_metadata["milestone_slo_ms"],
+        request_path=request_path,
+        field_name=f"{context}.milestone_slo_ms",
+    )
+    max_preemptions = _nonnegative_int(
+        raw_metadata["max_preemptions"],
+        field="max_preemptions",
+        context=context,
+    )
+    normalized: dict[str, Any] = {
+        "schema_version": CURRENT_SCHEDULING_SCHEMA_VERSION,
+        "source_request_id": source_request_id,
+        "ingress_order": ingress_order,
+        "request_path": request_path.value,
+        "service_class": service_class,
+        "milestone_slo_ms": {
+            milestone.value: value
+            for milestone, value in milestone_values.items()
+        },
+        "max_preemptions": max_preemptions,
+    }
+    for field in ("text_consume_rate_tps", "audio_consume_rate"):
+        raw_rate = raw_metadata.get(field)
+        if raw_rate is None:
+            continue
+        rate = _finite_number(raw_rate, field=field, context=context)
+        if rate <= 0:
+            raise ValueError(f"{context}: {field} must be positive")
+        normalized[field] = rate
+    return normalized
+
+
 def build_client_scheduling_metadata(
     *,
     source_request_id: str,
@@ -261,6 +374,7 @@ def build_server_scheduling_metadata(
     *,
     ingress_monotonic_s: float,
     ingress_wall_s: float,
+    logical_request_id: str | None = None,
     context: str = CLIENT_SCHEDULING_FIELD,
 ) -> dict[str, Any]:
     """Validate client metadata and add server-owned ingress timestamps.
@@ -296,6 +410,39 @@ def build_server_scheduling_metadata(
         "sched_ingress_monotonic_s": monotonic_s,
         "sched_ingress_wall_s": wall_s,
     }
+    if normalized["schema_version"] == CURRENT_SCHEDULING_SCHEMA_VERSION:
+        milestone_deadlines = {
+            milestone: monotonic_s + relative_ms / 1000.0
+            for milestone, relative_ms in normalize_milestone_values(
+                normalized["milestone_slo_ms"],
+                request_path=normalized["request_path"],
+                field_name=f"{context}.milestone_slo_ms",
+            ).items()
+        }
+        contract = RequestSLOContract(
+            schema_version=CURRENT_SCHEDULING_SCHEMA_VERSION,
+            logical_request_id=(
+                logical_request_id or normalized["source_request_id"]
+            ),
+            ingress_monotonic_s=monotonic_s,
+            request_path=normalized["request_path"],
+            service_class=normalized["service_class"],
+            milestone_deadlines_s=milestone_deadlines,
+            text_consume_rate_tps=normalized.get("text_consume_rate_tps"),
+            audio_consume_rate=normalized.get("audio_consume_rate"),
+            max_preemptions=normalized["max_preemptions"],
+        )
+        server_metadata.update(contract.to_server_metadata())
+        server_metadata["sched_ingress_wall_s"] = wall_s
+        server_metadata["sched_source_request_id"] = normalized[
+            "source_request_id"
+        ]
+        server_metadata["sched_ingress_order"] = normalized["ingress_order"]
+        server_metadata["sched_deadline_monotonic_s"] = (
+            contract.milestone_deadlines_s[SLOMilestone.E2E]
+        )
+        return server_metadata
+
     for field in (
         "slo_ms",
         "request_path",
