@@ -369,20 +369,28 @@ def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
             sample_age_ms=5.0,
         )
     )
-    now = 100.0
+    now = 101.0
     at_risk = _set_stage_ddl_metadata(
         FakeRequest("at-risk", deadline=None),
         ingress_order=0,
-        ttft=99.0,
-        e2e=101.0,
+        ttft=100.1,
+        e2e=101.1,
     )
+    at_risk.additional_information["meta"]["sched_request_path"] = "audio"
+    at_risk.additional_information["meta"][
+        "sched_milestone_deadlines_monotonic_s"
+    ]["ttfp"] = 100.1
     at_risk.status = SimpleNamespace(name="RUNNING")
     safe = _set_stage_ddl_metadata(
         FakeRequest("safe", deadline=None),
         ingress_order=1,
-        ttft=99.0,
-        e2e=101.0,
+        ttft=100.1,
+        e2e=101.1,
     )
+    safe.additional_information["meta"]["sched_request_path"] = "audio"
+    safe.additional_information["meta"][
+        "sched_milestone_deadlines_monotonic_s"
+    ]["ttfp"] = 100.1
     safe.status = SimpleNamespace(name="RUNNING")
     scheduler.running = [at_risk, safe]
     scheduler._update_slo_downstream_pressure(

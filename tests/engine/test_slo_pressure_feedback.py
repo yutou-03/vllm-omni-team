@@ -8,6 +8,7 @@ import pytest
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+from vllm_omni.scheduling.config import SloSchedulingMode
 
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -100,6 +101,32 @@ def _feedback_orchestrator(clients: list[_FeedbackClient]) -> Orchestrator:
     ]
     orchestrator._slo_feedback_last_sample_by_edge = {}
     return orchestrator
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        SloSchedulingMode.STAGE_DDL_FIXED,
+        SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
+    ],
+)
+def test_orchestrator_enables_feedback_for_pressure_consuming_modes(
+    monkeypatch,
+    mode,
+):
+    monkeypatch.setattr(
+        "vllm_omni.engine.orchestrator.extract_slo_scheduling_config",
+        lambda config: config,
+    )
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        SimpleNamespace(
+            stage_vllm_config=SimpleNamespace(enabled=True, mode=mode)
+        ),
+        SimpleNamespace(stage_vllm_config=None),
+    ]
+
+    assert orchestrator._slo_downstream_feedback_enabled() is True
 
 
 @pytest.mark.asyncio
