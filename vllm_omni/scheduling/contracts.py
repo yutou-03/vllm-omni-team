@@ -300,8 +300,10 @@ class StageRuntimeSnapshot:
     last_admission_rejection: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("StageRuntimeSnapshot schema_version must be 1")
+        if self.schema_version not in {1, 2}:
+            raise ValueError(
+                "StageRuntimeSnapshot schema_version must be 1 or 2"
+            )
         for field_name in (
             "stage_id",
             "control_epoch",
@@ -388,6 +390,10 @@ class StageRuntimeSnapshot:
             "token_budget_available": self.token_budget_available,
             "captured_monotonic_s": self.captured_monotonic_s,
         }
+        if self.schema_version == 2:
+            fields["request_count_semantics"] = (
+                "runnable_excludes_input_blocked"
+            )
         for field_name in (
             "kv_cache_usage_ratio",
             "gpu_active_ratio",

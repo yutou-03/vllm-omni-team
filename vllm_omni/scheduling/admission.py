@@ -357,6 +357,10 @@ def decide_admission_cap(
 ) -> AdmissionDecision:
     """Return one fail-closed AIMD cap decision without scheduler mutation."""
 
+    if snapshot.schema_version != 2:
+        raise ValueError(
+            "dynamic admission requires pressure schema version 2"
+        )
     if (
         state.last_observed_epoch is not None
         and snapshot.control_epoch <= state.last_observed_epoch
@@ -477,4 +481,3 @@ def replay_admission_trace(
         decisions.append(decision)
         state = decision.next_state
     return tuple(decisions)
-

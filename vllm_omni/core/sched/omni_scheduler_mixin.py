@@ -398,7 +398,7 @@ class OmniSchedulerMixin:
         )
         kv_cache_manager = getattr(self, "kv_cache_manager", None)
         return StageRuntimeSnapshot(
-            schema_version=1,
+            schema_version=2,
             stage_id=int(self._omni_stage_id_for_trace()),
             captured_monotonic_s=(
                 time.monotonic()
