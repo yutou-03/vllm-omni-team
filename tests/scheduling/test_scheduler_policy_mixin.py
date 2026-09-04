@@ -712,8 +712,63 @@ def test_iteration_trace_carries_immutable_stage_pressure_snapshot(monkeypatch):
         "effective_max_num_seqs": 8,
         "token_budget_total": 4096,
         "token_budget_available": 3968,
+        "token_budget_utilization_ratio": 0.03125,
         "kv_cache_usage_ratio": 0.75,
     }
+
+
+def test_profiled_pressure_tracks_queue_growth_and_running_deadline_risk(
+    monkeypatch,
+):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *_args, **_kwargs: FakeMilestoneModel(),
+    )
+    scheduler = SchedulerHarness(0, additional_config=_stage_ddl_config())
+    scheduler.max_num_running_reqs = 2
+    scheduler.effective_max_num_seqs = 2
+    scheduler.max_num_scheduled_tokens = 100
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.25)
+    at_risk = _set_stage_ddl_metadata(
+        FakeRequest("at-risk", deadline=None),
+        ingress_order=0,
+        ttft=100.05,
+        e2e=100.4,
+    )
+    safe = _set_stage_ddl_metadata(
+        FakeRequest("safe", deadline=None),
+        ingress_order=1,
+        ttft=102.0,
+        e2e=103.0,
+    )
+    at_risk.status = SimpleNamespace(name="RUNNING")
+    safe.status = SimpleNamespace(name="RUNNING")
+    scheduler.running = [at_risk, safe]
+    scheduler.waiting.add_request(FakeRequest("waiting-1", deadline=None))
+    scheduler._stage_ddl_tick_monotonic_s = 100.0
+    scheduler._stage_ddl_snapshot_by_request.clear()
+
+    first = scheduler._capture_stage_runtime_snapshot(
+        captured_monotonic_s=100.0,
+        token_budget_available=75,
+        update_control_signals=True,
+    )
+    scheduler.waiting.add_request(FakeRequest("waiting-2", deadline=None))
+    second = scheduler._capture_stage_runtime_snapshot(
+        captured_monotonic_s=100.5,
+        token_budget_available=50,
+        update_control_signals=True,
+    )
+
+    assert first["token_budget_utilization_ratio"] == 0.25
+    assert "queue_growth_rate_rps" not in first
+    assert first["deadline_miss_risk"] == 0.5
+    assert first["deadline_miss_risk_population"] == 2
+    assert first["deadline_miss_risk_scope"] == "runnable_running"
+    assert second["token_budget_utilization_ratio"] == 0.5
+    assert second["queue_growth_rate_rps"] == pytest.approx(2.0)
 
 
 def test_pressure_snapshot_excludes_input_blocked_requests_from_active_counts():
