@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import pytest
 
+from vllm_omni.scheduling.contracts import RequestSLOContract
+from vllm_omni.scheduling.deadline import (
+    MilestoneCostEstimate,
+    derive_stage_deadline_snapshot,
+)
 from vllm_omni.scheduling.policy import (
     BASELINE_POLICY_ENV,
     BaselineSchedulingPolicy,
@@ -45,6 +50,42 @@ def _scheduling(
         "sched_predicted_stage_ms": [100.0, 200.0, 300.0],
         "sched_predicted_stage_work_units": [10.0, 20.0, 30.0],
     }
+
+
+def _stage_ddl_request(request_id: str, ingress_order: int, ttft: float, e2e: float):
+    scheduling = {
+        "sched_schema_version": 2,
+        "sched_source_request_id": f"source-{request_id}",
+        "sched_ingress_order": ingress_order,
+        "sched_logical_request_id": request_id,
+        "sched_ingress_monotonic_s": 100.0,
+        "sched_request_path": "text",
+        "sched_service_class": "interactive",
+        "sched_milestone_deadlines_monotonic_s": {
+            "ttft": ttft,
+            "e2e": e2e,
+        },
+        "sched_max_preemptions": 1,
+    }
+    return FakeRequest(request_id, scheduling)
+
+
+def _stage_ddl_snapshot(request, *, ttft_cost_ms, e2e_cost_ms):
+    contract = RequestSLOContract.from_server_metadata(
+        request.additional_information["meta"]
+    )
+    return derive_stage_deadline_snapshot(
+        contract,
+        stage_id=0,
+        captured_monotonic_s=100.5,
+        milestone_costs={
+            "ttft": MilestoneCostEstimate(ttft_cost_ms),
+            "e2e": MilestoneCostEstimate(e2e_cost_ms),
+        },
+        deadline_version=1,
+        cost_model_version="static-v1",
+        cost_source="static_p95",
+    )
 
 
 def test_policy_environment_defaults_to_native_fcfs():
@@ -143,6 +184,58 @@ def test_stage_deadline_edf_can_reverse_final_deadline_order_upstream():
 
     assert final_order == [earlier_final, earlier_stage]
     assert stage_order == [earlier_stage, earlier_final]
+
+
+def test_multi_milestone_stage_ddl_orders_by_base_laxity_not_final_deadline():
+    earlier_final = _stage_ddl_request("final-first", 0, 102.0, 104.0)
+    tighter_ttft = _stage_ddl_request("ttft-first", 1, 101.0, 110.0)
+    snapshots = {
+        earlier_final.request_id: _stage_ddl_snapshot(
+            earlier_final, ttft_cost_ms=100.0, e2e_cost_ms=500.0
+        ),
+        tighter_ttft.request_id: _stage_ddl_snapshot(
+            tighter_ttft, ttft_cost_ms=700.0, e2e_cost_ms=500.0
+        ),
+    }
+
+    ordered = sorted(
+        [earlier_final, tighter_ttft],
+        key=lambda request: policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.STAGE_DDL_FIXED,
+            stage_id=0,
+            data_ready_time=100.0,
+            now=100.5,
+            stage_deadline_snapshot=snapshots[request.request_id],
+        ),
+    )
+
+    assert ordered == [tighter_ttft, earlier_final]
+
+
+def test_stage_ddl_key_requires_matching_frozen_snapshot():
+    request = _stage_ddl_request("request-a", 0, 101.0, 105.0)
+    with pytest.raises(SchedulingMetadataError, match="requires a frozen snapshot"):
+        policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.STAGE_DDL_FIXED,
+            stage_id=0,
+            data_ready_time=100.0,
+            now=100.5,
+        )
+
+    other = _stage_ddl_request("other", 1, 101.0, 105.0)
+    with pytest.raises(SchedulingMetadataError, match="snapshot identity"):
+        policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.STAGE_DDL_FIXED,
+            stage_id=0,
+            data_ready_time=100.0,
+            now=100.5,
+            stage_deadline_snapshot=_stage_ddl_snapshot(
+                other, ttft_cost_ms=100.0, e2e_cost_ms=500.0
+            ),
+        )
 
 
 def test_srpf_uses_sarathi_style_local_remaining_prefill_tokens():
