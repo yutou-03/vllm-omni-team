@@ -121,6 +121,9 @@ class OmniSchedulerMixin:
         self._omni_request_trace_fields_by_request: dict[
             str, dict[str, Any]
         ] = {}
+        self._omni_stage_cost_features_by_request: dict[
+            str, dict[str, Any]
+        ] = {}
         self._omni_reentered_recovery_requests: set[str] = set()
         self._omni_first_recovery_progress_seen: set[str] = set()
         self._omni_recovery_catchup_seen: set[str] = set()
@@ -189,14 +192,93 @@ class OmniSchedulerMixin:
         trace_fields = self._omni_request_trace_fields_by_request.get(
             request_id, {}
         )
+        pressure_snapshot = None
+        stage_cost_features = None
+        if stage_trace_enabled():
+            pressure_snapshot = self._capture_stage_runtime_snapshot(
+                captured_monotonic_s=ready_time,
+            )
+            request = getattr(self, "requests", {}).get(request_id)
+            if request is not None:
+                stage_cost_features = self._request_stage_cost_features(
+                    request
+                )
+            else:
+                stage_cost_features = (
+                    self._omni_stage_cost_features_by_request.get(request_id)
+                )
         emit_stage_event(
             "stage_data_ready",
             stage_id=self._baseline_stage_id,
             request_id=request_id,
             data_ready_monotonic_s=ready_time,
             stage_ready_order=ready_order,
+            pressure_snapshot=pressure_snapshot,
+            stage_cost_features=stage_cost_features,
             **trace_fields,
         )
+
+    @staticmethod
+    def _request_stage_cost_features(request: Request) -> dict[str, Any]:
+        max_output_tokens = getattr(request, "max_tokens", None)
+        return {
+            "feature_schema_version": 1,
+            "num_prompt_tokens": int(request.num_prompt_tokens),
+            "max_output_tokens": (
+                None
+                if max_output_tokens is None
+                else int(max_output_tokens)
+            ),
+            "num_computed_tokens": int(request.num_computed_tokens),
+            "num_output_placeholders": int(
+                getattr(request, "num_output_placeholders", 0)
+            ),
+            "candidate_sequence_demand": 1,
+        }
+
+    def _capture_stage_runtime_snapshot(
+        self,
+        *,
+        captured_monotonic_s: float | None = None,
+        token_budget_available: int | None = None,
+    ) -> dict[str, Any]:
+        physical_cap = int(
+            getattr(self, "max_num_running_reqs", len(self.running))
+        )
+        effective_cap = int(
+            getattr(self, "effective_max_num_seqs", physical_cap)
+        )
+        total_token_budget = int(
+            getattr(self, "max_num_scheduled_tokens", 0)
+        )
+        available_token_budget = (
+            total_token_budget
+            if token_budget_available is None
+            else int(token_budget_available)
+        )
+        kv_cache_manager = getattr(self, "kv_cache_manager", None)
+        return StageRuntimeSnapshot(
+            schema_version=1,
+            stage_id=int(self._omni_stage_id_for_trace()),
+            captured_monotonic_s=(
+                time.monotonic()
+                if captured_monotonic_s is None
+                else captured_monotonic_s
+            ),
+            control_epoch=int(getattr(self, "_slo_control_epoch", 0)),
+            running_requests=len(self.running),
+            waiting_requests=(
+                len(self.waiting) + len(getattr(self, "skipped_waiting", ()))
+            ),
+            input_waiting_requests=int(
+                getattr(self, "num_waiting_for_streaming_input", 0)
+            ),
+            physical_max_num_seqs=physical_cap,
+            effective_max_num_seqs=effective_cap,
+            token_budget_total=total_token_budget,
+            token_budget_available=available_token_budget,
+            kv_cache_usage_ratio=getattr(kv_cache_manager, "usage", None),
+        ).to_event_fields()
 
     def _baseline_validate_and_track_admission(self, request: Request) -> None:
         if self._baseline_request_is_ready_on_add():
@@ -587,6 +669,9 @@ class OmniSchedulerMixin:
         if request_id is not None:
             request_id = str(request_id)
             self._omni_request_trace_fields_by_request[request_id] = trace_fields
+            self._omni_stage_cost_features_by_request[request_id] = (
+                self._request_stage_cost_features(request)
+            )
             if recovery_fields:
                 self._omni_recovery_trace_by_request[request_id] = (
                     recovery_fields
@@ -654,6 +739,9 @@ class OmniSchedulerMixin:
                 str(request.request_id), None
             )
             self._omni_request_trace_fields_by_request.pop(
+                str(request.request_id), None
+            )
+            self._omni_stage_cost_features_by_request.pop(
                 str(request.request_id), None
             )
 
@@ -875,40 +963,19 @@ class OmniSchedulerMixin:
             )
         pressure_snapshot = None
         if stage_trace_enabled():
-            physical_cap = max_running
-            effective_cap = int(
-                getattr(self, "effective_max_num_seqs", physical_cap)
-            )
             total_token_budget = int(
                 getattr(self, "max_num_scheduled_tokens", 0)
             )
-            available_token_budget = (
-                token_budget_after
-                if token_budget_after is not None
-                else max(total_token_budget - total_num_scheduled_tokens, 0)
+            pressure_snapshot = self._capture_stage_runtime_snapshot(
+                token_budget_available=(
+                    token_budget_after
+                    if token_budget_after is not None
+                    else max(
+                        total_token_budget - total_num_scheduled_tokens,
+                        0,
+                    )
+                )
             )
-            pressure_snapshot = StageRuntimeSnapshot(
-                schema_version=1,
-                stage_id=int(stage_id),
-                captured_monotonic_s=time.monotonic(),
-                control_epoch=int(getattr(self, "_slo_control_epoch", 0)),
-                running_requests=len(self.running),
-                waiting_requests=(
-                    len(self.waiting) + len(getattr(self, "skipped_waiting", ()))
-                ),
-                input_waiting_requests=int(
-                    getattr(self, "num_waiting_for_streaming_input", 0)
-                ),
-                physical_max_num_seqs=physical_cap,
-                effective_max_num_seqs=effective_cap,
-                token_budget_total=total_token_budget,
-                token_budget_available=available_token_budget,
-                kv_cache_usage_ratio=getattr(
-                    self.kv_cache_manager,
-                    "usage",
-                    None,
-                ),
-            ).to_event_fields()
         emit_iteration_event(
             stage_id=stage_id,
             iteration_id=iteration_id,

@@ -1355,6 +1355,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omni_request_trace_fields_by_request.pop(
             request.request_id, None
         )
+        self._omni_stage_cost_features_by_request.pop(
+            request.request_id, None
+        )
 
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
