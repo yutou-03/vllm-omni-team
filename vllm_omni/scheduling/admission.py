@@ -11,9 +11,12 @@ function as offline trace replay.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -110,6 +113,76 @@ class StaticConcurrencyEnvelope:
             raise ValueError(
                 f"stage {stage_id} is absent from concurrency envelope"
             ) from error
+
+    @classmethod
+    def from_json_file(
+        cls,
+        path: str | Path,
+        *,
+        expected_sha256: str,
+    ) -> StaticConcurrencyEnvelope:
+        artifact_path = Path(path)
+        payload = artifact_path.read_bytes()
+        observed_sha256 = hashlib.sha256(payload).hexdigest()
+        if observed_sha256 != expected_sha256:
+            raise ValueError(
+                "concurrency envelope SHA256 mismatch: expected "
+                f"{expected_sha256}, observed {observed_sha256}"
+            )
+        raw = json.loads(payload)
+        if not isinstance(raw, dict):
+            raise ValueError("concurrency envelope must be a JSON object")
+        allowed = {
+            "schema_version",
+            "artifact_type",
+            "artifact_id",
+            "safe_max_active_by_stage",
+            "service_p95_limit_ms_by_stage",
+        }
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise ValueError(
+                f"unknown concurrency envelope fields: {unknown}"
+            )
+        if raw.get("artifact_type") != "stage_concurrency_envelope":
+            raise ValueError(
+                "concurrency envelope artifact_type must be "
+                "stage_concurrency_envelope"
+            )
+        raw_caps = raw.get("safe_max_active_by_stage")
+        if not isinstance(raw_caps, Mapping):
+            raise ValueError(
+                "safe_max_active_by_stage must be an object"
+            )
+        raw_limits = raw.get("service_p95_limit_ms_by_stage", {})
+        if not isinstance(raw_limits, Mapping):
+            raise ValueError(
+                "service_p95_limit_ms_by_stage must be an object"
+            )
+
+        def stage_mapping(values: Mapping[Any, Any]) -> dict[int, Any]:
+            normalized: dict[int, Any] = {}
+            for raw_stage, value in values.items():
+                try:
+                    stage = int(raw_stage)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "concurrency envelope stage ids must be integers"
+                    ) from error
+                if str(stage) != str(raw_stage) or stage < 0:
+                    raise ValueError(
+                        "concurrency envelope stage ids must be "
+                        "non-negative integers"
+                    )
+                normalized[stage] = value
+            return normalized
+
+        return cls(
+            schema_version=raw.get("schema_version"),
+            artifact_id=raw.get("artifact_id"),
+            safe_max_active_by_stage=stage_mapping(raw_caps),
+            service_p95_limit_ms_by_stage=stage_mapping(raw_limits),
+        )
 
 
 @dataclass(frozen=True, slots=True)
