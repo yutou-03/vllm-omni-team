@@ -20,7 +20,9 @@ _TRACE_DIR = os.environ.get("STAGE_QUEUE_TRACE_DIR", _DEFAULT_TRACE_DIR)
 _RUN_ID = os.environ.get("STAGE_QUEUE_RUN_ID", "server")
 _PID = os.getpid()
 TRACE_SCHEMA_VERSION = 2
-_REQUEST_METRICS_EVENTS = frozenset({"request_ingress", "stage_done_metrics"})
+_REQUEST_METRICS_EVENTS = frozenset(
+    {"request_ingress", "stage_data_ready", "stage_done_metrics"}
+)
 
 
 class ConformanceIneligibleReason(str, Enum):
@@ -70,8 +72,9 @@ def _record_enabled(filename: str, payload: dict[str, Any]) -> bool:
     """Apply an optional low-overhead trace filter for unloaded calibration.
 
     Full tracing remains the default.  ``request_metrics`` retains only the
-    two request-scoped events needed to join client completion with server
-    ingress and per-stage generation durations; scheduler iterations,
+    three request-scoped events needed to join client completion with server
+    ingress, data-ready feature snapshots, and per-stage generation durations;
+    scheduler iterations,
     forward spans, connector events, and per-token events are intentionally
     omitted so synchronous trace I/O does not dominate unloaded latency.
     ``scheduler_resource`` retains only scheduler iteration events.  It is
