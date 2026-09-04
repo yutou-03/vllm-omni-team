@@ -15,6 +15,7 @@ from vllm_omni.scheduling.policy import BASELINE_POLICY_ENV
 from vllm_omni.scheduling.deadline import MilestoneCostEstimate
 from vllm_omni.scheduling.policy import BaselineSchedulingPolicy
 from vllm_omni.scheduling.request_queue import PolicyOrderedRequestQueue
+from vllm_omni.scheduling.signals import GPUActiveSample
 
 
 class FakeRequest:
@@ -731,6 +732,14 @@ def test_profiled_pressure_tracks_queue_growth_and_running_deadline_risk(
     scheduler.effective_max_num_seqs = 2
     scheduler.max_num_scheduled_tokens = 100
     scheduler.kv_cache_manager = SimpleNamespace(usage=0.25)
+    scheduler._stage_gpu_active_sampler = SimpleNamespace(
+        sample=lambda **_kwargs: GPUActiveSample(
+            ratio=0.42,
+            source="nvml_mean_visible_devices",
+            device_count=1,
+            sample_age_ms=7.0,
+        )
+    )
     at_risk = _set_stage_ddl_metadata(
         FakeRequest("at-risk", deadline=None),
         ingress_order=0,
@@ -779,6 +788,10 @@ def test_profiled_pressure_tracks_queue_growth_and_running_deadline_risk(
     assert first["deadline_miss_risk"] == 0.5
     assert first["deadline_miss_risk_population"] == 2
     assert first["deadline_miss_risk_scope"] == "runnable_running"
+    assert first["gpu_active_ratio"] == 0.42
+    assert first["gpu_active_source"] == "nvml_mean_visible_devices"
+    assert first["gpu_active_device_count"] == 1
+    assert first["gpu_active_sample_age_ms"] == 7.0
     assert second["token_budget_utilization_ratio"] == 0.5
     assert second["queue_growth_rate_rps"] == pytest.approx(2.0)
 
