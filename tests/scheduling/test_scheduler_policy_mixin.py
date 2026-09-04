@@ -302,6 +302,79 @@ def test_stage_data_ready_reuses_admission_identity(monkeypatch):
     assert ready_fields["stage_attempt_id"] == 1
 
 
+def test_stage_data_ready_captures_prediction_features_and_pressure(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.stage_trace_enabled",
+        lambda: True,
+    )
+    captured = []
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_stage_event",
+        lambda event, **fields: captured.append((event, fields)),
+    )
+    scheduler = SchedulerHarness(0)
+    scheduler.max_num_running_reqs = 4
+    scheduler.effective_max_num_seqs = 3
+    scheduler.max_num_scheduled_tokens = 1024
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.25)
+    scheduler.num_waiting_for_streaming_input = 2
+    request = FakeRequest(
+        "profile-me",
+        deadline=None,
+        num_prompt_tokens=17,
+        num_computed_tokens=3,
+        max_tokens=29,
+        num_output_placeholders=5,
+    )
+
+    scheduler.add_request(request)
+
+    ready_fields = next(
+        fields for event, fields in captured if event == "stage_data_ready"
+    )
+    assert ready_fields["stage_cost_features"] == {
+        "feature_schema_version": 1,
+        "num_prompt_tokens": 17,
+        "max_output_tokens": 29,
+        "num_computed_tokens": 3,
+        "num_output_placeholders": 5,
+        "candidate_sequence_demand": 1,
+    }
+    assert ready_fields["pressure_snapshot"] == {
+        "pressure_schema_version": 1,
+        "captured_monotonic_s": pytest.approx(
+            ready_fields["data_ready_monotonic_s"]
+        ),
+        "control_epoch": 0,
+        "running_requests": 0,
+        "waiting_requests": 0,
+        "input_waiting_requests": 2,
+        "physical_max_num_seqs": 4,
+        "effective_max_num_seqs": 3,
+        "token_budget_total": 1024,
+        "token_budget_available": 1024,
+        "kv_cache_usage_ratio": 0.25,
+    }
+
+
+def test_disabled_trace_skips_data_ready_feature_snapshot(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.stage_trace_enabled",
+        lambda: False,
+    )
+    scheduler = SchedulerHarness(0)
+    monkeypatch.setattr(
+        scheduler,
+        "_capture_stage_runtime_snapshot",
+        lambda **_kwargs: pytest.fail("disabled trace built pressure snapshot"),
+    )
+    request = FakeRequest("no-trace-work", deadline=None)
+
+    scheduler.add_request(request)
+
+
 def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
     monkeypatch.setenv(BASELINE_POLICY_ENV, "final_deadline_edf_np")
     monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
