@@ -291,6 +291,9 @@ class StageRuntimeSnapshot:
     token_budget_utilization_ratio: float | None = None
     kv_cache_usage_ratio: float | None = None
     gpu_active_ratio: float | None = None
+    gpu_active_sample_age_ms: float | None = None
+    gpu_active_source: str | None = None
+    gpu_active_device_count: int | None = None
     service_time_ewma_ms: float | None = None
     service_time_p95_ms: float | None = None
     queue_growth_rate_rps: float | None = None
@@ -340,6 +343,7 @@ class StageRuntimeSnapshot:
             "downstream_effective_cap",
             "connector_backlog",
             "deadline_miss_risk_population",
+            "gpu_active_device_count",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -347,6 +351,7 @@ class StageRuntimeSnapshot:
         for field_name in (
             "service_time_ewma_ms",
             "service_time_p95_ms",
+            "gpu_active_sample_age_ms",
         ):
             object.__setattr__(
                 self,
@@ -356,6 +361,23 @@ class StageRuntimeSnapshot:
                     field=field_name,
                 ),
             )
+        gpu_active_fields = (
+            self.gpu_active_ratio,
+            self.gpu_active_sample_age_ms,
+            self.gpu_active_source,
+            self.gpu_active_device_count,
+        )
+        if any(value is not None for value in gpu_active_fields):
+            if any(value is None for value in gpu_active_fields):
+                raise ValueError(
+                    "GPU active fields must be provided together"
+                )
+            if self.gpu_active_source != "nvml_mean_visible_devices":
+                raise ValueError(
+                    "gpu_active_source must be nvml_mean_visible_devices"
+                )
+            if self.gpu_active_device_count == 0:
+                raise ValueError("gpu_active_device_count must be positive")
         for field_name in (
             "token_budget_utilization_ratio",
             "kv_cache_usage_ratio",
@@ -427,6 +449,9 @@ class StageRuntimeSnapshot:
             "token_budget_utilization_ratio",
             "kv_cache_usage_ratio",
             "gpu_active_ratio",
+            "gpu_active_sample_age_ms",
+            "gpu_active_source",
+            "gpu_active_device_count",
             "service_time_ewma_ms",
             "service_time_p95_ms",
             "queue_growth_rate_rps",
