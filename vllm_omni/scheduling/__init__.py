@@ -6,6 +6,11 @@ from vllm_omni.scheduling.contracts import (
     SLOMilestone,
     StageRuntimeSnapshot,
 )
+from vllm_omni.scheduling.deadline import (
+    MilestoneCostEstimate,
+    StageDeadlineSnapshot,
+    derive_stage_deadline_snapshot,
+)
 
 from vllm_omni.scheduling.metadata import (
     CLIENT_SCHEDULING_FIELD,
@@ -43,6 +48,8 @@ __all__ = [
     "RequestSLOContract",
     "SLOMilestone",
     "StageRuntimeSnapshot",
+    "MilestoneCostEstimate",
+    "StageDeadlineSnapshot",
     "SCHEDULING_SCHEMA_VERSION",
     "BASELINE_POLICY_ENV",
     "BaselineSchedulingPolicy",
@@ -52,6 +59,7 @@ __all__ = [
     "bind_server_scheduling_metadata",
     "build_server_scheduling_metadata",
     "derive_stage_deadlines",
+    "derive_stage_deadline_snapshot",
     "extract_scheduling_metadata",
     "get_baseline_scheduling_policy",
     "merge_scheduling_metadata_into_additional_information",
