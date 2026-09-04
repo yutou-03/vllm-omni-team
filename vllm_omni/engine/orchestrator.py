@@ -411,6 +411,24 @@ class OrchestratorRequestState:
             )
         return decision
 
+    def trace_identity_fields(self, stage_id: int) -> dict[str, Any]:
+        """Return the current canonical trace identity for one stage."""
+
+        logical_request_id = self.logical_request_id or self.request_id
+        pipeline_attempt_id = self.execution_attempt
+        stage_attempt_id = 0
+        if self.execution_ledger is not None:
+            pipeline_attempt_id = self.execution_ledger.pipeline_attempt_id
+            stage_ref = self.execution_ledger.current_stages.get(stage_id)
+            if stage_ref is not None:
+                stage_attempt_id = stage_ref.stage_attempt_id
+        return {
+            "logical_request_id": logical_request_id,
+            "execution_id": self.current_execution_id or self.request_id,
+            "pipeline_attempt_id": pipeline_attempt_id,
+            "stage_attempt_id": stage_attempt_id,
+        }
+
 
 @dataclass
 class StreamingInputState:
@@ -1664,10 +1682,21 @@ class Orchestrator:
             return
 
         if self.stage_pools[stage_id].final_output:
+            output_sequence = req_state.output_attempt_sequences.get(stage_id, 0)
             output_decision = req_state.classify_and_commit_output(
                 stage_id,
                 finished=bool(finished),
             )
+            if output_decision is OutputDecision.COMMIT:
+                emit_stage_event(
+                    "stage_output_committed",
+                    stage_id=stage_id,
+                    request_id=req_id,
+                    **req_state.trace_identity_fields(stage_id),
+                    output_stream_id=req_state._output_stream_id(stage_id),
+                    output_sequence=output_sequence,
+                    finished=bool(finished),
+                )
             terminal_only_output = None
             if output_decision in {
                 OutputDecision.DROP_REPLAY_DUPLICATE,
