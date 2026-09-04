@@ -673,6 +673,10 @@ def test_request_metrics_trace_mode_keeps_only_calibration_join_events(
     )
     stage_queue_trace._write_jsonl(
         "stage_events.jsonl",
+        {"event": "stage_data_ready", "request_id": "server-id"},
+    )
+    stage_queue_trace._write_jsonl(
+        "stage_events.jsonl",
         {"event": "stage_done_metrics", "request_id": "server-id"},
     )
     stage_queue_trace._write_jsonl(
@@ -694,6 +698,7 @@ def test_request_metrics_trace_mode_keeps_only_calibration_join_events(
     ]
     assert [record["event"] for record in records] == [
         "request_ingress",
+        "stage_data_ready",
         "stage_done_metrics",
     ]
     assert not (tmp_path / "iteration_events.jsonl").exists()
