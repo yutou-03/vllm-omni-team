@@ -552,7 +552,8 @@ def test_stage_data_ready_captures_prediction_features_and_pressure(monkeypatch)
         "candidate_sequence_demand": 1,
     }
     assert ready_fields["pressure_snapshot"] == {
-        "pressure_schema_version": 1,
+        "pressure_schema_version": 2,
+        "request_count_semantics": "runnable_excludes_input_blocked",
         "captured_monotonic_s": pytest.approx(
             ready_fields["data_ready_monotonic_s"]
         ),
@@ -701,7 +702,8 @@ def test_iteration_trace_carries_immutable_stage_pressure_snapshot(monkeypatch):
     captured_monotonic_s = pressure.pop("captured_monotonic_s")
     assert captured_monotonic_s >= 0
     assert pressure == {
-        "pressure_schema_version": 1,
+        "pressure_schema_version": 2,
+        "request_count_semantics": "runnable_excludes_input_blocked",
         "control_epoch": 0,
         "running_requests": 1,
         "waiting_requests": 1,
@@ -746,6 +748,10 @@ def test_pressure_snapshot_excludes_input_blocked_requests_from_active_counts():
     assert pressure["running_requests"] == 1
     assert pressure["waiting_requests"] == 1
     assert pressure["input_waiting_requests"] == 3
+    assert pressure["pressure_schema_version"] == 2
+    assert pressure["request_count_semantics"] == (
+        "runnable_excludes_input_blocked"
+    )
 
 
 def test_conformance_trace_records_kv_preemption_requeue_and_resume(monkeypatch):

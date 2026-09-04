@@ -102,3 +102,10 @@ def test_stage_runtime_snapshot_omits_unavailable_optional_signals():
     assert "kv_cache_usage_ratio" not in fields
     assert "downstream_waiting_requests" not in fields
     assert "last_admission_rejection" not in fields
+
+
+def test_stage_runtime_snapshot_v2_marks_runnable_count_semantics():
+    fields = _snapshot(schema_version=2).to_event_fields()
+
+    assert fields["pressure_schema_version"] == 2
+    assert fields["request_count_semantics"] == "runnable_excludes_input_blocked"

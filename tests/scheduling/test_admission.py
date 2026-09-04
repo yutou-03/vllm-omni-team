@@ -17,7 +17,7 @@ from vllm_omni.scheduling.contracts import StageRuntimeSnapshot
 
 def _snapshot(**overrides) -> StageRuntimeSnapshot:
     values = {
-        "schema_version": 1,
+        "schema_version": 2,
         "stage_id": 0,
         "captured_monotonic_s": 100.0,
         "control_epoch": 1,
@@ -76,6 +76,16 @@ def test_envelope_and_config_fail_closed() -> None:
         _config(kv_low_watermark=0.9, kv_high_watermark=0.8)
     with pytest.raises(ValueError, match="decrease_factor must be in"):
         _config(decrease_factor=1.0)
+
+
+def test_controller_rejects_legacy_raw_queue_pressure_semantics() -> None:
+    with pytest.raises(ValueError, match="pressure schema version 2"):
+        decide_admission_cap(
+            _config(),
+            _envelope(),
+            _snapshot(schema_version=1),
+            AdmissionControllerState.initial(2),
+        )
 
 
 def test_safe_low_pressure_increases_only_after_hold() -> None:
