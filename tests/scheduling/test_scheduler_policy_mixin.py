@@ -350,6 +350,54 @@ def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
     }
 
 
+def test_iteration_trace_carries_immutable_stage_pressure_snapshot(monkeypatch):
+    scheduler = SchedulerHarness(1)
+    scheduler.max_num_running_reqs = 8
+    scheduler.max_num_scheduled_tokens = 4096
+    scheduler.num_waiting_for_streaming_input = 1
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.75)
+    scheduler.running = [FakeRequest("running", deadline=None)]
+    scheduler.waiting.add_request(FakeRequest("waiting", deadline=None))
+    captured = {}
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.stage_trace_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_iteration_event",
+        lambda **fields: captured.update(fields),
+    )
+
+    scheduler._trace_scheduler_output(
+        SimpleNamespace(
+            num_scheduled_tokens={"running": 128},
+            total_num_scheduled_tokens=128,
+            preempted_req_ids=set(),
+        ),
+        iteration_id=3,
+        timestamp_start=1.0,
+        timestamp_end=1.1,
+        num_running_before=1,
+        num_waiting_before=1,
+    )
+
+    pressure = dict(captured["pressure_snapshot"])
+    captured_monotonic_s = pressure.pop("captured_monotonic_s")
+    assert captured_monotonic_s >= 0
+    assert pressure == {
+        "pressure_schema_version": 1,
+        "control_epoch": 0,
+        "running_requests": 1,
+        "waiting_requests": 1,
+        "input_waiting_requests": 1,
+        "physical_max_num_seqs": 8,
+        "effective_max_num_seqs": 8,
+        "token_budget_total": 4096,
+        "token_budget_available": 3968,
+        "kv_cache_usage_ratio": 0.75,
+    }
+
+
 def test_conformance_trace_records_kv_preemption_requeue_and_resume(monkeypatch):
     monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
     monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
