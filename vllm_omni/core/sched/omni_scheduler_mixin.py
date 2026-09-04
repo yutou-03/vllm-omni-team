@@ -379,6 +379,9 @@ class OmniSchedulerMixin:
         captured_monotonic_s: float | None = None,
         token_budget_available: int | None = None,
     ) -> dict[str, Any]:
+        running_requests, waiting_requests, input_waiting_requests = (
+            self._stage_runtime_request_counts()
+        )
         physical_cap = int(
             getattr(self, "max_num_running_reqs", len(self.running))
         )
@@ -403,19 +406,71 @@ class OmniSchedulerMixin:
                 else captured_monotonic_s
             ),
             control_epoch=int(getattr(self, "_slo_control_epoch", 0)),
-            running_requests=len(self.running),
-            waiting_requests=(
-                len(self.waiting) + len(getattr(self, "skipped_waiting", ()))
-            ),
-            input_waiting_requests=int(
-                getattr(self, "num_waiting_for_streaming_input", 0)
-            ),
+            running_requests=running_requests,
+            waiting_requests=waiting_requests,
+            input_waiting_requests=input_waiting_requests,
             physical_max_num_seqs=physical_cap,
             effective_max_num_seqs=effective_cap,
             token_budget_total=total_token_budget,
             token_budget_available=available_token_budget,
             kv_cache_usage_ratio=getattr(kv_cache_manager, "usage", None),
         ).to_event_fields()
+
+    def _stage_runtime_request_counts(self) -> tuple[int, int, int]:
+        """Count runnable and input-blocked requests without double counting.
+
+        Async chunk adapters temporarily remove WAITING_FOR_CHUNK requests and
+        later restore them to their original scheduler queue.  Raw queue
+        lengths therefore overstate active compute demand and can even exceed
+        ``max_num_running_reqs``.  Admission control must see runnable demand,
+        while preserving input-blocked occupancy as a separate signal.
+        """
+
+        runnable_running: set[str] = set()
+        runnable_waiting: set[str] = set()
+        input_blocked: set[str] = set()
+
+        def classify(request: Any, *, running: bool) -> None:
+            request_id = str(request.request_id)
+            status = getattr(request, "status", None)
+            status_name = getattr(status, "name", str(status)).lower()
+            if (
+                "waiting_for_chunk" in status_name
+                or "waiting_for_input" in status_name
+            ):
+                input_blocked.add(request_id)
+            elif "finished" not in status_name:
+                (runnable_running if running else runnable_waiting).add(
+                    request_id
+                )
+
+        for request in self.running:
+            classify(request, running=True)
+        for request in self.waiting:
+            classify(request, running=False)
+        for request in getattr(self, "skipped_waiting", ()):
+            classify(request, running=False)
+
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is not None:
+            for attribute in (
+                "waiting_for_chunk_running_requests",
+                "waiting_for_chunk_waiting_requests",
+                "_waiting_for_chunk_running",
+                "_waiting_for_chunk_waiting",
+                "_waiting_for_input",
+            ):
+                for request in getattr(adapter, attribute, ()):
+                    input_blocked.add(str(request.request_id))
+
+        legacy_input_waiting = int(
+            getattr(self, "num_waiting_for_streaming_input", 0)
+        )
+        return (
+            len(runnable_running),
+            len(runnable_waiting),
+            max(len(input_blocked), legacy_input_waiting),
+        )
 
     def _baseline_validate_and_track_admission(self, request: Request) -> None:
         if self._baseline_request_is_ready_on_add():
