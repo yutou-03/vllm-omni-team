@@ -81,12 +81,13 @@ def request_scheduling_metadata(request: Any) -> dict[str, Any]:
 
 
 def remaining_prefill_tokens(request: Any) -> int:
-    """Return Sarathi-style local remaining work for one scheduler request.
+    """Return local remaining-prefill work for a diagnostic SRPF ablation.
 
-    Sarathi's SRPF baseline uses unprocessed prompt tokens as a direct proxy
-    for remaining processing time. Output length and downstream-stage work are
-    deliberately excluded. Once prefill is complete the key stays at zero, so
-    decode requests remain ahead of requests with unfinished local prefill.
+    This is not a Sarathi-Serve reproduction: Sarathi-Serve combines chunked
+    prefills with stall-free batching, neither of which this queue key
+    implements. Output length and downstream-stage work are deliberately
+    excluded. Once prefill is complete the key stays at zero, so decode
+    requests remain ahead of requests with unfinished local prefill.
     """
 
     request_id = str(getattr(request, "request_id", "<unknown>"))
