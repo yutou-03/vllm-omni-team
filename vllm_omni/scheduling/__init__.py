@@ -4,6 +4,7 @@ from vllm_omni.scheduling.contracts import (
     RequestPath,
     RequestSLOContract,
     SLOMilestone,
+    StageRuntimeSnapshot,
 )
 
 from vllm_omni.scheduling.metadata import (
@@ -41,6 +42,7 @@ __all__ = [
     "RequestPath",
     "RequestSLOContract",
     "SLOMilestone",
+    "StageRuntimeSnapshot",
     "SCHEDULING_SCHEMA_VERSION",
     "BASELINE_POLICY_ENV",
     "BaselineSchedulingPolicy",

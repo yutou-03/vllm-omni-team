@@ -247,3 +247,160 @@ class RequestSLOContract:
         if self.audio_consume_rate is not None:
             metadata["sched_audio_consume_rate"] = self.audio_consume_rate
         return metadata
+
+
+def _nonnegative_integer(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _optional_nonnegative_number(value: Any, *, field: str) -> float | None:
+    if value is None:
+        return None
+    number = _finite_number(value, field=field)
+    if number < 0:
+        raise ValueError(f"{field} must be non-negative")
+    return number
+
+
+def _optional_ratio(value: Any, *, field: str) -> float | None:
+    if value is None:
+        return None
+    ratio = _finite_number(value, field=field)
+    if ratio < 0 or ratio > 1:
+        raise ValueError(f"{field} must be in [0, 1]")
+    return ratio
+
+
+@dataclass(frozen=True, slots=True)
+class StageRuntimeSnapshot:
+    """One immutable input snapshot for a stage control decision."""
+
+    schema_version: int
+    stage_id: int
+    captured_monotonic_s: float
+    control_epoch: int
+    running_requests: int
+    waiting_requests: int
+    input_waiting_requests: int
+    physical_max_num_seqs: int
+    effective_max_num_seqs: int
+    token_budget_total: int
+    token_budget_available: int
+    kv_cache_usage_ratio: float | None = None
+    gpu_active_ratio: float | None = None
+    service_time_ewma_ms: float | None = None
+    service_time_p95_ms: float | None = None
+    queue_growth_rate_rps: float | None = None
+    downstream_waiting_requests: int | None = None
+    downstream_effective_cap: int | None = None
+    connector_backlog: int | None = None
+    deadline_miss_risk: float | None = None
+    last_admission_rejection: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("StageRuntimeSnapshot schema_version must be 1")
+        for field_name in (
+            "stage_id",
+            "control_epoch",
+            "running_requests",
+            "waiting_requests",
+            "input_waiting_requests",
+            "physical_max_num_seqs",
+            "effective_max_num_seqs",
+            "token_budget_total",
+            "token_budget_available",
+        ):
+            _nonnegative_integer(getattr(self, field_name), field=field_name)
+        captured = _finite_number(
+            self.captured_monotonic_s,
+            field="captured_monotonic_s",
+        )
+        if captured < 0:
+            raise ValueError("captured_monotonic_s must be non-negative")
+        object.__setattr__(self, "captured_monotonic_s", captured)
+        if self.effective_max_num_seqs > self.physical_max_num_seqs:
+            raise ValueError(
+                "effective_max_num_seqs must not exceed physical_max_num_seqs"
+            )
+        if self.token_budget_available > self.token_budget_total:
+            raise ValueError(
+                "token_budget_available must not exceed token_budget_total"
+            )
+
+        for field_name in (
+            "downstream_waiting_requests",
+            "downstream_effective_cap",
+            "connector_backlog",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                _nonnegative_integer(value, field=field_name)
+        for field_name in (
+            "service_time_ewma_ms",
+            "service_time_p95_ms",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _optional_nonnegative_number(
+                    getattr(self, field_name),
+                    field=field_name,
+                ),
+            )
+        for field_name in (
+            "kv_cache_usage_ratio",
+            "gpu_active_ratio",
+            "deadline_miss_risk",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _optional_ratio(getattr(self, field_name), field=field_name),
+            )
+        if self.queue_growth_rate_rps is not None:
+            object.__setattr__(
+                self,
+                "queue_growth_rate_rps",
+                _finite_number(
+                    self.queue_growth_rate_rps,
+                    field="queue_growth_rate_rps",
+                ),
+            )
+        if (
+            self.last_admission_rejection is not None
+            and not str(self.last_admission_rejection).strip()
+        ):
+            raise ValueError("last_admission_rejection must not be empty")
+
+    def to_event_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "pressure_schema_version": self.schema_version,
+            "control_epoch": self.control_epoch,
+            "running_requests": self.running_requests,
+            "waiting_requests": self.waiting_requests,
+            "input_waiting_requests": self.input_waiting_requests,
+            "physical_max_num_seqs": self.physical_max_num_seqs,
+            "effective_max_num_seqs": self.effective_max_num_seqs,
+            "token_budget_total": self.token_budget_total,
+            "token_budget_available": self.token_budget_available,
+            "captured_monotonic_s": self.captured_monotonic_s,
+        }
+        for field_name in (
+            "kv_cache_usage_ratio",
+            "gpu_active_ratio",
+            "service_time_ewma_ms",
+            "service_time_p95_ms",
+            "queue_growth_rate_rps",
+            "downstream_waiting_requests",
+            "downstream_effective_cap",
+            "connector_backlog",
+            "deadline_miss_risk",
+            "last_admission_rejection",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                fields[field_name] = value
+        return fields
