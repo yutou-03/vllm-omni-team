@@ -199,6 +199,8 @@ def check_trace_invariants(
         previous = lifecycle.get(key)
         if event_name == "stage_enqueue":
             lifecycle[key] = "enqueued"
+        elif event_name == "stage_reentered":
+            lifecycle[key] = "enqueued"
         elif event_name == "stage_schedule":
             if previous not in {"enqueued", "scheduled"}:
                 add(

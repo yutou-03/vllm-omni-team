@@ -145,7 +145,9 @@ def merge_pipeline_attempt_metadata_into_request_input(
     request_input: Any,
     *,
     logical_request_id: str,
+    execution_id: str,
     pipeline_attempt_id: int,
+    stage_attempt_id: int,
     recovery_target_stage_id: int,
     recovery_target_num_computed_tokens: int,
     recovery_preemption_cause: str,
@@ -155,7 +157,9 @@ def merge_pipeline_attempt_metadata_into_request_input(
 
     recovery_meta: dict[str, Any] = {
         "omni_logical_request_id": logical_request_id,
+        "omni_execution_id": execution_id,
         "omni_pipeline_attempt_id": int(pipeline_attempt_id),
+        "omni_stage_attempt_id": int(stage_attempt_id),
         "omni_recovery_target_stage_id": int(recovery_target_stage_id),
         "omni_recovery_target_num_computed_tokens": int(
             recovery_target_num_computed_tokens
@@ -170,7 +174,9 @@ def merge_pipeline_attempt_metadata_into_request_input(
             merge_pipeline_attempt_metadata_into_request_input(
                 item,
                 logical_request_id=logical_request_id,
+                execution_id=execution_id,
                 pipeline_attempt_id=pipeline_attempt_id,
+                stage_attempt_id=stage_attempt_id,
                 recovery_target_stage_id=recovery_target_stage_id,
                 recovery_target_num_computed_tokens=(
                     recovery_target_num_computed_tokens
@@ -1481,7 +1487,9 @@ class Orchestrator:
             stage0_request = merge_pipeline_attempt_metadata_into_request_input(
                 stage0_request,
                 logical_request_id=request_id,
+                execution_id=new_execution_id,
                 pipeline_attempt_id=req_state.execution_attempt,
+                stage_attempt_id=0,
                 recovery_target_stage_id=stage_id,
                 recovery_target_num_computed_tokens=discarded_progress,
                 recovery_preemption_cause=preemption_cause,
@@ -2274,7 +2282,17 @@ class Orchestrator:
                     base_input = merge_pipeline_attempt_metadata_into_request_input(
                         base_input,
                         logical_request_id=request_id,
+                        execution_id=(
+                            req_state.current_execution_id or request_id
+                        ),
                         pipeline_attempt_id=req_state.execution_attempt,
+                        stage_attempt_id=(
+                            req_state.execution_ledger.current_stages[
+                                next_stage_id
+                            ].stage_attempt_id
+                            if req_state.execution_ledger is not None
+                            else 0
+                        ),
                         recovery_target_stage_id=(
                             req_state.recovery_target_stage_id
                             if req_state.recovery_target_stage_id is not None

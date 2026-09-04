@@ -275,6 +275,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             recovery_modes[request.request_id] = actual_mode.value
 
         if restart_talker_locally:
+            previous_trace_fields = dict(
+                getattr(
+                    self,
+                    "_omni_request_trace_fields_by_request",
+                    {},
+                ).get(str(request.request_id), {})
+            )
             del request._all_token_ids[request.num_prompt_tokens :]
             request._output_token_ids.clear()
             request.num_output_placeholders = 0
@@ -301,6 +308,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter.abandon_sender(
                     str(old_output_connector_req_id)
                 )
+            previous_identity = {
+                key: previous_trace_fields[key]
+                for key in (
+                    "logical_request_id",
+                    "execution_id",
+                    "pipeline_attempt_id",
+                    "stage_attempt_id",
+                )
+                if key in previous_trace_fields
+            }
             emit_stage_event(
                 "stage_local_dynamic_state_discarded",
                 stage_id=self._omni_stage_id_for_trace(),
@@ -312,7 +329,43 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 preemption_cause=preemption_cause,
                 controlled_rule_id=rule_id,
                 recovery_mode=actual_mode.value,
+                **previous_identity,
             )
+            logical_request_id = str(
+                previous_trace_fields.get(
+                    "logical_request_id", request.request_id
+                )
+            )
+            next_trace_fields = {
+                "logical_request_id": logical_request_id,
+                "execution_id": str(
+                    previous_trace_fields.get(
+                        "execution_id", logical_request_id
+                    )
+                ),
+                "pipeline_attempt_id": int(
+                    previous_trace_fields.get("pipeline_attempt_id", 0)
+                ),
+                "stage_attempt_id": int(
+                    previous_trace_fields.get("stage_attempt_id", 0)
+                )
+                + 1,
+                "recovery_target_stage_id": int(
+                    self._omni_stage_id_for_trace()
+                ),
+                "recovery_target_num_computed_tokens": (
+                    discarded_computed_tokens
+                ),
+                "preemption_cause": preemption_cause,
+            }
+            if rule_id is not None:
+                next_trace_fields["controlled_rule_id"] = str(rule_id)
+            self._omni_recovery_trace_by_request[
+                str(request.request_id)
+            ] = next_trace_fields
+            self._omni_request_trace_fields_by_request[
+                str(request.request_id)
+            ] = next_trace_fields
             return
 
         # The upstream implementation immediately prepends the victim to the
@@ -1299,6 +1352,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omits_kv_transfer_cache.pop(request.request_id, None)
         self._baseline_forget_request_ids(request.request_id)
         self._omni_recovery_trace_by_request.pop(request.request_id, None)
+        self._omni_request_trace_fields_by_request.pop(
+            request.request_id, None
+        )
 
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
