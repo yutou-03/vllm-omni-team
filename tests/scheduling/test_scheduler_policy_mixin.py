@@ -332,7 +332,7 @@ def test_dynamic_stage1_loads_envelope_and_applies_initial_cap(monkeypatch):
     ]
 
 
-def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
+def test_dynamic_stage1_applies_resource_driven_drain_only_cap(monkeypatch):
     monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
     monkeypatch.setattr(
         "vllm_omni.core.sched.omni_scheduler_mixin."
@@ -359,7 +359,7 @@ def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
         max_num_running_reqs=2,
     )
     scheduler.max_num_scheduled_tokens = 100
-    scheduler.kv_cache_manager = SimpleNamespace(usage=0.001)
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.95)
     scheduler._stage_gpu_active_sampler = SimpleNamespace(
         sample=lambda **_kwargs: GPUActiveSample(
             ratio=0.7,
