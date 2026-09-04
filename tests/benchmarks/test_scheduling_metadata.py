@@ -2,6 +2,7 @@ import pytest
 
 from vllm_omni.scheduling.metadata import (
     CURRENT_SCHEDULING_SCHEMA_VERSION,
+    bind_server_scheduling_metadata,
     build_client_scheduling_metadata,
     build_server_scheduling_metadata,
     derive_stage_deadlines,
@@ -89,6 +90,32 @@ def test_v2_rejects_path_inapplicable_milestones():
                 audio_consume_rate=None,
             )
         )
+
+
+def test_server_logical_id_binding_replaces_untrusted_source_id():
+    metadata = build_server_scheduling_metadata(
+        _valid_v2_metadata(source_request_id="client-chosen-id"),
+        ingress_monotonic_s=100.0,
+        ingress_wall_s=1700000000.0,
+    )
+
+    bound = bind_server_scheduling_metadata(metadata, "chatcmpl-server-id")
+
+    assert metadata["sched_logical_request_id"] == "client-chosen-id"
+    assert bound["sched_source_request_id"] == "client-chosen-id"
+    assert bound["sched_logical_request_id"] == "chatcmpl-server-id"
+
+
+def test_server_logical_id_binding_also_correlates_legacy_requests():
+    metadata = build_server_scheduling_metadata(
+        {"schema_version": 1, "source_request_id": "legacy", "ingress_order": 0},
+        ingress_monotonic_s=100.0,
+        ingress_wall_s=1700000000.0,
+    )
+
+    assert bind_server_scheduling_metadata(metadata, "chatcmpl-legacy")[
+        "sched_logical_request_id"
+    ] == "chatcmpl-legacy"
 
 
 def test_build_client_scheduling_metadata_normalizes_stage_mapping():

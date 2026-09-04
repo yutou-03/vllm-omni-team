@@ -1,5 +1,7 @@
 """Unit tests for cross-stage scheduling metadata propagation."""
 
+import pytest
+
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.core.sched.omni_scheduler_mixin import (
@@ -11,10 +13,13 @@ from vllm_omni.engine.serialization import (
     serialize_additional_information,
 )
 from vllm_omni.engine.orchestrator import (
+    OrchestratorRequestState,
     build_engine_core_request_from_tokens,
     extract_scheduling_metadata_from_request_input,
     merge_scheduling_metadata_into_request_input,
 )
+from vllm_omni.scheduling.contracts import RequestPath, SLOMilestone
+from vllm_omni.scheduling.metadata import build_server_scheduling_metadata
 
 
 def test_rebuilt_stage_request_preserves_identical_scheduling_metadata():
@@ -109,3 +114,54 @@ def test_stage_admission_trace_decodes_scheduling_fields():
     )()
 
     assert extract_request_scheduling_trace_fields(request) == scheduling
+
+
+def test_orchestrator_state_materializes_v2_contract():
+    scheduling = build_server_scheduling_metadata(
+        {
+            "schema_version": 2,
+            "source_request_id": "source-1",
+            "ingress_order": 1,
+            "request_path": "text",
+            "service_class": "interactive",
+            "milestone_slo_ms": {"ttft": 500, "e2e": 2000},
+            "max_preemptions": 1,
+        },
+        ingress_monotonic_s=100.0,
+        ingress_wall_s=1700000000.0,
+        logical_request_id="logical-1",
+    )
+
+    state = OrchestratorRequestState(
+        request_id="logical-1",
+        final_stage_id=0,
+        scheduling_metadata=scheduling,
+    )
+
+    assert state.slo_contract is not None
+    assert state.slo_contract.request_path is RequestPath.TEXT
+    assert state.slo_contract.milestone_deadlines_s[SLOMilestone.E2E] == 102.0
+
+
+def test_orchestrator_state_rejects_mismatched_v2_logical_id():
+    scheduling = build_server_scheduling_metadata(
+        {
+            "schema_version": 2,
+            "source_request_id": "source-1",
+            "ingress_order": 1,
+            "request_path": "text",
+            "service_class": "interactive",
+            "milestone_slo_ms": {"ttft": 500, "e2e": 2000},
+            "max_preemptions": 1,
+        },
+        ingress_monotonic_s=100.0,
+        ingress_wall_s=1700000000.0,
+        logical_request_id="other-logical-id",
+    )
+
+    with pytest.raises(ValueError, match="logical request id mismatch"):
+        OrchestratorRequestState(
+            request_id="logical-1",
+            final_stage_id=0,
+            scheduling_metadata=scheduling,
+        )
