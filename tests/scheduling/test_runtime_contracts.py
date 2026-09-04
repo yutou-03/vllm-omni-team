@@ -21,6 +21,9 @@ def _snapshot(**overrides):
         "token_budget_utilization_ratio": 0.75,
         "kv_cache_usage_ratio": 0.75,
         "gpu_active_ratio": 0.9,
+        "gpu_active_sample_age_ms": 12.0,
+        "gpu_active_source": "nvml_mean_visible_devices",
+        "gpu_active_device_count": 1,
         "service_time_ewma_ms": 12.5,
         "service_time_p95_ms": 18.0,
         "queue_growth_rate_rps": 1.25,
@@ -52,6 +55,9 @@ def test_stage_runtime_snapshot_is_immutable_and_serializable():
         "token_budget_utilization_ratio": 0.75,
         "kv_cache_usage_ratio": 0.75,
         "gpu_active_ratio": 0.9,
+        "gpu_active_sample_age_ms": 12.0,
+        "gpu_active_source": "nvml_mean_visible_devices",
+        "gpu_active_device_count": 1,
         "service_time_ewma_ms": 12.5,
         "service_time_p95_ms": 18.0,
         "queue_growth_rate_rps": 1.25,
@@ -102,6 +108,9 @@ def test_stage_runtime_snapshot_omits_unavailable_optional_signals():
     snapshot = _snapshot(
         kv_cache_usage_ratio=None,
         gpu_active_ratio=None,
+        gpu_active_sample_age_ms=None,
+        gpu_active_source=None,
+        gpu_active_device_count=None,
         service_time_ewma_ms=None,
         service_time_p95_ms=None,
         queue_growth_rate_rps=None,
@@ -123,6 +132,11 @@ def test_stage_runtime_snapshot_omits_unavailable_optional_signals():
 def test_deadline_risk_metadata_must_be_all_present_or_all_absent():
     with pytest.raises(ValueError, match="deadline risk fields must be provided together"):
         _snapshot(deadline_miss_risk_population=None)
+
+
+def test_gpu_active_metadata_must_be_all_present_or_all_absent():
+    with pytest.raises(ValueError, match="GPU active fields must be provided together"):
+        _snapshot(gpu_active_sample_age_ms=None)
 
 
 def test_stage_runtime_snapshot_v2_marks_runnable_count_semantics():

@@ -30,6 +30,9 @@ def _snapshot(**overrides) -> StageRuntimeSnapshot:
         "token_budget_available": 1024,
         "kv_cache_usage_ratio": 0.4,
         "gpu_active_ratio": 0.5,
+        "gpu_active_sample_age_ms": 0.0,
+        "gpu_active_source": "nvml_mean_visible_devices",
+        "gpu_active_device_count": 1,
         "service_time_p95_ms": 10.0,
         "deadline_miss_risk": 0.1,
         "deadline_miss_risk_population": 2,
@@ -115,7 +118,12 @@ def test_missing_required_signal_blocks_increase_without_implying_pressure() -> 
     decision = decide_admission_cap(
         _config(increase_hold=1),
         _envelope(),
-        _snapshot(gpu_active_ratio=None),
+        _snapshot(
+            gpu_active_ratio=None,
+            gpu_active_sample_age_ms=None,
+            gpu_active_source=None,
+            gpu_active_device_count=None,
+        ),
         AdmissionControllerState.initial(2),
     )
 
