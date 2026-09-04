@@ -528,7 +528,9 @@ class Orchestrator:
         self._fatal_error_stage_id: int | None = None
         self._drain_state_epoch = 0
         self._drain_output_inflight = 0
-        self._slo_feedback_last_epoch_by_edge: dict[tuple[int, int], int] = {}
+        self._slo_feedback_last_sample_by_edge: dict[
+            tuple[int, int], tuple[int, float]
+        ] = {}
         self._slo_feedback_error_logged_edges: set[tuple[int, int]] = set()
 
     def _bump_drain_epoch(self) -> None:
@@ -626,13 +628,13 @@ class Orchestrator:
     ) -> None:
         """Relay adjacent single-replica pressure through owner-safe RPCs."""
 
-        last_epochs = getattr(
+        last_samples = getattr(
             self,
-            "_slo_feedback_last_epoch_by_edge",
+            "_slo_feedback_last_sample_by_edge",
             None,
         )
-        if last_epochs is None:
-            last_epochs = self._slo_feedback_last_epoch_by_edge = {}
+        if last_samples is None:
+            last_samples = self._slo_feedback_last_sample_by_edge = {}
         logged_errors = getattr(
             self,
             "_slo_feedback_error_logged_edges",
@@ -680,6 +682,7 @@ class Orchestrator:
             try:
                 sample = await get_pressure(timeout=timeout)
                 epoch = sample.get("control_epoch")
+                captured = sample.get("captured_monotonic_s")
                 if (
                     isinstance(epoch, bool)
                     or not isinstance(epoch, int)
@@ -689,11 +692,24 @@ class Orchestrator:
                         "pressure sample control_epoch must be a "
                         "non-negative integer"
                     )
-                previous_epoch = last_epochs.get(edge)
-                if previous_epoch is not None and epoch <= previous_epoch:
+                if isinstance(captured, bool):
+                    raise ValueError(
+                        "pressure sample captured_monotonic_s must be numeric"
+                    )
+                try:
+                    captured = float(captured)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "pressure sample captured_monotonic_s must be numeric"
+                    ) from error
+                previous_sample = last_samples.get(edge)
+                if previous_sample is not None and (
+                    epoch < previous_sample[0]
+                    or captured <= previous_sample[1]
+                ):
                     continue
                 await update_pressure(sample, timeout=timeout)
-                last_epochs[edge] = epoch
+                last_samples[edge] = (epoch, captured)
                 logged_errors.discard(edge)
             except asyncio.CancelledError:
                 raise

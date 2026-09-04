@@ -626,9 +626,15 @@ class OmniSchedulerMixin:
         previous = self._slo_downstream_pressure
         if (
             previous is not None
-            and sample["control_epoch"] <= previous["control_epoch"]
+            and (
+                sample["control_epoch"] < previous["control_epoch"]
+                or captured <= previous["captured_monotonic_s"]
+            )
         ):
-            raise ValueError("downstream control_epoch must increase")
+            raise ValueError(
+                "downstream control_epoch must increase or refresh "
+                "timestamp must advance"
+            )
         self._slo_downstream_pressure = {
             **sample,
             "captured_monotonic_s": captured,
