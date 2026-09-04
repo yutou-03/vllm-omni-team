@@ -470,6 +470,24 @@ def build_server_scheduling_metadata(
     return server_metadata
 
 
+def bind_server_scheduling_metadata(
+    scheduling_metadata: Mapping[str, Any],
+    logical_request_id: str,
+) -> dict[str, Any]:
+    """Bind validated metadata to the server-owned logical request id."""
+
+    normalized_id = str(logical_request_id)
+    if not normalized_id.strip():
+        raise ValueError("logical_request_id must not be empty")
+    bound = dict(scheduling_metadata)
+    bound["sched_logical_request_id"] = normalized_id
+    if bound.get("sched_schema_version") == CURRENT_SCHEDULING_SCHEMA_VERSION:
+        # Reconstructing the immutable contract makes rebinding fail closed if
+        # any v2 field was lost between frontend validation and request setup.
+        RequestSLOContract.from_server_metadata(bound)
+    return bound
+
+
 def derive_stage_deadlines(
     *,
     deadline_monotonic_s: float,

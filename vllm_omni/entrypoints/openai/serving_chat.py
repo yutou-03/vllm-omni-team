@@ -108,6 +108,7 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.scheduling.metadata import (
     CLIENT_SCHEDULING_FIELD,
+    bind_server_scheduling_metadata,
     build_server_scheduling_metadata,
     merge_scheduling_metadata_into_prompt,
 )
@@ -348,6 +349,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
 
         if scheduling_metadata is not None:
+            scheduling_metadata = bind_server_scheduling_metadata(
+                scheduling_metadata,
+                request_id,
+            )
             emit_stage_event(
                 "request_ingress",
                 stage_id="frontend",

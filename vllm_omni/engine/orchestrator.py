@@ -46,6 +46,7 @@ from vllm_omni.recovery import (
     OutputDecision,
     PreemptionRecoveryMode,
 )
+from vllm_omni.scheduling.contracts import RequestSLOContract
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     merge_scheduling_metadata_into_additional_information,
@@ -264,6 +265,7 @@ class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
 
     request_id: str
+    logical_request_id: str | None = None
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
@@ -274,6 +276,7 @@ class OrchestratorRequestState:
     mm_features: list | None = None
     pd_prefill_multimodal_output: dict[str, Any] | None = None
     scheduling_metadata: dict[str, Any] | None = None
+    slo_contract: RequestSLOContract | None = None
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
@@ -303,6 +306,34 @@ class OrchestratorRequestState:
     def __post_init__(self) -> None:
         """Create the explicit execution ledger for a valid pipeline request."""
 
+        if self.logical_request_id is None:
+            self.logical_request_id = self.request_id
+        if self.scheduling_metadata is not None and self.scheduling_metadata.get(
+            "sched_schema_version"
+        ) == 2:
+            parsed_contract = RequestSLOContract.from_server_metadata(
+                self.scheduling_metadata
+            )
+            if parsed_contract.logical_request_id != self.logical_request_id:
+                raise ValueError(
+                    "logical request id mismatch between orchestrator state "
+                    "and schema-v2 SLO contract"
+                )
+            if self.slo_contract is None:
+                self.slo_contract = parsed_contract
+            elif self.slo_contract != parsed_contract:
+                raise ValueError(
+                    "schema-v2 scheduling metadata and SLO contract differ"
+                )
+        elif (
+            self.slo_contract is not None
+            and self.slo_contract.logical_request_id != self.logical_request_id
+        ):
+            raise ValueError(
+                "logical request id mismatch between orchestrator state "
+                "and SLO contract"
+            )
+
         if self.final_stage_id < 0:
             return
         if self.execution_ledger is None:
@@ -312,7 +343,7 @@ class OrchestratorRequestState:
                 for stage_id in range(self.final_stage_id + 1)
             }
             self.execution_ledger = ExecutionLedger.initialize(
-                logical_request_id=self.request_id,
+                logical_request_id=self.logical_request_id,
                 final_stage_id=self.final_stage_id,
                 physical_request_ids=physical_request_ids,
                 started_monotonic_s=_time.monotonic(),
@@ -701,6 +732,7 @@ class Orchestrator:
 
         companion_state = OrchestratorRequestState(
             request_id=companion_id,
+            logical_request_id=parent_state.logical_request_id,
             prompt=companion_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=0,
