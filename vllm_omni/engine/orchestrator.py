@@ -12,7 +12,7 @@ import asyncio
 import copy
 import time as _time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import janus
 import torch
@@ -602,11 +602,17 @@ class Orchestrator:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     def _slo_downstream_feedback_enabled(self) -> bool:
-        """Enable the relay for Stage-DDL modes that consume pressure."""
+        """Enable the relay only when at least one dynamic stage consumes it."""
+
+        return bool(self._slo_downstream_feedback_edges())
+
+    def _slo_downstream_feedback_edges(self) -> tuple[tuple[int, int], ...]:
+        """Select only upstream dynamic targets that require downstream data."""
 
         if len(self.stage_pools) < 2:
-            return False
-        for pool in self.stage_pools[:-1]:
+            return ()
+        edges: list[tuple[int, int]] = []
+        for upstream_stage_id, pool in enumerate(self.stage_pools[:-1]):
             config = getattr(pool, "stage_vllm_config", None)
             if config is None:
                 continue
@@ -614,17 +620,27 @@ class Orchestrator:
                 slo_config = extract_slo_scheduling_config(config)
             except (TypeError, ValueError):
                 continue
-            if slo_config.enabled and slo_config.mode in {
-                SloSchedulingMode.STAGE_DDL_FIXED,
-                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
-            }:
-                return True
-        return False
+            if not (
+                slo_config.enabled
+                and slo_config.mode
+                is SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION
+            ):
+                continue
+            dynamic = slo_config.stage_ddl.dynamic_admission
+            if dynamic is None:
+                continue
+            if (
+                upstream_stage_id in dynamic.target_stage_ids
+                and dynamic.controller.require_downstream_pressure
+            ):
+                edges.append((upstream_stage_id, upstream_stage_id + 1))
+        return tuple(edges)
 
     async def _relay_slo_downstream_pressure_once(
         self,
         *,
         timeout: float = _SLO_PRESSURE_FEEDBACK_TIMEOUT_S,
+        edges: Sequence[tuple[int, int]] | None = None,
     ) -> None:
         """Relay adjacent single-replica pressure through owner-safe RPCs."""
 
@@ -643,8 +659,12 @@ class Orchestrator:
         if logged_errors is None:
             logged_errors = self._slo_feedback_error_logged_edges = set()
 
-        for upstream_stage_id in reversed(range(len(self.stage_pools) - 1)):
-            downstream_stage_id = upstream_stage_id + 1
+        selected_edges = (
+            self._slo_downstream_feedback_edges()
+            if edges is None
+            else tuple(edges)
+        )
+        for upstream_stage_id, downstream_stage_id in reversed(selected_edges):
             edge = (upstream_stage_id, downstream_stage_id)
             upstream_pool = self.stage_pools[upstream_stage_id]
             downstream_pool = self.stage_pools[downstream_stage_id]
