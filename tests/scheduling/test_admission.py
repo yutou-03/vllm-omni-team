@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
 
 import pytest
@@ -82,6 +84,54 @@ def test_envelope_and_config_fail_closed() -> None:
         _config(kv_low_watermark=0.9, kv_high_watermark=0.8)
     with pytest.raises(ValueError, match="decrease_factor must be in"):
         _config(decrease_factor=1.0)
+
+
+def test_static_envelope_loads_only_hash_bound_artifact(tmp_path) -> None:
+    path = tmp_path / "envelope.json"
+    payload = {
+        "schema_version": 1,
+        "artifact_type": "stage_concurrency_envelope",
+        "artifact_id": "p4-stage1-cap-v3",
+        "safe_max_active_by_stage": {"0": 1, "1": 2, "2": 1},
+        "service_p95_limit_ms_by_stage": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    envelope = StaticConcurrencyEnvelope.from_json_file(
+        path,
+        expected_sha256=digest,
+    )
+
+    assert envelope.artifact_id == "p4-stage1-cap-v3"
+    assert envelope.safe_max_active_by_stage == {0: 1, 1: 2, 2: 1}
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        StaticConcurrencyEnvelope.from_json_file(
+            path,
+            expected_sha256="0" * 64,
+        )
+
+
+def test_static_envelope_rejects_wrong_artifact_type(tmp_path) -> None:
+    path = tmp_path / "not-envelope.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_type": "summary",
+                "artifact_id": "wrong",
+                "safe_max_active_by_stage": {"1": 2},
+            }
+        ),
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    with pytest.raises(ValueError, match="artifact_type"):
+        StaticConcurrencyEnvelope.from_json_file(
+            path,
+            expected_sha256=digest,
+        )
 
 
 def test_controller_rejects_legacy_raw_queue_pressure_semantics() -> None:
