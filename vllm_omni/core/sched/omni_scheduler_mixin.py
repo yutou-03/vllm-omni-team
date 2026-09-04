@@ -19,7 +19,20 @@ from vllm_omni.profiling.stage_queue_trace import (
     emit_stage_event,
     stage_trace_enabled,
 )
-from vllm_omni.scheduling.contracts import StageRuntimeSnapshot
+from vllm_omni.scheduling.config import (
+    SloSchedulingMode,
+    extract_slo_scheduling_config,
+)
+from vllm_omni.scheduling.contracts import (
+    RequestSLOContract,
+    StageRuntimeSnapshot,
+)
+from vllm_omni.scheduling.cost_model import StaticMilestoneCostModel
+from vllm_omni.scheduling.deadline import (
+    StageDeadlineSnapshot,
+    active_stage_milestones,
+    derive_stage_deadline_snapshot,
+)
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     preserve_scheduling_metadata,
@@ -29,6 +42,7 @@ from vllm_omni.scheduling.policy import (
     get_baseline_scheduling_policy,
     policy_applies_to_stage,
     policy_key,
+    request_scheduling_metadata,
 )
 from vllm_omni.scheduling.request_queue import (
     PolicyOrderedRequestQueue,
@@ -108,7 +122,51 @@ class OmniSchedulerMixin:
     def _initialize_baseline_scheduling(self) -> None:
         """Configure optional baseline ordering after the native scheduler init."""
 
-        self._baseline_policy = get_baseline_scheduling_policy()
+        environment_policy = get_baseline_scheduling_policy()
+        self._slo_scheduling_config = extract_slo_scheduling_config(
+            self.vllm_config
+        )
+        self._stage_ddl_model: StaticMilestoneCostModel | None = None
+        self._stage_ddl_snapshot_by_request: dict[
+            str, StageDeadlineSnapshot
+        ] = {}
+        self._stage_ddl_tick_monotonic_s: float | None = None
+        self._stage_ddl_version = 0
+        if (
+            self._slo_scheduling_config.enabled
+            and self._slo_scheduling_config.mode
+            is SloSchedulingMode.STAGE_DDL_FIXED
+        ):
+            if environment_policy is not BaselineSchedulingPolicy.NATIVE_FCFS:
+                raise ValueError(
+                    f"{environment_policy.value} conflicts with enabled SLO mode "
+                    f"{self._slo_scheduling_config.mode.value}"
+                )
+            stage_ddl_config = self._slo_scheduling_config.stage_ddl
+            assert stage_ddl_config.model_path is not None
+            assert stage_ddl_config.model_sha256 is not None
+            self._stage_ddl_model = StaticMilestoneCostModel.from_json_file(
+                stage_ddl_config.model_path,
+                expected_sha256=stage_ddl_config.model_sha256,
+                input_token_cutoff=stage_ddl_config.input_token_cutoff,
+                milestone_guard_ms=stage_ddl_config.milestone_guard_ms,
+            )
+            self._baseline_policy = BaselineSchedulingPolicy.STAGE_DDL_FIXED
+            self._stage_ddl_begin_tick()
+        elif (
+            self._slo_scheduling_config.enabled
+            and self._slo_scheduling_config.mode
+            in {
+                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
+                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
+            }
+        ):
+            raise NotImplementedError(
+                f"SLO mode {self._slo_scheduling_config.mode.value!r} is not "
+                "implemented; use stage_ddl_fixed"
+            )
+        else:
+            self._baseline_policy = environment_policy
         self._baseline_stage_id = int(self._omni_stage_id_for_trace())
         self._baseline_data_ready_time: dict[str, float] = {}
         self._baseline_data_ready_order: dict[str, int] = {}
@@ -132,18 +190,30 @@ class OmniSchedulerMixin:
         if not self._baseline_policy_applies():
             return
 
-        self.waiting = maybe_create_policy_ordered_queue(
-            self.waiting,
-            policy=self._baseline_policy,
-            stage_id=self._baseline_stage_id,
-            data_ready_time=self._baseline_request_data_ready_time,
-        )
-        self.skipped_waiting = maybe_create_policy_ordered_queue(
-            self.skipped_waiting,
-            policy=self._baseline_policy,
-            stage_id=self._baseline_stage_id,
-            data_ready_time=self._baseline_request_data_ready_time,
-        )
+        if self._baseline_policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+            if self.waiting or self.skipped_waiting:
+                raise ValueError(
+                    "Stage-DDL queues must replace empty native queues"
+                )
+            self.waiting = PolicyOrderedRequestQueue(
+                key=self._baseline_request_key
+            )
+            self.skipped_waiting = PolicyOrderedRequestQueue(
+                key=self._baseline_request_key
+            )
+        else:
+            self.waiting = maybe_create_policy_ordered_queue(
+                self.waiting,
+                policy=self._baseline_policy,
+                stage_id=self._baseline_stage_id,
+                data_ready_time=self._baseline_request_data_ready_time,
+            )
+            self.skipped_waiting = maybe_create_policy_ordered_queue(
+                self.skipped_waiting,
+                policy=self._baseline_policy,
+                stage_id=self._baseline_stage_id,
+                data_ready_time=self._baseline_request_data_ready_time,
+            )
 
     def _baseline_policy_applies(self) -> bool:
         policy = getattr(
@@ -164,13 +234,63 @@ class OmniSchedulerMixin:
         return self._baseline_data_ready_time.get(request.request_id, float("inf"))
 
     def _baseline_request_key(self, request: Request):
+        snapshot = None
+        if self._baseline_policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+            snapshot = self._stage_ddl_request_snapshot(request)
         return policy_key(
             request,
             policy=self._baseline_policy,
             stage_id=self._baseline_stage_id,
             data_ready_time=self._baseline_request_data_ready_time(request),
             now=time.monotonic(),
+            stage_deadline_snapshot=snapshot,
         )
+
+    def _stage_ddl_begin_tick(self) -> None:
+        self._stage_ddl_version += 1
+        self._stage_ddl_tick_monotonic_s = time.monotonic()
+        self._stage_ddl_snapshot_by_request.clear()
+
+    def _stage_ddl_request_snapshot(
+        self, request: Request
+    ) -> StageDeadlineSnapshot:
+        request_id = str(request.request_id)
+        existing = self._stage_ddl_snapshot_by_request.get(request_id)
+        if existing is not None:
+            return existing
+        if self._stage_ddl_model is None:
+            raise RuntimeError("Stage-DDL cost model is not initialized")
+        if self._stage_ddl_tick_monotonic_s is None:
+            raise RuntimeError("Stage-DDL tick snapshot is not initialized")
+        metadata = request_scheduling_metadata(request)
+        if metadata.get("sched_schema_version") != 2:
+            raise ValueError("Stage-DDL requires sched_schema_version=2")
+        contract = RequestSLOContract.from_server_metadata(metadata)
+        milestones = active_stage_milestones(
+            contract,
+            stage_id=self._baseline_stage_id,
+        )
+        costs = {
+            milestone: self._stage_ddl_model.predict(
+                request_path=contract.request_path,
+                stage_id=self._baseline_stage_id,
+                milestone=milestone,
+                num_prompt_tokens=request.num_prompt_tokens,
+            )
+            for milestone in milestones
+        }
+        snapshot = derive_stage_deadline_snapshot(
+            contract,
+            stage_id=self._baseline_stage_id,
+            captured_monotonic_s=self._stage_ddl_tick_monotonic_s,
+            milestone_costs=costs,
+            deadline_version=self._stage_ddl_version,
+            cost_model_version=self._stage_ddl_model.cost_model_version,
+            cost_source=self._stage_ddl_model.cost_source,
+            used_fallback=True,
+        )
+        self._stage_ddl_snapshot_by_request[request_id] = snapshot
+        return snapshot
 
     def _baseline_request_is_ready_on_add(self) -> bool:
         if self._baseline_stage_id == 0:
@@ -307,6 +427,8 @@ class OmniSchedulerMixin:
         """Refresh data-ready times and order runnable requests in place."""
 
         self._baseline_waiting_queue_choices = []
+        if self._baseline_policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+            self._stage_ddl_begin_tick()
         self._omni_request_progress_before_schedule = {
             str(request_id): int(request.num_computed_tokens)
             for request_id, request in getattr(self, "requests", {}).items()
@@ -332,7 +454,11 @@ class OmniSchedulerMixin:
                     str(request_id),
                     ready_time=ready_time,
                 )
-        if self._baseline_policy_applies():
+        if (
+            self._baseline_policy_applies()
+            and self._baseline_policy
+            is not BaselineSchedulingPolicy.STAGE_DDL_FIXED
+        ):
             self.running.sort(key=self._baseline_request_key)
 
         if trace_mechanism:
@@ -576,6 +702,10 @@ class OmniSchedulerMixin:
                 if reason
                 == ConformanceIneligibleReason.NONPREEMPTIVE_RUNNING_CAPACITY.value
             ),
+            "stage_ddl_snapshots": {
+                request_id: snapshot.to_event_fields()
+                for request_id, snapshot in self._stage_ddl_snapshot_by_request.items()
+            },
             **(self._baseline_policy_order_snapshot or {}),
         }
 
@@ -645,12 +775,14 @@ class OmniSchedulerMixin:
         if request_ids is None:
             ready_times.clear()
             self._baseline_data_ready_order.clear()
+            self._stage_ddl_snapshot_by_request.clear()
             return
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
         for request_id in request_ids:
             ready_times.pop(request_id, None)
             self._baseline_data_ready_order.pop(request_id, None)
+            self._stage_ddl_snapshot_by_request.pop(request_id, None)
 
     def _omni_stage_id_for_trace(self) -> int | str:
         return getattr(self.vllm_config.model_config, "stage_id", "?")
