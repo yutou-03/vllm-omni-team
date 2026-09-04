@@ -15,7 +15,7 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from vllm_omni.scheduling.contracts import StageRuntimeSnapshot
 
@@ -130,6 +130,7 @@ class AdmissionControllerConfig:
     deadline_risk_high_watermark: float = 0.6
     queue_growth_high_rps: float | None = None
     connector_backlog_high: int | None = None
+    require_downstream_pressure: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -180,6 +181,31 @@ class AdmissionControllerConfig:
                 self.connector_backlog_high,
                 field_name="connector_backlog_high",
             )
+        if not isinstance(self.require_downstream_pressure, bool):
+            raise ValueError("require_downstream_pressure must be a boolean")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: Mapping[str, Any] | None,
+    ) -> AdmissionControllerConfig:
+        if raw is None:
+            return cls()
+        if not isinstance(raw, Mapping):
+            raise ValueError("dynamic admission controller must be an object")
+        allowed = set(cls.__dataclass_fields__)
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise ValueError(
+                f"unknown dynamic admission controller fields: {unknown}"
+            )
+        return cls(**dict(raw))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +343,19 @@ def _increase_blockers(
         for name, value in required.items()
         if value is None
     )
+    if config.require_downstream_pressure:
+        for name in (
+            "downstream_waiting_requests",
+            "downstream_effective_cap",
+        ):
+            if getattr(snapshot, name) is None:
+                blockers.append(f"missing:{name}")
+    if (
+        config.require_downstream_pressure
+        and config.connector_backlog_high is not None
+        and snapshot.connector_backlog is None
+    ):
+        blockers.append("missing:connector_backlog")
     if (
         snapshot.gpu_active_ratio is not None
         and snapshot.gpu_active_ratio > config.gpu_low_watermark

@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from vllm_omni.recovery import PreemptionRecoveryMode
+from vllm_omni.scheduling.admission import AdmissionControllerConfig
 
 
 class SloSchedulingMode(str, Enum):
@@ -74,6 +75,144 @@ def _nonnegative_finite(value: Any, *, field_name: str) -> float:
 
 
 @dataclass(frozen=True, slots=True)
+class DynamicAdmissionConfig:
+    """Hash-bound controller configuration for selected pipeline stages."""
+
+    envelope_path: str | None = None
+    envelope_sha256: str | None = None
+    target_stage_ids: tuple[int, ...] = ()
+    initial_active_by_stage: Mapping[int, int] = field(default_factory=dict)
+    controller: AdmissionControllerConfig = AdmissionControllerConfig()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "initial_active_by_stage",
+            MappingProxyType(dict(self.initial_active_by_stage)),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        return self.envelope_path is not None
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: Mapping[str, Any] | None,
+    ) -> DynamicAdmissionConfig:
+        if raw is None:
+            return cls()
+        if not isinstance(raw, Mapping):
+            raise ValueError(
+                "slo_scheduling.stage_ddl.dynamic_admission must be an object"
+            )
+        expected = {
+            "envelope_path",
+            "envelope_sha256",
+            "target_stage_ids",
+            "initial_active_by_stage",
+            "controller",
+        }
+        _reject_unknown_fields(
+            raw,
+            allowed=expected,
+            scope="slo_scheduling.stage_ddl.dynamic_admission",
+        )
+        missing = sorted(expected - raw.keys())
+        if missing:
+            raise ValueError(
+                "slo_scheduling.stage_ddl.dynamic_admission missing fields: "
+                f"{missing}"
+            )
+        path = str(raw["envelope_path"])
+        if not path.strip():
+            raise ValueError("dynamic admission envelope_path must not be empty")
+        sha256 = str(raw["envelope_sha256"])
+        if not _SHA256_RE.fullmatch(sha256):
+            raise ValueError(
+                "dynamic admission envelope_sha256 must be 64 lowercase hex "
+                "characters"
+            )
+        raw_targets = raw["target_stage_ids"]
+        if isinstance(raw_targets, (str, bytes)) or not isinstance(
+            raw_targets, Sequence
+        ):
+            raise ValueError("dynamic admission target_stage_ids must be a list")
+        targets: list[int] = []
+        for value in raw_targets:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    "dynamic admission target_stage_ids must contain "
+                    "non-negative integers"
+                )
+            targets.append(value)
+        if not targets or len(targets) != len(set(targets)):
+            raise ValueError(
+                "dynamic admission target_stage_ids must be non-empty and unique"
+            )
+        raw_initial = raw["initial_active_by_stage"]
+        if not isinstance(raw_initial, Mapping):
+            raise ValueError(
+                "dynamic admission initial_active_by_stage must be an object"
+            )
+        initial: dict[int, int] = {}
+        for raw_stage, raw_cap in raw_initial.items():
+            try:
+                stage = int(raw_stage)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "dynamic admission initial stage ids must be integers"
+                ) from error
+            if str(stage) != str(raw_stage) or stage < 0:
+                raise ValueError(
+                    "dynamic admission initial stage ids must be "
+                    "non-negative integers"
+                )
+            if (
+                isinstance(raw_cap, bool)
+                or not isinstance(raw_cap, int)
+                or raw_cap <= 0
+            ):
+                raise ValueError(
+                    "dynamic admission initial caps must be positive integers"
+                )
+            initial[stage] = raw_cap
+        if set(initial) != set(targets):
+            raise ValueError(
+                "dynamic admission initial_active_by_stage keys must exactly "
+                "match target_stage_ids"
+            )
+        controller = AdmissionControllerConfig.from_mapping(raw["controller"])
+        for stage, cap in initial.items():
+            if not controller.min_active <= cap <= controller.max_active:
+                raise ValueError(
+                    f"dynamic admission initial cap for stage {stage} is "
+                    "outside controller bounds"
+                )
+        return cls(
+            envelope_path=path,
+            envelope_sha256=sha256,
+            target_stage_ids=tuple(targets),
+            initial_active_by_stage=initial,
+            controller=controller,
+        )
+
+    def to_dict(self) -> dict[str, Any] | None:
+        if not self.is_configured:
+            return None
+        return {
+            "envelope_path": self.envelope_path,
+            "envelope_sha256": self.envelope_sha256,
+            "target_stage_ids": list(self.target_stage_ids),
+            "initial_active_by_stage": {
+                str(stage): cap
+                for stage, cap in self.initial_active_by_stage.items()
+            },
+            "controller": self.controller.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class StageDDLConfig:
     """Hash-bound static milestone cost controls shared by every stage."""
 
@@ -83,6 +222,7 @@ class StageDDLConfig:
     milestone_guard_ms: Mapping[str, float] = field(
         default_factory=lambda: {"ttft": 5.0, "ttfp": 5.0, "e2e": 0.0}
     )
+    dynamic_admission: DynamicAdmissionConfig = DynamicAdmissionConfig()
 
     def __post_init__(self) -> None:
         guards = dict(self.milestone_guard_ms)
@@ -105,6 +245,7 @@ class StageDDLConfig:
                 "model_sha256",
                 "input_token_cutoff",
                 "milestone_guard_ms",
+                "dynamic_admission",
             },
             scope="slo_scheduling.stage_ddl",
         )
@@ -166,15 +307,22 @@ class StageDDLConfig:
             model_sha256=model_sha256,
             input_token_cutoff=cutoff,
             milestone_guard_ms=guards,
+            dynamic_admission=DynamicAdmissionConfig.from_mapping(
+                raw.get("dynamic_admission")
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "model_path": self.model_path,
             "model_sha256": self.model_sha256,
             "input_token_cutoff": self.input_token_cutoff,
             "milestone_guard_ms": dict(self.milestone_guard_ms),
         }
+        dynamic = self.dynamic_admission.to_dict()
+        if dynamic is not None:
+            result["dynamic_admission"] = dynamic
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +440,24 @@ class SloSchedulingConfig:
             raise ValueError(
                 "slo_scheduling.stage_ddl.model_path and model_sha256 are "
                 "required for an enabled profiled deadline mode"
+            )
+        dynamic_modes = {
+            SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
+            SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
+        }
+        if enabled and mode in dynamic_modes and not (
+            stage_ddl.dynamic_admission.is_configured
+        ):
+            raise ValueError(
+                "slo_scheduling.stage_ddl.dynamic_admission is required "
+                "for dynamic admission modes"
+            )
+        if mode not in dynamic_modes and (
+            stage_ddl.dynamic_admission.is_configured
+        ):
+            raise ValueError(
+                "slo_scheduling.stage_ddl.dynamic_admission is only valid "
+                "for dynamic admission modes"
             )
         return cls(
             enabled=enabled,
