@@ -246,6 +246,32 @@ def _normalize_costs(
     return normalized
 
 
+def active_stage_milestones(
+    contract: RequestSLOContract,
+    *,
+    stage_id: int,
+    completed_milestones: Iterable[SLOMilestone | str] = (),
+) -> tuple[SLOMilestone, ...]:
+    """Return one-shot milestones that the given request stage can affect."""
+
+    if not isinstance(contract, RequestSLOContract):
+        raise ValueError("contract must be a RequestSLOContract")
+    if stage_id not in (0, 1, 2):
+        raise ValueError("stage_id must be one of [0, 1, 2]")
+    path_scope = _STAGE_MILESTONE_SCOPE[contract.request_path]
+    if stage_id not in path_scope:
+        raise ValueError(
+            f"{contract.request_path.value} path does not traverse stage {stage_id}"
+        )
+    contract_milestones = set(contract.milestone_deadlines_s)
+    completed = _normalize_completed_milestones(
+        completed_milestones,
+        contract_milestones=contract_milestones,
+    )
+    active = (contract_milestones & path_scope[stage_id]) - completed
+    return tuple(sorted(active, key=lambda milestone: milestone.value))
+
+
 def derive_stage_deadline_snapshot(
     contract: RequestSLOContract,
     *,
@@ -265,23 +291,18 @@ def derive_stage_deadline_snapshot(
     one-shot milestone deadline.
     """
 
-    if not isinstance(contract, RequestSLOContract):
-        raise ValueError("contract must be a RequestSLOContract")
-    if stage_id not in (0, 1, 2):
-        raise ValueError("stage_id must be one of [0, 1, 2]")
-    path_scope = _STAGE_MILESTONE_SCOPE[contract.request_path]
-    if stage_id not in path_scope:
-        raise ValueError(
-            f"{contract.request_path.value} path does not traverse stage {stage_id}"
-        )
-
     contract_milestones = set(contract.milestone_deadlines_s)
     completed = _normalize_completed_milestones(
         completed_milestones,
         contract_milestones=contract_milestones,
     )
-    stage_scope = path_scope[stage_id]
-    expected = (contract_milestones & stage_scope) - completed
+    expected = set(
+        active_stage_milestones(
+            contract,
+            stage_id=stage_id,
+            completed_milestones=completed,
+        )
+    )
     if not expected:
         raise ValueError("no active one-shot milestone remains for this stage")
 
