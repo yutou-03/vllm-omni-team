@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any
 
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.scheduling.deadline import StageDeadlineSnapshot
 from vllm_omni.scheduling.metadata import extract_scheduling_metadata
 
 BASELINE_POLICY_ENV = "VLLM_OMNI_BASELINE_POLICY"
@@ -21,6 +22,7 @@ class BaselineSchedulingPolicy(str, Enum):
     SRPF_LOCAL_NP = "srpf_local_np"
     FINAL_DEADLINE_EDF_NP = "final_deadline_edf_np"
     STAGE_DEADLINE_EDF_NP = "stage_deadline_edf_np"
+    STAGE_DDL_FIXED = "stage_ddl_fixed"
 
 
 class SchedulingMetadataError(ValueError):
@@ -142,6 +144,7 @@ def policy_key(
     stage_id: int,
     data_ready_time: float,
     now: float,
+    stage_deadline_snapshot: StageDeadlineSnapshot | None = None,
 ) -> PolicyKey:
     """Compute a deterministic total-order key for one eligible request.
 
@@ -165,6 +168,39 @@ def policy_key(
             request_id=request_id,
         )
     )
+
+    if policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+        if stage_deadline_snapshot is None:
+            raise SchedulingMetadataError(
+                f"request {request_id!r} requires a frozen snapshot for Stage-DDL"
+            )
+        logical_request_id = str(
+            _required_field(
+                metadata,
+                "sched_logical_request_id",
+                request_id=request_id,
+            )
+        )
+        if (
+            stage_deadline_snapshot.logical_request_id != logical_request_id
+            or stage_deadline_snapshot.stage_id != stage_id
+        ):
+            raise SchedulingMetadataError(
+                f"request {request_id!r} Stage-DDL snapshot identity does not match"
+            )
+        base_laxity = float(stage_deadline_snapshot.base_laxity_s)
+        if not math.isfinite(base_laxity):
+            raise SchedulingMetadataError(
+                f"request {request_id!r} has a non-finite Stage-DDL laxity"
+            )
+        ingress_order = int(
+            _required_field(
+                metadata,
+                "sched_ingress_order",
+                request_id=request_id,
+            )
+        )
+        return base_laxity, ingress_order, logical_request_id, request_id
 
     if policy in (
         BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,
