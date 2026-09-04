@@ -944,6 +944,10 @@ def test_scheduler_omits_stale_downstream_pressure_and_rejects_bad_updates():
     with pytest.raises(ValueError, match="control_epoch must increase"):
         scheduler._update_slo_downstream_pressure(sample)
 
+    refreshed = {**sample, "captured_monotonic_s": 100.1}
+    scheduler._update_slo_downstream_pressure(refreshed)
+    assert scheduler._slo_downstream_pressure == refreshed
+
 
 def test_conformance_trace_records_kv_preemption_requeue_and_resume(monkeypatch):
     monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)

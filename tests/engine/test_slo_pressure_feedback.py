@@ -98,7 +98,7 @@ def _feedback_orchestrator(clients: list[_FeedbackClient]) -> Orchestrator:
         SimpleNamespace(num_replicas=1, clients=[client])
         for client in clients
     ]
-    orchestrator._slo_feedback_last_epoch_by_edge = {}
+    orchestrator._slo_feedback_last_sample_by_edge = {}
     return orchestrator
 
 
@@ -115,14 +115,23 @@ async def test_orchestrator_relays_adjacent_pressure_downstream_to_upstream():
     assert stage1.updates == [_sample(2, 7)]
     assert stage2.updates == []
 
-    # Repeated source epochs are not resent; idle cores may retain an epoch.
+    # An identical observation is not resent.
     await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
     assert stage0.updates == [_sample(1, 5)]
     assert stage1.updates == [_sample(2, 7)]
 
-    stage2.sample = _sample(2, 8)
+    # A fresh capture of an unchanged epoch refreshes an idle-stage sample.
+    stage2.sample = {
+        **_sample(2, 7),
+        "captured_monotonic_s": 102.1,
+    }
     await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
-    assert stage1.updates[-1] == _sample(2, 8)
+    assert stage1.updates[-1] == stage2.sample
+
+    stage2.sample = _sample(2, 8)
+    stage2.sample["captured_monotonic_s"] = 102.2
+    await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
+    assert stage1.updates[-1] == stage2.sample
 
 
 @pytest.mark.asyncio
@@ -135,7 +144,7 @@ async def test_orchestrator_feedback_fails_closed_for_multi_replica_stage():
         SimpleNamespace(num_replicas=1, clients=[stage0]),
         SimpleNamespace(num_replicas=2, clients=[stage1a, stage1b]),
     ]
-    orchestrator._slo_feedback_last_epoch_by_edge = {}
+    orchestrator._slo_feedback_last_sample_by_edge = {}
 
     await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
 
