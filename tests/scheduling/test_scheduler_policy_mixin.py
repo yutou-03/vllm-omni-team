@@ -714,6 +714,40 @@ def test_iteration_trace_carries_immutable_stage_pressure_snapshot(monkeypatch):
     }
 
 
+def test_pressure_snapshot_excludes_input_blocked_requests_from_active_counts():
+    scheduler = SchedulerHarness(2)
+    scheduler.max_num_running_reqs = 4
+    scheduler.max_num_scheduled_tokens = 1024
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.25)
+    ready_running = FakeRequest("ready-running", deadline=None)
+    ready_running.status = SimpleNamespace(name="RUNNING")
+    chunk_blocked_running = FakeRequest("chunk-running", deadline=None)
+    chunk_blocked_running.status = SimpleNamespace(name="WAITING_FOR_CHUNK")
+    ready_waiting = FakeRequest("ready-waiting", deadline=None)
+    ready_waiting.status = SimpleNamespace(name="WAITING")
+    input_blocked_waiting = FakeRequest("input-waiting", deadline=None)
+    input_blocked_waiting.status = SimpleNamespace(name="WAITING_FOR_INPUT")
+    adapter_only = FakeRequest("adapter-only", deadline=None)
+    adapter_only.status = SimpleNamespace(name="WAITING_FOR_CHUNK")
+
+    scheduler.running = [ready_running, chunk_blocked_running]
+    scheduler.waiting.add_request(ready_waiting)
+    scheduler.waiting.add_request(input_blocked_waiting)
+    scheduler.chunk_transfer_adapter = SimpleNamespace(
+        waiting_for_chunk_running_requests=[chunk_blocked_running],
+        waiting_for_chunk_waiting_requests=[adapter_only],
+    )
+
+    pressure = scheduler._capture_stage_runtime_snapshot(
+        captured_monotonic_s=100.0,
+        token_budget_available=512,
+    )
+
+    assert pressure["running_requests"] == 1
+    assert pressure["waiting_requests"] == 1
+    assert pressure["input_waiting_requests"] == 3
+
+
 def test_conformance_trace_records_kv_preemption_requeue_and_resume(monkeypatch):
     monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
     monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
