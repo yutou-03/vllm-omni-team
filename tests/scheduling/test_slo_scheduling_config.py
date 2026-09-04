@@ -61,6 +61,22 @@ def test_stage_ddl_config_parses_hash_bound_static_model():
     }
 
 
+def test_clockwork_latest_start_reuses_hash_bound_cost_model():
+    config = SloSchedulingConfig.from_mapping(
+        {
+            "enabled": True,
+            "mode": "clockwork_latest_start_fixed",
+            "stage_ddl": {
+                "model_path": "/models/p3.json",
+                "model_sha256": "a" * 64,
+            },
+        }
+    )
+
+    assert config.mode is SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED
+    assert config.stage_ddl.is_configured
+
+
 def test_enabled_stage_local_mode_must_be_explicitly_allowed():
     config = SloSchedulingConfig.from_mapping(
         {
@@ -128,6 +144,10 @@ def test_disabled_master_switch_forces_baseline_recovery():
         ),
         (
             {"enabled": True, "mode": "stage_ddl_fixed"},
+            "stage_ddl.model_path.*required",
+        ),
+        (
+            {"enabled": True, "mode": "clockwork_latest_start_fixed"},
             "stage_ddl.model_path.*required",
         ),
         (

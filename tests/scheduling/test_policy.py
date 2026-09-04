@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.scheduling.contracts import RequestSLOContract
+from vllm_omni.scheduling.contracts import (
+    RequestSLOContract,
+    SLOMilestone,
+)
 from vllm_omni.scheduling.deadline import (
     MilestoneCostEstimate,
     derive_stage_deadline_snapshot,
@@ -211,6 +214,43 @@ def test_multi_milestone_stage_ddl_orders_by_base_laxity_not_final_deadline():
     )
 
     assert ordered == [tighter_ttft, earlier_final]
+
+
+def test_clockwork_latest_start_uses_profiled_e2e_remaining_time_only():
+    earlier_e2e = _stage_ddl_request("e2e-first", 0, 102.0, 104.0)
+    tighter_ttft = _stage_ddl_request("ttft-first", 1, 101.0, 110.0)
+    snapshots = {
+        earlier_e2e.request_id: _stage_ddl_snapshot(
+            earlier_e2e, ttft_cost_ms=100.0, e2e_cost_ms=500.0
+        ),
+        tighter_ttft.request_id: _stage_ddl_snapshot(
+            tighter_ttft, ttft_cost_ms=700.0, e2e_cost_ms=500.0
+        ),
+    }
+
+    ordered = sorted(
+        [tighter_ttft, earlier_e2e],
+        key=lambda request: policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP,
+            stage_id=0,
+            data_ready_time=100.0,
+            now=100.5,
+            stage_deadline_snapshot=snapshots[request.request_id],
+        ),
+    )
+
+    assert ordered == [earlier_e2e, tighter_ttft]
+    assert policy_key(
+        earlier_e2e,
+        policy=BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP,
+        stage_id=0,
+        data_ready_time=100.0,
+        now=100.5,
+        stage_deadline_snapshot=snapshots[earlier_e2e.request_id],
+    )[0] == snapshots[earlier_e2e.request_id].milestone_laxities_s[
+        SLOMilestone.E2E
+    ]
 
 
 def test_stage_ddl_key_requires_matching_frozen_snapshot():

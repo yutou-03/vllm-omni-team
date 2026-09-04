@@ -239,6 +239,38 @@ def test_stage_ddl_mode_loads_model_and_orders_only_waiting(monkeypatch):
     assert scheduler.running == [short, long]
 
 
+def test_clockwork_mode_loads_same_model_but_orders_by_e2e_laxity(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *args, **kwargs: FakeMilestoneModel(),
+    )
+    scheduler = SchedulerHarness(
+        0, additional_config=_stage_ddl_config("clockwork_latest_start_fixed")
+    )
+    earlier_e2e = _set_stage_ddl_metadata(
+        FakeRequest("e2e-first", deadline=None, num_prompt_tokens=36),
+        ingress_order=0,
+        ttft=102.0,
+        e2e=104.0,
+    )
+    tighter_ttft = _set_stage_ddl_metadata(
+        FakeRequest("ttft-first", deadline=None, num_prompt_tokens=216),
+        ingress_order=1,
+        ttft=101.0,
+        e2e=110.0,
+    )
+    scheduler.add_request(tighter_ttft)
+    scheduler.add_request(earlier_e2e)
+
+    assert (
+        scheduler._baseline_policy
+        is BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP
+    )
+    assert scheduler.waiting.peek_request() is earlier_e2e
+
+
 def test_stage_ddl_freezes_one_snapshot_time_per_scheduler_tick(monkeypatch):
     monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
     monkeypatch.setattr(
