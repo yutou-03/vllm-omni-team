@@ -18,6 +18,7 @@ def _snapshot(**overrides):
         "effective_max_num_seqs": 4,
         "token_budget_total": 4096,
         "token_budget_available": 1024,
+        "token_budget_utilization_ratio": 0.75,
         "kv_cache_usage_ratio": 0.75,
         "gpu_active_ratio": 0.9,
         "service_time_ewma_ms": 12.5,
@@ -27,6 +28,8 @@ def _snapshot(**overrides):
         "downstream_effective_cap": 3,
         "connector_backlog": 2,
         "deadline_miss_risk": 0.2,
+        "deadline_miss_risk_population": 5,
+        "deadline_miss_risk_scope": "runnable_running",
         "last_admission_rejection": "effective_cap_reached",
     }
     values.update(overrides)
@@ -46,6 +49,7 @@ def test_stage_runtime_snapshot_is_immutable_and_serializable():
         "effective_max_num_seqs": 4,
         "token_budget_total": 4096,
         "token_budget_available": 1024,
+        "token_budget_utilization_ratio": 0.75,
         "kv_cache_usage_ratio": 0.75,
         "gpu_active_ratio": 0.9,
         "service_time_ewma_ms": 12.5,
@@ -55,6 +59,8 @@ def test_stage_runtime_snapshot_is_immutable_and_serializable():
         "downstream_effective_cap": 3,
         "connector_backlog": 2,
         "deadline_miss_risk": 0.2,
+        "deadline_miss_risk_population": 5,
+        "deadline_miss_risk_scope": "runnable_running",
         "last_admission_rejection": "effective_cap_reached",
         "captured_monotonic_s": 100.0,
     }
@@ -76,6 +82,14 @@ def test_stage_runtime_snapshot_is_immutable_and_serializable():
         ),
         ({"kv_cache_usage_ratio": 1.1}, "kv_cache_usage_ratio must be in"),
         ({"deadline_miss_risk": -0.1}, "deadline_miss_risk must be in"),
+        (
+            {"deadline_miss_risk_scope": "all_queued"},
+            "deadline_miss_risk_scope must be runnable_running",
+        ),
+        (
+            {"token_budget_utilization_ratio": 1.1},
+            "token_budget_utilization_ratio must be in",
+        ),
         ({"service_time_p95_ms": -1}, "service_time_p95_ms must be non-negative"),
     ],
 )
@@ -95,6 +109,8 @@ def test_stage_runtime_snapshot_omits_unavailable_optional_signals():
         downstream_effective_cap=None,
         connector_backlog=None,
         deadline_miss_risk=None,
+        deadline_miss_risk_population=None,
+        deadline_miss_risk_scope=None,
         last_admission_rejection=None,
     )
 
@@ -102,6 +118,11 @@ def test_stage_runtime_snapshot_omits_unavailable_optional_signals():
     assert "kv_cache_usage_ratio" not in fields
     assert "downstream_waiting_requests" not in fields
     assert "last_admission_rejection" not in fields
+
+
+def test_deadline_risk_metadata_must_be_all_present_or_all_absent():
+    with pytest.raises(ValueError, match="deadline risk fields must be provided together"):
+        _snapshot(deadline_miss_risk_population=None)
 
 
 def test_stage_runtime_snapshot_v2_marks_runnable_count_semantics():
