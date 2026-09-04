@@ -31,6 +31,21 @@ def test_valid_stage_lifecycle_and_commits_pass():
     assert report.violation_counts == {}
 
 
+def test_local_reentry_starts_a_new_stage_attempt():
+    report = check_trace_invariants(
+        [
+            _event("stage_enqueue", stage_attempt_id=0),
+            _event("stage_schedule", stage_attempt_id=0),
+            _event("stage_reentered", stage_attempt_id=1),
+            _event("stage_schedule", stage_attempt_id=1),
+            _event("stage_done", stage_attempt_id=1),
+        ]
+    )
+
+    assert report.valid is True
+    assert report.violation_counts == {}
+
+
 def test_checker_detects_negative_duration_duplicate_and_illegal_transition():
     report = check_trace_invariants(
         [

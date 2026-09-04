@@ -113,6 +113,15 @@ def test_talker_stage_local_preemption_requeues_only_immutable_input(monkeypatch
     scheduler._omni_preemption_progress_pending = {}
     scheduler._omni_preemption_rule_ids_pending = {}
     scheduler._omni_preemption_recovery_modes_pending = {}
+    scheduler._omni_recovery_trace_by_request = {}
+    scheduler._omni_request_trace_fields_by_request = {
+        "logical": {
+            "logical_request_id": "logical",
+            "execution_id": "logical",
+            "pipeline_attempt_id": 0,
+            "stage_attempt_id": 0,
+        }
+    }
     request = SimpleNamespace(
         request_id="logical",
         external_req_id="logical",
@@ -154,6 +163,19 @@ def test_talker_stage_local_preemption_requeues_only_immutable_input(monkeypatch
     assert scheduler._omni_preemption_recovery_modes_pending == {
         "logical": "stage_local_recompute"
     }
+    assert scheduler._omni_recovery_trace_by_request["logical"] == {
+        "logical_request_id": "logical",
+        "execution_id": "logical",
+        "pipeline_attempt_id": 0,
+        "stage_attempt_id": 1,
+        "recovery_target_stage_id": 1,
+        "recovery_target_num_computed_tokens": 4,
+        "preemption_cause": "allocation_failure",
+    }
+    assert (
+        scheduler._omni_request_trace_fields_by_request["logical"]
+        == scheduler._omni_recovery_trace_by_request["logical"]
+    )
     assert [event for event, _ in events] == [
         "stage_local_dynamic_state_discarded"
     ]

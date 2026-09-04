@@ -545,6 +545,16 @@ def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
     assert prewarm_calls[0][3]["end_stage_id"] == 1
     assert prewarm_calls[0][3]["recovery"] is True
     assert prewarm_calls[0][3]["connector_req_id"] == execution_id
+    assert state.pending_restart_stages == {2}
+
+    asyncio.run(
+        orchestrator._submit_next_restart_stage_after_upstream_output(
+            1, [SimpleNamespace(request_id=execution_id)]
+        )
+    )
+    assert prewarm_calls[1][3]["start_stage_id"] == 2
+    assert prewarm_calls[1][3]["end_stage_id"] == 2
+    assert state.pending_restart_stages == set()
 
 
 def test_local_recompute_trace_identity_is_preserved_at_pipeline_attempt_zero():
@@ -573,18 +583,6 @@ def test_local_recompute_trace_identity_is_preserved_at_pipeline_attempt_zero():
         "preemption_cause": "controlled_restart",
         "controlled_rule_id": "s1-half",
     }
-    assert state.pending_restart_stages == {2}
-
-    asyncio.run(
-        orchestrator._submit_next_restart_stage_after_upstream_output(
-            1, [SimpleNamespace(request_id=execution_id)]
-        )
-    )
-    assert prewarm_calls[1][3]["start_stage_id"] == 2
-    assert prewarm_calls[1][3]["end_stage_id"] == 2
-    assert state.pending_restart_stages == set()
-
-
 def test_recovery_progress_events_are_confirmed_once(monkeypatch):
     scheduler = object.__new__(OmniARAsyncScheduler)
     scheduler._omni_stage_id_for_trace = lambda: 1
