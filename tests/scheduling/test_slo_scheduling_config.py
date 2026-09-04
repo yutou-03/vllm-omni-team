@@ -8,6 +8,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
 )
 from vllm_omni.recovery import PreemptionRecoveryMode
 from vllm_omni.scheduling.config import (
+    StageDDLConfig,
     SloSchedulingConfig,
     SloSchedulingMode,
     effective_preemption_recovery_mode,
@@ -23,6 +24,41 @@ def test_slo_config_defaults_are_disabled_and_native():
     assert config.recovery.allowed_modes == (
         PreemptionRecoveryMode.FULL_PIPELINE_RESTART,
     )
+    assert config.stage_ddl == StageDDLConfig()
+
+
+def test_stage_ddl_config_parses_hash_bound_static_model():
+    config = SloSchedulingConfig.from_mapping(
+        {
+            "enabled": True,
+            "mode": "stage_ddl_fixed",
+            "stage_ddl": {
+                "model_path": "/models/p3.json",
+                "model_sha256": "a" * 64,
+                "input_token_cutoff": 128,
+                "milestone_guard_ms": {
+                    "ttft": 5.0,
+                    "ttfp": 5.0,
+                    "e2e": 0.0,
+                },
+            },
+        }
+    )
+
+    assert config.stage_ddl.model_path == "/models/p3.json"
+    assert config.stage_ddl.model_sha256 == "a" * 64
+    assert config.stage_ddl.input_token_cutoff == 128
+    assert config.stage_ddl.milestone_guard_ms == {
+        "ttft": 5.0,
+        "ttfp": 5.0,
+        "e2e": 0.0,
+    }
+    assert config.to_dict()["stage_ddl"] == {
+        "model_path": "/models/p3.json",
+        "model_sha256": "a" * 64,
+        "input_token_cutoff": 128,
+        "milestone_guard_ms": {"ttft": 5.0, "ttfp": 5.0, "e2e": 0.0},
+    }
 
 
 def test_enabled_stage_local_mode_must_be_explicitly_allowed():
@@ -89,6 +125,23 @@ def test_disabled_master_switch_forces_baseline_recovery():
         (
             {"recovery": {"allowed_modes": ["stage_local_recompute"]}},
             "must include full_pipeline_restart",
+        ),
+        (
+            {"enabled": True, "mode": "stage_ddl_fixed"},
+            "stage_ddl.model_path.*required",
+        ),
+        (
+            {
+                "stage_ddl": {
+                    "model_path": "/models/p3.json",
+                    "model_sha256": "bad",
+                }
+            },
+            "model_sha256",
+        ),
+        (
+            {"stage_ddl": {"milestone_guard_ms": {"ttft": 5.0}}},
+            "milestone_guard_ms.*missing",
         ),
     ],
 )
