@@ -1,6 +1,7 @@
 import pytest
 
 from vllm_omni.scheduling.metadata import (
+    CURRENT_SCHEDULING_SCHEMA_VERSION,
     build_client_scheduling_metadata,
     build_server_scheduling_metadata,
     derive_stage_deadlines,
@@ -9,6 +10,85 @@ from vllm_omni.scheduling.metadata import (
     normalize_client_scheduling_metadata,
     preserve_scheduling_metadata,
 )
+
+
+def _valid_v2_metadata(**overrides):
+    metadata = {
+        "schema_version": 2,
+        "source_request_id": "request-v2",
+        "ingress_order": 7,
+        "request_path": "audio",
+        "service_class": "realtime",
+        "milestone_slo_ms": {
+            "ttft": 500,
+            "ttfp": 900,
+            "audio_gap": 120,
+            "e2e": 3000,
+        },
+        "text_consume_rate_tps": 25,
+        "audio_consume_rate": 1,
+        "max_preemptions": 2,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def test_current_schema_is_v2_while_v1_remains_accepted():
+    assert CURRENT_SCHEDULING_SCHEMA_VERSION == 2
+    assert normalize_client_scheduling_metadata(
+        {"schema_version": 1, "source_request_id": "legacy", "ingress_order": 0}
+    ) == {"schema_version": 1, "source_request_id": "legacy", "ingress_order": 0}
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "source_request_id",
+        "ingress_order",
+        "request_path",
+        "service_class",
+        "milestone_slo_ms",
+        "max_preemptions",
+    ],
+)
+def test_v2_missing_required_field_fails_closed(missing):
+    metadata = _valid_v2_metadata()
+    del metadata[missing]
+
+    with pytest.raises(ValueError, match=f"missing {missing}"):
+        normalize_client_scheduling_metadata(metadata)
+
+
+def test_server_owns_v2_logical_id_and_absolute_milestone_deadlines():
+    metadata = build_server_scheduling_metadata(
+        _valid_v2_metadata(),
+        ingress_monotonic_s=100.0,
+        ingress_wall_s=1700000000.0,
+        logical_request_id="chatcmpl-server-id",
+    )
+
+    assert metadata["sched_schema_version"] == 2
+    assert metadata["sched_logical_request_id"] == "chatcmpl-server-id"
+    assert metadata["sched_milestone_deadlines_monotonic_s"] == {
+        "ttft": 100.5,
+        "ttfp": 100.9,
+        "audio_gap": 100.12,
+        "e2e": 103.0,
+    }
+    assert metadata["sched_deadline_monotonic_s"] == 103.0
+    assert metadata["sched_service_class"] == "realtime"
+    assert metadata["sched_max_preemptions"] == 2
+
+
+def test_v2_rejects_path_inapplicable_milestones():
+    with pytest.raises(ValueError, match="milestones not applicable to text.*ttfp"):
+        normalize_client_scheduling_metadata(
+            _valid_v2_metadata(
+                request_path="text",
+                milestone_slo_ms={"ttft": 500, "ttfp": 900, "e2e": 3000},
+                audio_consume_rate=None,
+            )
+        )
 
 
 def test_build_client_scheduling_metadata_normalizes_stage_mapping():
