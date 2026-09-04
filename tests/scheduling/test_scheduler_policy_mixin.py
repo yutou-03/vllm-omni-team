@@ -181,6 +181,7 @@ def _dynamic_stage_ddl_config(*, decrease_hold=20):
             "queue_growth_high_rps": None,
             "connector_backlog_high": 2,
             "require_downstream_pressure": True,
+            "reset_to_safe_cap_when_fully_idle": True,
         },
     }
     return config
@@ -428,6 +429,20 @@ def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
     scheduler._baseline_prepare_schedule(token_budget_before=100)
     assert scheduler.effective_max_num_seqs == 1
     assert scheduler.max_num_running_reqs == 1
+
+    scheduler.running = []
+    scheduler.chunk_transfer_adapter = SimpleNamespace(
+        waiting_for_chunk_running_requests=[],
+        waiting_for_chunk_waiting_requests=[],
+        get_control_signal_snapshot=lambda: {
+            "sender_pending_save_requests": 0,
+            "sender_save_inflight": 0,
+        },
+    )
+    scheduler._baseline_prepare_schedule(token_budget_before=100)
+    assert scheduler._slo_last_admission_decision.action.value == "reset"
+    assert scheduler.effective_max_num_seqs == 2
+    assert scheduler.max_num_running_reqs == 2
 
     pressure = scheduler._capture_stage_runtime_snapshot(
         captured_monotonic_s=now,

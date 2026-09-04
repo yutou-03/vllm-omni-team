@@ -61,6 +61,7 @@ def _config(**overrides) -> AdmissionControllerConfig:
         "queue_growth_high_rps": 5.0,
         "connector_backlog_high": 2,
         "require_downstream_pressure": False,
+        "reset_to_safe_cap_when_fully_idle": False,
     }
     values.update(overrides)
     return AdmissionControllerConfig(**values)
@@ -215,6 +216,44 @@ def test_input_waiting_requests_are_not_runnable_demand() -> None:
 
     assert decision.action is AdmissionAction.HOLD
     assert "no_runnable_waiting_demand" in decision.blocked_reasons
+
+
+def test_fully_idle_stage_can_reset_to_safe_cap_between_busy_periods() -> None:
+    decision = decide_admission_cap(
+        _config(
+            max_active=2,
+            reset_to_safe_cap_when_fully_idle=True,
+            require_downstream_pressure=True,
+        ),
+        _envelope(safe_max_active_by_stage={0: 2}),
+        _snapshot(
+            running_requests=0,
+            waiting_requests=0,
+            input_waiting_requests=0,
+            physical_max_num_seqs=2,
+            effective_max_num_seqs=1,
+            downstream_waiting_requests=0,
+            downstream_effective_cap=1,
+            downstream_stage_id=1,
+            downstream_control_epoch=7,
+            downstream_sample_age_ms=25.0,
+            downstream_source="engine_core_utility",
+            connector_backlog=0,
+            connector_backlog_scope="sender_pending_save_and_inflight",
+        ),
+        AdmissionControllerState(
+            current_cap=1,
+            last_change_epoch=1,
+            last_observed_epoch=0,
+        ),
+    )
+
+    assert decision.action is AdmissionAction.RESET
+    assert decision.old_cap == 1
+    assert decision.new_cap == 2
+    assert decision.trigger_reasons == ("fully_idle_reset",)
+    assert decision.drain_only is False
+    assert decision.evicted_requests == 0
 
 
 def test_high_pressure_uses_aimd_decrease_and_never_evicts_running() -> None:
