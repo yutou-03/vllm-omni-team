@@ -411,7 +411,10 @@ def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
     scheduler._baseline_prepare_schedule(token_budget_before=100)
 
     assert scheduler.effective_max_num_seqs == 1
-    assert scheduler.max_num_running_reqs == 1
+    # vLLM asserts running <= max_num_running_reqs before it can drain.  The
+    # enforcement ceiling therefore follows the existing population down,
+    # while the logical effective cap immediately blocks new admissions.
+    assert scheduler.max_num_running_reqs == 2
     assert len(scheduler.running) == 2
     decision = scheduler._slo_last_admission_decision
     assert decision.action.value == "decrease"
@@ -419,6 +422,12 @@ def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
     assert decision.evicted_requests == 0
     assert decisions[-1][0] == "stage_admission_decision"
     assert decisions[-1][1]["new_effective_max_num_seqs"] == 1
+    assert decisions[-1][1]["scheduler_enforcement_max_num_seqs"] == 2
+
+    scheduler.running = [at_risk]
+    scheduler._baseline_prepare_schedule(token_budget_before=100)
+    assert scheduler.effective_max_num_seqs == 1
+    assert scheduler.max_num_running_reqs == 1
 
     pressure = scheduler._capture_stage_runtime_snapshot(
         captured_monotonic_s=now,
