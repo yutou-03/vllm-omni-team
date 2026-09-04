@@ -271,7 +271,12 @@ def test_explicit_pressure_signals_are_recorded_in_stable_order() -> None:
             queue_growth_rate_rps=7.0,
             downstream_waiting_requests=3,
             downstream_effective_cap=3,
+            downstream_stage_id=1,
+            downstream_control_epoch=7,
+            downstream_sample_age_ms=25.0,
+            downstream_source="engine_core_utility",
             connector_backlog=2,
+            connector_backlog_scope="sender_pending_save_and_inflight",
         ),
         AdmissionControllerState.initial(4),
     )

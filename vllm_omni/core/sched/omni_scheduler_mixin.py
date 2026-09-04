@@ -56,6 +56,7 @@ from vllm_omni.scheduling.signals import (
 )
 
 _STATS_INTERVAL_S = 1.0
+_DOWNSTREAM_PRESSURE_MAX_AGE_S = 0.5
 _PROFILED_DEADLINE_POLICIES = frozenset(
     {
         BaselineSchedulingPolicy.STAGE_DDL_FIXED,
@@ -145,6 +146,7 @@ class OmniSchedulerMixin:
         self._stage_ddl_tick_monotonic_s: float | None = None
         self._stage_ddl_version = 0
         self._slo_control_epoch = 0
+        self._slo_downstream_pressure: dict[str, Any] | None = None
         if (
             self._slo_scheduling_config.enabled
             and self._slo_scheduling_config.mode
@@ -419,6 +421,8 @@ class OmniSchedulerMixin:
         queue_growth = None
         deadline_risk = None
         gpu_active = None
+        downstream_pressure = None
+        connector_backlog = None
         if update_control_signals:
             token_utilization = token_budget_utilization_ratio(
                 total=total_token_budget,
@@ -449,6 +453,20 @@ class OmniSchedulerMixin:
                 deadline_risk = estimate_deadline_miss_risk(
                     running_laxities
                 )
+            downstream_pressure = self._fresh_slo_downstream_pressure(
+                captured_monotonic_s=captured,
+            )
+            adapter = getattr(self, "chunk_transfer_adapter", None)
+            get_connector_signals = getattr(
+                adapter,
+                "get_control_signal_snapshot",
+                None,
+            )
+            if callable(get_connector_signals):
+                connector_signals = get_connector_signals()
+                connector_backlog = int(
+                    connector_signals["sender_pending_save_requests"]
+                ) + int(connector_signals["sender_save_inflight"])
         kv_cache_manager = getattr(self, "kv_cache_manager", None)
         return StageRuntimeSnapshot(
             schema_version=2,
@@ -479,6 +497,42 @@ class OmniSchedulerMixin:
                 else gpu_active.device_count
             ),
             queue_growth_rate_rps=queue_growth,
+            downstream_waiting_requests=(
+                None
+                if downstream_pressure is None
+                else downstream_pressure["waiting_requests"]
+            ),
+            downstream_effective_cap=(
+                None
+                if downstream_pressure is None
+                else downstream_pressure["effective_max_num_seqs"]
+            ),
+            downstream_stage_id=(
+                None
+                if downstream_pressure is None
+                else downstream_pressure["stage_id"]
+            ),
+            downstream_control_epoch=(
+                None
+                if downstream_pressure is None
+                else downstream_pressure["control_epoch"]
+            ),
+            downstream_sample_age_ms=(
+                None
+                if downstream_pressure is None
+                else downstream_pressure["sample_age_ms"]
+            ),
+            downstream_source=(
+                None
+                if downstream_pressure is None
+                else "engine_core_utility"
+            ),
+            connector_backlog=connector_backlog,
+            connector_backlog_scope=(
+                None
+                if connector_backlog is None
+                else "sender_pending_save_and_inflight"
+            ),
             deadline_miss_risk=(
                 None if deadline_risk is None else deadline_risk.risk_ratio
             ),
@@ -489,6 +543,109 @@ class OmniSchedulerMixin:
                 None if deadline_risk is None else deadline_risk.scope
             ),
         ).to_event_fields()
+
+    def _export_slo_runtime_pressure(
+        self,
+        *,
+        captured_monotonic_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Export only owner-process fields needed by the upstream stage."""
+
+        _, waiting_requests, _ = self._stage_runtime_request_counts()
+        physical_cap = int(
+            getattr(self, "max_num_running_reqs", len(self.running))
+        )
+        effective_cap = int(
+            getattr(self, "effective_max_num_seqs", physical_cap)
+        )
+        captured = (
+            time.monotonic()
+            if captured_monotonic_s is None
+            else float(captured_monotonic_s)
+        )
+        if captured < 0:
+            raise ValueError("captured_monotonic_s must be non-negative")
+        return {
+            "pressure_feedback_schema_version": 1,
+            "stage_id": int(self._omni_stage_id_for_trace()),
+            "control_epoch": int(getattr(self, "_slo_control_epoch", 0)),
+            "captured_monotonic_s": captured,
+            "waiting_requests": waiting_requests,
+            "effective_max_num_seqs": effective_cap,
+        }
+
+    def _update_slo_downstream_pressure(
+        self,
+        sample: dict[str, Any],
+    ) -> None:
+        """Accept one validated snapshot from the immediate downstream core."""
+
+        if not isinstance(sample, dict):
+            raise ValueError("downstream pressure sample must be an object")
+        required = {
+            "pressure_feedback_schema_version",
+            "stage_id",
+            "control_epoch",
+            "captured_monotonic_s",
+            "waiting_requests",
+            "effective_max_num_seqs",
+        }
+        if set(sample) != required:
+            raise ValueError(
+                "downstream pressure sample fields must exactly match schema"
+            )
+        if sample["pressure_feedback_schema_version"] != 1:
+            raise ValueError("unsupported downstream pressure schema version")
+        expected_stage_id = int(self._omni_stage_id_for_trace()) + 1
+        if sample["stage_id"] != expected_stage_id:
+            raise ValueError(
+                "pressure sample must come from the immediate downstream stage"
+            )
+        for name in (
+            "stage_id",
+            "control_epoch",
+            "waiting_requests",
+            "effective_max_num_seqs",
+        ):
+            value = sample[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if sample["effective_max_num_seqs"] < 1:
+            raise ValueError("effective_max_num_seqs must be positive")
+        captured = sample["captured_monotonic_s"]
+        if isinstance(captured, bool):
+            raise ValueError("captured_monotonic_s must be non-negative")
+        try:
+            captured = float(captured)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "captured_monotonic_s must be non-negative"
+            ) from error
+        if not 0 <= captured < float("inf"):
+            raise ValueError("captured_monotonic_s must be non-negative")
+        previous = self._slo_downstream_pressure
+        if (
+            previous is not None
+            and sample["control_epoch"] <= previous["control_epoch"]
+        ):
+            raise ValueError("downstream control_epoch must increase")
+        self._slo_downstream_pressure = {
+            **sample,
+            "captured_monotonic_s": captured,
+        }
+
+    def _fresh_slo_downstream_pressure(
+        self,
+        *,
+        captured_monotonic_s: float,
+    ) -> dict[str, Any] | None:
+        sample = self._slo_downstream_pressure
+        if sample is None:
+            return None
+        age_s = captured_monotonic_s - sample["captured_monotonic_s"]
+        if age_s < 0 or age_s > _DOWNSTREAM_PRESSURE_MAX_AGE_S:
+            return None
+        return {**sample, "sample_age_ms": age_s * 1000.0}
 
     def _stage_runtime_request_counts(self) -> tuple[int, int, int]:
         """Count runnable and input-blocked requests without double counting.

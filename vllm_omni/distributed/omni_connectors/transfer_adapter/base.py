@@ -227,6 +227,15 @@ class OmniTransferAdapterBase:
             status["error"] = "; ".join(errors)
         return status
 
+    def get_control_signal_snapshot(self) -> dict[str, int]:
+        """Return sender-side work only for online admission observability."""
+
+        with self._drain_state_lock:
+            return {
+                "sender_pending_save_requests": len(self._pending_save_reqs),
+                "sender_save_inflight": self._save_inflight,
+            }
+
     def _poll_single_request(self, *args, **kwargs):
         """Poll connector for a single request task.
         Subclasses should implement request-specific receive behavior."""

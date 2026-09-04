@@ -299,7 +299,12 @@ class StageRuntimeSnapshot:
     queue_growth_rate_rps: float | None = None
     downstream_waiting_requests: int | None = None
     downstream_effective_cap: int | None = None
+    downstream_stage_id: int | None = None
+    downstream_control_epoch: int | None = None
+    downstream_sample_age_ms: float | None = None
+    downstream_source: str | None = None
     connector_backlog: int | None = None
+    connector_backlog_scope: str | None = None
     deadline_miss_risk: float | None = None
     deadline_miss_risk_population: int | None = None
     deadline_miss_risk_scope: str | None = None
@@ -341,6 +346,8 @@ class StageRuntimeSnapshot:
         for field_name in (
             "downstream_waiting_requests",
             "downstream_effective_cap",
+            "downstream_stage_id",
+            "downstream_control_epoch",
             "connector_backlog",
             "deadline_miss_risk_population",
             "gpu_active_device_count",
@@ -352,6 +359,7 @@ class StageRuntimeSnapshot:
             "service_time_ewma_ms",
             "service_time_p95_ms",
             "gpu_active_sample_age_ms",
+            "downstream_sample_age_ms",
         ):
             object.__setattr__(
                 self,
@@ -422,6 +430,48 @@ class StageRuntimeSnapshot:
                     field="queue_growth_rate_rps",
                 ),
             )
+        downstream_fields = (
+            self.downstream_waiting_requests,
+            self.downstream_effective_cap,
+            self.downstream_stage_id,
+            self.downstream_control_epoch,
+            self.downstream_sample_age_ms,
+            self.downstream_source,
+        )
+        if self.schema_version == 2 and any(
+            value is not None for value in downstream_fields
+        ):
+            if any(value is None for value in downstream_fields):
+                raise ValueError(
+                    "downstream pressure fields must be provided together"
+                )
+        if (
+            self.downstream_source is not None
+            and self.downstream_source != "engine_core_utility"
+        ):
+            raise ValueError(
+                "downstream_source must be engine_core_utility"
+            )
+        connector_fields = (
+            self.connector_backlog,
+            self.connector_backlog_scope,
+        )
+        if self.schema_version == 2 and any(
+            value is not None for value in connector_fields
+        ):
+            if any(value is None for value in connector_fields):
+                raise ValueError(
+                    "connector backlog fields must be provided together"
+                )
+        if (
+            self.connector_backlog_scope is not None
+            and self.connector_backlog_scope
+            != "sender_pending_save_and_inflight"
+        ):
+            raise ValueError(
+                "connector_backlog_scope must be "
+                "sender_pending_save_and_inflight"
+            )
         if (
             self.last_admission_rejection is not None
             and not str(self.last_admission_rejection).strip()
@@ -457,7 +507,12 @@ class StageRuntimeSnapshot:
             "queue_growth_rate_rps",
             "downstream_waiting_requests",
             "downstream_effective_cap",
+            "downstream_stage_id",
+            "downstream_control_epoch",
+            "downstream_sample_age_ms",
+            "downstream_source",
             "connector_backlog",
+            "connector_backlog_scope",
             "deadline_miss_risk",
             "deadline_miss_risk_population",
             "deadline_miss_risk_scope",
