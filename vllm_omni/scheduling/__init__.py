@@ -12,6 +12,7 @@ from vllm_omni.scheduling.deadline import (
     derive_stage_deadline_snapshot,
 )
 from vllm_omni.scheduling.cost_model import StaticMilestoneCostModel
+from vllm_omni.scheduling.config import StageDDLConfig
 
 from vllm_omni.scheduling.metadata import (
     CLIENT_SCHEDULING_FIELD,
@@ -52,6 +53,7 @@ __all__ = [
     "MilestoneCostEstimate",
     "StageDeadlineSnapshot",
     "StaticMilestoneCostModel",
+    "StageDDLConfig",
     "SCHEDULING_SCHEMA_VERSION",
     "BASELINE_POLICY_ENV",
     "BaselineSchedulingPolicy",
