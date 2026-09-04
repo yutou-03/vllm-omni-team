@@ -116,7 +116,7 @@ def test_build_client_scheduling_metadata_normalizes_stage_mapping():
     ("metadata", "message"),
     [
         (
-            {"schema_version": 2, "source_request_id": "r", "ingress_order": 0},
+            {"schema_version": 3, "source_request_id": "r", "ingress_order": 0},
             "unsupported schema_version",
         ),
         (
