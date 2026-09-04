@@ -103,17 +103,7 @@ def _feedback_orchestrator(clients: list[_FeedbackClient]) -> Orchestrator:
     return orchestrator
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        SloSchedulingMode.STAGE_DDL_FIXED,
-        SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
-    ],
-)
-def test_orchestrator_enables_feedback_for_pressure_consuming_modes(
-    monkeypatch,
-    mode,
-):
+def test_orchestrator_selects_only_dynamic_pressure_consumers(monkeypatch):
     monkeypatch.setattr(
         "vllm_omni.engine.orchestrator.extract_slo_scheduling_config",
         lambda config: config,
@@ -121,12 +111,58 @@ def test_orchestrator_enables_feedback_for_pressure_consuming_modes(
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator.stage_pools = [
         SimpleNamespace(
-            stage_vllm_config=SimpleNamespace(enabled=True, mode=mode)
+            stage_vllm_config=SimpleNamespace(
+                enabled=True,
+                mode=SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
+                stage_ddl=SimpleNamespace(
+                    dynamic_admission=SimpleNamespace(
+                        target_stage_ids=(1,),
+                        controller=SimpleNamespace(
+                            require_downstream_pressure=True
+                        ),
+                    )
+                ),
+            )
+        ),
+        SimpleNamespace(
+            stage_vllm_config=SimpleNamespace(
+                enabled=True,
+                mode=SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
+                stage_ddl=SimpleNamespace(
+                    dynamic_admission=SimpleNamespace(
+                        target_stage_ids=(1,),
+                        controller=SimpleNamespace(
+                            require_downstream_pressure=True
+                        ),
+                    )
+                ),
+            )
         ),
         SimpleNamespace(stage_vllm_config=None),
     ]
 
     assert orchestrator._slo_downstream_feedback_enabled() is True
+    assert orchestrator._slo_downstream_feedback_edges() == ((1, 2),)
+
+
+def test_orchestrator_disables_feedback_for_fixed_stage_ddl(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.engine.orchestrator.extract_slo_scheduling_config",
+        lambda config: config,
+    )
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        SimpleNamespace(
+            stage_vllm_config=SimpleNamespace(
+                enabled=True,
+                mode=SloSchedulingMode.STAGE_DDL_FIXED,
+            )
+        ),
+        SimpleNamespace(stage_vllm_config=None),
+    ]
+
+    assert orchestrator._slo_downstream_feedback_enabled() is False
+    assert orchestrator._slo_downstream_feedback_edges() == ()
 
 
 @pytest.mark.asyncio
@@ -136,14 +172,19 @@ async def test_orchestrator_relays_adjacent_pressure_downstream_to_upstream():
     stage2 = _FeedbackClient(2, 7)
     orchestrator = _feedback_orchestrator([stage0, stage1, stage2])
 
-    await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
+    edges = ((0, 1), (1, 2))
+    await orchestrator._relay_slo_downstream_pressure_once(
+        timeout=0.25, edges=edges
+    )
 
     assert stage0.updates == [_sample(1, 5)]
     assert stage1.updates == [_sample(2, 7)]
     assert stage2.updates == []
 
     # An identical observation is not resent.
-    await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
+    await orchestrator._relay_slo_downstream_pressure_once(
+        timeout=0.25, edges=edges
+    )
     assert stage0.updates == [_sample(1, 5)]
     assert stage1.updates == [_sample(2, 7)]
 
@@ -152,12 +193,16 @@ async def test_orchestrator_relays_adjacent_pressure_downstream_to_upstream():
         **_sample(2, 7),
         "captured_monotonic_s": 102.1,
     }
-    await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
+    await orchestrator._relay_slo_downstream_pressure_once(
+        timeout=0.25, edges=edges
+    )
     assert stage1.updates[-1] == stage2.sample
 
     stage2.sample = _sample(2, 8)
     stage2.sample["captured_monotonic_s"] = 102.2
-    await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
+    await orchestrator._relay_slo_downstream_pressure_once(
+        timeout=0.25, edges=edges
+    )
     assert stage1.updates[-1] == stage2.sample
 
 
@@ -173,7 +218,9 @@ async def test_orchestrator_feedback_fails_closed_for_multi_replica_stage():
     ]
     orchestrator._slo_feedback_last_sample_by_edge = {}
 
-    await orchestrator._relay_slo_downstream_pressure_once(timeout=0.25)
+    await orchestrator._relay_slo_downstream_pressure_once(
+        timeout=0.25, edges=((0, 1),)
+    )
 
     assert stage0.updates == []
     assert stage1a.get_calls == 0
