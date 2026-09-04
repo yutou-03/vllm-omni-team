@@ -515,7 +515,9 @@ def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
     )["global_request_id"] == [execution_id]
     assert extract_request_recovery_trace_fields(restarted_request) == {
         "logical_request_id": "logical",
+        "execution_id": execution_id,
         "pipeline_attempt_id": 1,
+        "stage_attempt_id": 0,
         "recovery_target_stage_id": 1,
         "recovery_target_num_computed_tokens": 37,
         "preemption_cause": "controlled_restart",
@@ -543,6 +545,34 @@ def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
     assert prewarm_calls[0][3]["end_stage_id"] == 1
     assert prewarm_calls[0][3]["recovery"] is True
     assert prewarm_calls[0][3]["connector_req_id"] == execution_id
+
+
+def test_local_recompute_trace_identity_is_preserved_at_pipeline_attempt_zero():
+    request = SimpleNamespace(
+        additional_information={
+            "meta": {
+                "omni_logical_request_id": "logical",
+                "omni_execution_id": "logical",
+                "omni_pipeline_attempt_id": 0,
+                "omni_stage_attempt_id": 1,
+                "omni_recovery_target_stage_id": 1,
+                "omni_recovery_target_num_computed_tokens": 37,
+                "omni_recovery_preemption_cause": "controlled_restart",
+                "omni_controlled_rule_id": "s1-half",
+            }
+        }
+    )
+
+    assert extract_request_recovery_trace_fields(request) == {
+        "logical_request_id": "logical",
+        "execution_id": "logical",
+        "pipeline_attempt_id": 0,
+        "stage_attempt_id": 1,
+        "recovery_target_stage_id": 1,
+        "recovery_target_num_computed_tokens": 37,
+        "preemption_cause": "controlled_restart",
+        "controlled_rule_id": "s1-half",
+    }
     assert state.pending_restart_stages == {2}
 
     asyncio.run(

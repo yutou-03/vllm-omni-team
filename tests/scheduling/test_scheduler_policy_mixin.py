@@ -269,6 +269,39 @@ def test_stage_data_ready_is_traced_once_for_native_fcfs(monkeypatch):
     assert ready_fields["stage_ready_order"] == 0
 
 
+def test_stage_data_ready_reuses_admission_identity(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    captured = []
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_stage_event",
+        lambda event, **fields: captured.append((event, fields)),
+    )
+    scheduler = SchedulerHarness(2)
+    request = FakeRequest("logical__pipeline0__stage2__attempt1", deadline=None)
+    request.additional_information = {
+        "meta": {
+            "sched_logical_request_id": "logical",
+            "omni_logical_request_id": "logical",
+            "omni_execution_id": "logical",
+            "omni_pipeline_attempt_id": 0,
+            "omni_stage_attempt_id": 1,
+            "omni_recovery_target_stage_id": 1,
+            "omni_recovery_target_num_computed_tokens": 37,
+            "omni_recovery_preemption_cause": "controlled_restart",
+        }
+    }
+
+    scheduler.add_request(request)
+
+    ready_fields = next(
+        fields for event, fields in captured if event == "stage_data_ready"
+    )
+    assert ready_fields["logical_request_id"] == "logical"
+    assert ready_fields["execution_id"] == "logical"
+    assert ready_fields["pipeline_attempt_id"] == 0
+    assert ready_fields["stage_attempt_id"] == 1
+
+
 def test_conformance_trace_records_replayable_edf_decision(monkeypatch):
     monkeypatch.setenv(BASELINE_POLICY_ENV, "final_deadline_edf_np")
     monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
