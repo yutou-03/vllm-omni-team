@@ -29,7 +29,12 @@ def _snapshot(**overrides):
         "queue_growth_rate_rps": 1.25,
         "downstream_waiting_requests": 5,
         "downstream_effective_cap": 3,
+        "downstream_stage_id": 2,
+        "downstream_control_epoch": 11,
+        "downstream_sample_age_ms": 25.0,
+        "downstream_source": "engine_core_utility",
         "connector_backlog": 2,
+        "connector_backlog_scope": "sender_pending_save_and_inflight",
         "deadline_miss_risk": 0.2,
         "deadline_miss_risk_population": 5,
         "deadline_miss_risk_scope": "runnable_running",
@@ -63,7 +68,12 @@ def test_stage_runtime_snapshot_is_immutable_and_serializable():
         "queue_growth_rate_rps": 1.25,
         "downstream_waiting_requests": 5,
         "downstream_effective_cap": 3,
+        "downstream_stage_id": 2,
+        "downstream_control_epoch": 11,
+        "downstream_sample_age_ms": 25.0,
+        "downstream_source": "engine_core_utility",
         "connector_backlog": 2,
+        "connector_backlog_scope": "sender_pending_save_and_inflight",
         "deadline_miss_risk": 0.2,
         "deadline_miss_risk_population": 5,
         "deadline_miss_risk_scope": "runnable_running",
@@ -116,7 +126,12 @@ def test_stage_runtime_snapshot_omits_unavailable_optional_signals():
         queue_growth_rate_rps=None,
         downstream_waiting_requests=None,
         downstream_effective_cap=None,
+        downstream_stage_id=None,
+        downstream_control_epoch=None,
+        downstream_sample_age_ms=None,
+        downstream_source=None,
         connector_backlog=None,
+        connector_backlog_scope=None,
         deadline_miss_risk=None,
         deadline_miss_risk_population=None,
         deadline_miss_risk_scope=None,
@@ -144,3 +159,31 @@ def test_stage_runtime_snapshot_v2_marks_runnable_count_semantics():
 
     assert fields["pressure_schema_version"] == 2
     assert fields["request_count_semantics"] == "runnable_excludes_input_blocked"
+
+
+def test_v2_downstream_pressure_requires_complete_provenance():
+    with pytest.raises(
+        ValueError,
+        match="downstream pressure fields must be provided together",
+    ):
+        _snapshot(schema_version=2, downstream_sample_age_ms=None)
+
+    with pytest.raises(
+        ValueError,
+        match="downstream_source must be engine_core_utility",
+    ):
+        _snapshot(schema_version=2, downstream_source="local_queue_guess")
+
+
+def test_v2_connector_backlog_requires_sender_scope():
+    with pytest.raises(
+        ValueError,
+        match="connector backlog fields must be provided together",
+    ):
+        _snapshot(schema_version=2, connector_backlog_scope=None)
+
+    with pytest.raises(
+        ValueError,
+        match="connector_backlog_scope must be sender_pending_save_and_inflight",
+    ):
+        _snapshot(schema_version=2, connector_backlog_scope="receiver_waiting")

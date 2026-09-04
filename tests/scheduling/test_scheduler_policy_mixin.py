@@ -850,6 +850,101 @@ def test_pressure_snapshot_excludes_input_blocked_requests_from_active_counts():
     )
 
 
+def test_scheduler_exports_compact_runnable_pressure_for_control_plane():
+    scheduler = SchedulerHarness(2)
+    scheduler.max_num_running_reqs = 4
+    scheduler.effective_max_num_seqs = 3
+    scheduler._slo_control_epoch = 17
+    ready_waiting = FakeRequest("ready", deadline=None)
+    ready_waiting.status = SimpleNamespace(name="WAITING")
+    blocked = FakeRequest("blocked", deadline=None)
+    blocked.status = SimpleNamespace(name="WAITING_FOR_CHUNK")
+    scheduler.waiting.add_request(ready_waiting)
+    scheduler.waiting.add_request(blocked)
+
+    exported = scheduler._export_slo_runtime_pressure(
+        captured_monotonic_s=100.0,
+    )
+
+    assert exported == {
+        "pressure_feedback_schema_version": 1,
+        "stage_id": 2,
+        "control_epoch": 17,
+        "captured_monotonic_s": 100.0,
+        "waiting_requests": 1,
+        "effective_max_num_seqs": 3,
+    }
+
+
+def test_scheduler_joins_fresh_downstream_pressure_and_sender_backlog():
+    scheduler = SchedulerHarness(1)
+    scheduler.max_num_running_reqs = 2
+    scheduler.effective_max_num_seqs = 2
+    scheduler.max_num_scheduled_tokens = 100
+    scheduler.chunk_transfer_adapter = SimpleNamespace(
+        waiting_for_chunk_running_requests=[],
+        waiting_for_chunk_waiting_requests=[],
+        get_control_signal_snapshot=lambda: {
+            "sender_pending_save_requests": 2,
+            "sender_save_inflight": 1,
+        },
+    )
+    scheduler._update_slo_downstream_pressure(
+        {
+            "pressure_feedback_schema_version": 1,
+            "stage_id": 2,
+            "control_epoch": 19,
+            "captured_monotonic_s": 100.0,
+            "waiting_requests": 3,
+            "effective_max_num_seqs": 1,
+        }
+    )
+
+    pressure = scheduler._capture_stage_runtime_snapshot(
+        captured_monotonic_s=100.2,
+        token_budget_available=50,
+        update_control_signals=True,
+    )
+
+    assert pressure["downstream_waiting_requests"] == 3
+    assert pressure["downstream_effective_cap"] == 1
+    assert pressure["downstream_stage_id"] == 2
+    assert pressure["downstream_control_epoch"] == 19
+    assert pressure["downstream_sample_age_ms"] == pytest.approx(200.0)
+    assert pressure["downstream_source"] == "engine_core_utility"
+    assert pressure["connector_backlog"] == 3
+    assert pressure["connector_backlog_scope"] == (
+        "sender_pending_save_and_inflight"
+    )
+
+
+def test_scheduler_omits_stale_downstream_pressure_and_rejects_bad_updates():
+    scheduler = SchedulerHarness(1)
+    scheduler.max_num_running_reqs = 2
+    scheduler.max_num_scheduled_tokens = 100
+    sample = {
+        "pressure_feedback_schema_version": 1,
+        "stage_id": 2,
+        "control_epoch": 19,
+        "captured_monotonic_s": 100.0,
+        "waiting_requests": 3,
+        "effective_max_num_seqs": 1,
+    }
+    scheduler._update_slo_downstream_pressure(sample)
+
+    stale = scheduler._capture_stage_runtime_snapshot(
+        captured_monotonic_s=100.501,
+        update_control_signals=True,
+    )
+    assert "downstream_waiting_requests" not in stale
+    assert "downstream_sample_age_ms" not in stale
+
+    with pytest.raises(ValueError, match="immediate downstream stage"):
+        scheduler._update_slo_downstream_pressure({**sample, "stage_id": 3})
+    with pytest.raises(ValueError, match="control_epoch must increase"):
+        scheduler._update_slo_downstream_pressure(sample)
+
+
 def test_conformance_trace_records_kv_preemption_requeue_and_resume(monkeypatch):
     monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
     monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
