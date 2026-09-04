@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any
 
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.scheduling.contracts import SLOMilestone
 from vllm_omni.scheduling.deadline import StageDeadlineSnapshot
 from vllm_omni.scheduling.metadata import extract_scheduling_metadata
 
@@ -23,6 +24,7 @@ class BaselineSchedulingPolicy(str, Enum):
     FINAL_DEADLINE_EDF_NP = "final_deadline_edf_np"
     STAGE_DEADLINE_EDF_NP = "stage_deadline_edf_np"
     STAGE_DDL_FIXED = "stage_ddl_fixed"
+    CLOCKWORK_LATEST_START_NP = "clockwork_latest_start_np"
 
 
 class SchedulingMetadataError(ValueError):
@@ -170,10 +172,14 @@ def policy_key(
         )
     )
 
-    if policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+    if policy in {
+        BaselineSchedulingPolicy.STAGE_DDL_FIXED,
+        BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP,
+    }:
         if stage_deadline_snapshot is None:
             raise SchedulingMetadataError(
-                f"request {request_id!r} requires a frozen snapshot for Stage-DDL"
+                f"request {request_id!r} requires a frozen snapshot for "
+                f"{policy.value}"
             )
         logical_request_id = str(
             _required_field(
@@ -187,12 +193,25 @@ def policy_key(
             or stage_deadline_snapshot.stage_id != stage_id
         ):
             raise SchedulingMetadataError(
-                f"request {request_id!r} Stage-DDL snapshot identity does not match"
+                f"request {request_id!r} profiled deadline snapshot identity "
+                "does not match"
             )
-        base_laxity = float(stage_deadline_snapshot.base_laxity_s)
-        if not math.isfinite(base_laxity):
+        if policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+            scheduling_laxity = float(stage_deadline_snapshot.base_laxity_s)
+        else:
+            try:
+                scheduling_laxity = float(
+                    stage_deadline_snapshot.milestone_laxities_s[
+                        SLOMilestone.E2E
+                    ]
+                )
+            except KeyError as error:
+                raise SchedulingMetadataError(
+                    f"request {request_id!r} has no E2E latest-start laxity"
+                ) from error
+        if not math.isfinite(scheduling_laxity):
             raise SchedulingMetadataError(
-                f"request {request_id!r} has a non-finite Stage-DDL laxity"
+                f"request {request_id!r} has a non-finite {policy.value} laxity"
             )
         ingress_order = int(
             _required_field(
@@ -201,7 +220,7 @@ def policy_key(
                 request_id=request_id,
             )
         )
-        return base_laxity, ingress_order, logical_request_id, request_id
+        return scheduling_laxity, ingress_order, logical_request_id, request_id
 
     if policy in (
         BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,

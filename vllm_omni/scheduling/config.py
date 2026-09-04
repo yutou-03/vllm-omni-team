@@ -23,6 +23,7 @@ class SloSchedulingMode(str, Enum):
     SRPF_FIXED = "srpf_fixed"
     PATH_RR_FIXED = "path_rr_fixed"
     STAGE_DDL_FIXED = "stage_ddl_fixed"
+    CLOCKWORK_LATEST_START_FIXED = "clockwork_latest_start_fixed"
     STAGE_DDL_DYNAMIC_ADMISSION = "stage_ddl_dynamic_admission"
     STAGE_DDL_DYNAMIC_ADMISSION_FAIR = "stage_ddl_dynamic_admission_fair"
     PRIORITY_ONLY_PREEMPT = "priority_only_preempt"
@@ -30,9 +31,10 @@ class SloSchedulingMode(str, Enum):
     ADAPTIVE_RECOVERY = "adaptive_recovery"
 
 
-_STAGE_DDL_MODES = frozenset(
+_PROFILED_DEADLINE_MODES = frozenset(
     {
         SloSchedulingMode.STAGE_DDL_FIXED,
+        SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED,
         SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
         SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
     }
@@ -282,10 +284,14 @@ class SloSchedulingConfig:
             field_name="slo_scheduling.mode",
         )
         stage_ddl = StageDDLConfig.from_mapping(raw.get("stage_ddl"))
-        if enabled and mode in _STAGE_DDL_MODES and not stage_ddl.is_configured:
+        if (
+            enabled
+            and mode in _PROFILED_DEADLINE_MODES
+            and not stage_ddl.is_configured
+        ):
             raise ValueError(
                 "slo_scheduling.stage_ddl.model_path and model_sha256 are "
-                "required for an enabled Stage-DDL mode"
+                "required for an enabled profiled deadline mode"
             )
         return cls(
             enabled=enabled,

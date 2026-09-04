@@ -50,6 +50,12 @@ from vllm_omni.scheduling.request_queue import (
 )
 
 _STATS_INTERVAL_S = 1.0
+_PROFILED_DEADLINE_POLICIES = frozenset(
+    {
+        BaselineSchedulingPolicy.STAGE_DDL_FIXED,
+        BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP,
+    }
+)
 
 
 def preserve_streaming_scheduling_metadata(
@@ -135,7 +141,10 @@ class OmniSchedulerMixin:
         if (
             self._slo_scheduling_config.enabled
             and self._slo_scheduling_config.mode
-            is SloSchedulingMode.STAGE_DDL_FIXED
+            in {
+                SloSchedulingMode.STAGE_DDL_FIXED,
+                SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED,
+            }
         ):
             if environment_policy is not BaselineSchedulingPolicy.NATIVE_FCFS:
                 raise ValueError(
@@ -151,7 +160,15 @@ class OmniSchedulerMixin:
                 input_token_cutoff=stage_ddl_config.input_token_cutoff,
                 milestone_guard_ms=stage_ddl_config.milestone_guard_ms,
             )
-            self._baseline_policy = BaselineSchedulingPolicy.STAGE_DDL_FIXED
+            if (
+                self._slo_scheduling_config.mode
+                is SloSchedulingMode.STAGE_DDL_FIXED
+            ):
+                self._baseline_policy = BaselineSchedulingPolicy.STAGE_DDL_FIXED
+            else:
+                self._baseline_policy = (
+                    BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP
+                )
             self._stage_ddl_begin_tick()
         elif (
             self._slo_scheduling_config.enabled
@@ -190,10 +207,10 @@ class OmniSchedulerMixin:
         if not self._baseline_policy_applies():
             return
 
-        if self._baseline_policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+        if self._baseline_policy in _PROFILED_DEADLINE_POLICIES:
             if self.waiting or self.skipped_waiting:
                 raise ValueError(
-                    "Stage-DDL queues must replace empty native queues"
+                    "profiled deadline queues must replace empty native queues"
                 )
             self.waiting = PolicyOrderedRequestQueue(
                 key=self._baseline_request_key
@@ -235,7 +252,7 @@ class OmniSchedulerMixin:
 
     def _baseline_request_key(self, request: Request):
         snapshot = None
-        if self._baseline_policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+        if self._baseline_policy in _PROFILED_DEADLINE_POLICIES:
             snapshot = self._stage_ddl_request_snapshot(request)
         return policy_key(
             request,
@@ -427,7 +444,7 @@ class OmniSchedulerMixin:
         """Refresh data-ready times and order runnable requests in place."""
 
         self._baseline_waiting_queue_choices = []
-        if self._baseline_policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+        if self._baseline_policy in _PROFILED_DEADLINE_POLICIES:
             self._stage_ddl_begin_tick()
         self._omni_request_progress_before_schedule = {
             str(request_id): int(request.num_computed_tokens)
@@ -457,7 +474,7 @@ class OmniSchedulerMixin:
         if (
             self._baseline_policy_applies()
             and self._baseline_policy
-            is not BaselineSchedulingPolicy.STAGE_DDL_FIXED
+            not in _PROFILED_DEADLINE_POLICIES
         ):
             self.running.sort(key=self._baseline_request_key)
 
