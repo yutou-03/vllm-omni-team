@@ -746,7 +746,13 @@ def test_profiled_pressure_tracks_queue_growth_and_running_deadline_risk(
     at_risk.status = SimpleNamespace(name="RUNNING")
     safe.status = SimpleNamespace(name="RUNNING")
     scheduler.running = [at_risk, safe]
-    scheduler.waiting.add_request(FakeRequest("waiting-1", deadline=None))
+    waiting_1 = _set_stage_ddl_metadata(
+        FakeRequest("waiting-1", deadline=None),
+        ingress_order=2,
+        ttft=102.0,
+        e2e=103.0,
+    )
+    scheduler.waiting.add_request(waiting_1)
     scheduler._stage_ddl_tick_monotonic_s = 100.0
     scheduler._stage_ddl_snapshot_by_request.clear()
 
@@ -755,7 +761,13 @@ def test_profiled_pressure_tracks_queue_growth_and_running_deadline_risk(
         token_budget_available=75,
         update_control_signals=True,
     )
-    scheduler.waiting.add_request(FakeRequest("waiting-2", deadline=None))
+    waiting_2 = _set_stage_ddl_metadata(
+        FakeRequest("waiting-2", deadline=None),
+        ingress_order=3,
+        ttft=102.0,
+        e2e=103.0,
+    )
+    scheduler.waiting.add_request(waiting_2)
     second = scheduler._capture_stage_runtime_snapshot(
         captured_monotonic_s=100.5,
         token_budget_available=50,

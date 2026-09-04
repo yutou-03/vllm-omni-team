@@ -48,6 +48,11 @@ from vllm_omni.scheduling.request_queue import (
     PolicyOrderedRequestQueue,
     maybe_create_policy_ordered_queue,
 )
+from vllm_omni.scheduling.signals import (
+    QueueGrowthWindow,
+    estimate_deadline_miss_risk,
+    token_budget_utilization_ratio,
+)
 
 _STATS_INTERVAL_S = 1.0
 _PROFILED_DEADLINE_POLICIES = frozenset(
@@ -185,6 +190,7 @@ class OmniSchedulerMixin:
         else:
             self._baseline_policy = environment_policy
         self._baseline_stage_id = int(self._omni_stage_id_for_trace())
+        self._stage_queue_growth_window = QueueGrowthWindow(window_s=1.0)
         self._baseline_data_ready_time: dict[str, float] = {}
         self._baseline_data_ready_order: dict[str, int] = {}
         self._baseline_next_data_ready_order = 0
@@ -378,6 +384,7 @@ class OmniSchedulerMixin:
         *,
         captured_monotonic_s: float | None = None,
         token_budget_available: int | None = None,
+        update_control_signals: bool = False,
     ) -> dict[str, Any]:
         running_requests, waiting_requests, input_waiting_requests = (
             self._stage_runtime_request_counts()
@@ -396,15 +403,45 @@ class OmniSchedulerMixin:
             if token_budget_available is None
             else int(token_budget_available)
         )
+        captured = (
+            time.monotonic()
+            if captured_monotonic_s is None
+            else captured_monotonic_s
+        )
+        token_utilization = None
+        queue_growth = None
+        deadline_risk = None
+        if update_control_signals:
+            token_utilization = token_budget_utilization_ratio(
+                total=total_token_budget,
+                available=available_token_budget,
+            )
+            queue_growth = self._stage_queue_growth_window.observe(
+                captured_monotonic_s=captured,
+                waiting_requests=waiting_requests,
+            )
+            if self._stage_ddl_model is not None:
+                running_laxities = []
+                for request in self.running:
+                    status = getattr(request, "status", None)
+                    status_name = getattr(status, "name", str(status)).lower()
+                    if (
+                        "finished" in status_name
+                        or "waiting_for_chunk" in status_name
+                        or "waiting_for_input" in status_name
+                    ):
+                        continue
+                    running_laxities.append(
+                        self._stage_ddl_request_snapshot(request).base_laxity_s
+                    )
+                deadline_risk = estimate_deadline_miss_risk(
+                    running_laxities
+                )
         kv_cache_manager = getattr(self, "kv_cache_manager", None)
         return StageRuntimeSnapshot(
             schema_version=2,
             stage_id=int(self._omni_stage_id_for_trace()),
-            captured_monotonic_s=(
-                time.monotonic()
-                if captured_monotonic_s is None
-                else captured_monotonic_s
-            ),
+            captured_monotonic_s=captured,
             control_epoch=int(getattr(self, "_slo_control_epoch", 0)),
             running_requests=running_requests,
             waiting_requests=waiting_requests,
@@ -413,7 +450,18 @@ class OmniSchedulerMixin:
             effective_max_num_seqs=effective_cap,
             token_budget_total=total_token_budget,
             token_budget_available=available_token_budget,
+            token_budget_utilization_ratio=token_utilization,
             kv_cache_usage_ratio=getattr(kv_cache_manager, "usage", None),
+            queue_growth_rate_rps=queue_growth,
+            deadline_miss_risk=(
+                None if deadline_risk is None else deadline_risk.risk_ratio
+            ),
+            deadline_miss_risk_population=(
+                None if deadline_risk is None else deadline_risk.population
+            ),
+            deadline_miss_risk_scope=(
+                None if deadline_risk is None else deadline_risk.scope
+            ),
         ).to_event_fields()
 
     def _stage_runtime_request_counts(self) -> tuple[int, int, int]:
@@ -1178,7 +1226,8 @@ class OmniSchedulerMixin:
                         total_token_budget - total_num_scheduled_tokens,
                         0,
                     )
-                )
+                ),
+                update_control_signals=True,
             )
         emit_iteration_event(
             stage_id=stage_id,
