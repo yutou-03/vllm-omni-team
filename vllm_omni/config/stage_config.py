@@ -747,7 +747,9 @@ def deploy_override_field_names() -> frozenset[str]:
     return (
         frozenset(_STAGE_DEPLOY_FIELDS)
         | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
-        | frozenset({"async_chunk", "devices"})
+        # vLLM's CLI default for additional_config is {}, which otherwise
+        # looks explicit and erases the deployment-injected SLO control block.
+        | frozenset({"additional_config", "async_chunk", "devices"})
     )
 
 
