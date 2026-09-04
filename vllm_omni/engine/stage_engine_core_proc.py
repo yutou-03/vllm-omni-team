@@ -52,6 +52,19 @@ class StageEngineCoreProc(EngineCoreProc):
     def _safe_len(value: Any) -> int:
         return len(value) if value is not None else 0
 
+    def get_slo_runtime_pressure(self) -> dict[str, Any]:
+        """Export scheduler-owned pressure through the utility channel."""
+
+        return self.scheduler._export_slo_runtime_pressure()
+
+    def update_slo_downstream_pressure(
+        self,
+        sample: dict[str, Any],
+    ) -> None:
+        """Publish one downstream sample into this core's scheduler."""
+
+        self.scheduler._update_slo_downstream_pressure(sample)
+
     def get_drain_status(self) -> dict[str, Any]:
         """Snapshot all scheduler work owned by this EngineCore process.
 

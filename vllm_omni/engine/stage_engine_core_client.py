@@ -479,6 +479,40 @@ class StageEngineCoreClientBase:
             )
         return result
 
+    async def get_slo_runtime_pressure_async(
+        self,
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Read one compact pressure snapshot from this stage core."""
+
+        result = await asyncio.wait_for(
+            self.call_utility_async("get_slo_runtime_pressure"),
+            timeout=timeout,
+        )
+        if not isinstance(result, dict):
+            raise TypeError(
+                "stage pressure utility must return a dictionary, got "
+                f"{type(result).__name__}"
+            )
+        return result
+
+    async def update_slo_downstream_pressure_async(
+        self,
+        sample: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> None:
+        """Send one downstream pressure sample to this stage core."""
+
+        await asyncio.wait_for(
+            self.call_utility_async(
+                "update_slo_downstream_pressure",
+                sample,
+            ),
+            timeout=timeout,
+        )
+
     def shutdown(self) -> None:
         """Shutdown managed resources and any externally spawned subprocess."""
         child_procs: list[psutil.Process] = []

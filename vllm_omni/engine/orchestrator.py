@@ -46,6 +46,10 @@ from vllm_omni.recovery import (
     OutputDecision,
     PreemptionRecoveryMode,
 )
+from vllm_omni.scheduling.config import (
+    SloSchedulingMode,
+    extract_slo_scheduling_config,
+)
 from vllm_omni.scheduling.contracts import RequestSLOContract
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
@@ -54,6 +58,9 @@ from vllm_omni.scheduling.metadata import (
 )
 
 logger = init_logger(__name__)
+
+_SLO_PRESSURE_FEEDBACK_INTERVAL_S = 0.1
+_SLO_PRESSURE_FEEDBACK_TIMEOUT_S = 0.25
 
 
 def extract_scheduling_metadata_from_request_input(
@@ -521,6 +528,8 @@ class Orchestrator:
         self._fatal_error_stage_id: int | None = None
         self._drain_state_epoch = 0
         self._drain_output_inflight = 0
+        self._slo_feedback_last_epoch_by_edge: dict[tuple[int, int], int] = {}
+        self._slo_feedback_error_logged_edges: set[tuple[int, int]] = set()
 
     def _bump_drain_epoch(self) -> None:
         """Record owner-loop state churn (also safe for minimal test doubles)."""
@@ -549,9 +558,17 @@ class Orchestrator:
             self._orchestration_output_handler(),
             name="orchestrator-stage-output-handler",
         )
+        tasks = [request_task, output_task]
+        if self._slo_downstream_feedback_enabled():
+            tasks.append(
+                asyncio.create_task(
+                    self._slo_downstream_feedback_loop(),
+                    name="orchestrator-slo-pressure-feedback",
+                )
+            )
 
         try:
-            await asyncio.gather(request_task, output_task)
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -559,11 +576,11 @@ class Orchestrator:
             raise
         finally:
             self._shutdown_event.set()
-            for task in (request_task, output_task):
+            for task in tasks:
                 if not task.done():
                     task.cancel()
             try:
-                await asyncio.gather(request_task, output_task, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
 
@@ -581,6 +598,128 @@ class Orchestrator:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+    def _slo_downstream_feedback_enabled(self) -> bool:
+        """Enable the relay only for configured fixed Stage-DDL stages."""
+
+        if len(self.stage_pools) < 2:
+            return False
+        for pool in self.stage_pools[:-1]:
+            config = getattr(pool, "stage_vllm_config", None)
+            if config is None:
+                continue
+            try:
+                slo_config = extract_slo_scheduling_config(config)
+            except (TypeError, ValueError):
+                continue
+            if (
+                slo_config.enabled
+                and slo_config.mode is SloSchedulingMode.STAGE_DDL_FIXED
+            ):
+                return True
+        return False
+
+    async def _relay_slo_downstream_pressure_once(
+        self,
+        *,
+        timeout: float = _SLO_PRESSURE_FEEDBACK_TIMEOUT_S,
+    ) -> None:
+        """Relay adjacent single-replica pressure through owner-safe RPCs."""
+
+        last_epochs = getattr(
+            self,
+            "_slo_feedback_last_epoch_by_edge",
+            None,
+        )
+        if last_epochs is None:
+            last_epochs = self._slo_feedback_last_epoch_by_edge = {}
+        logged_errors = getattr(
+            self,
+            "_slo_feedback_error_logged_edges",
+            None,
+        )
+        if logged_errors is None:
+            logged_errors = self._slo_feedback_error_logged_edges = set()
+
+        for upstream_stage_id in reversed(range(len(self.stage_pools) - 1)):
+            downstream_stage_id = upstream_stage_id + 1
+            edge = (upstream_stage_id, downstream_stage_id)
+            upstream_pool = self.stage_pools[upstream_stage_id]
+            downstream_pool = self.stage_pools[downstream_stage_id]
+
+            # Replica-aware aggregation needs a separate, request-affine
+            # contract.  Do not guess by summing unrelated replica epochs.
+            if (
+                upstream_pool.num_replicas != 1
+                or downstream_pool.num_replicas != 1
+            ):
+                if edge not in logged_errors:
+                    logger.warning(
+                        "[Orchestrator] SLO pressure feedback disabled for "
+                        "multi-replica edge %s->%s",
+                        *edge,
+                    )
+                    logged_errors.add(edge)
+                continue
+
+            upstream_client = upstream_pool.clients[0]
+            downstream_client = downstream_pool.clients[0]
+            get_pressure = getattr(
+                downstream_client,
+                "get_slo_runtime_pressure_async",
+                None,
+            )
+            update_pressure = getattr(
+                upstream_client,
+                "update_slo_downstream_pressure_async",
+                None,
+            )
+            if not callable(get_pressure) or not callable(update_pressure):
+                continue
+
+            try:
+                sample = await get_pressure(timeout=timeout)
+                epoch = sample.get("control_epoch")
+                if (
+                    isinstance(epoch, bool)
+                    or not isinstance(epoch, int)
+                    or epoch < 0
+                ):
+                    raise ValueError(
+                        "pressure sample control_epoch must be a "
+                        "non-negative integer"
+                    )
+                previous_epoch = last_epochs.get(edge)
+                if previous_epoch is not None and epoch <= previous_epoch:
+                    continue
+                await update_pressure(sample, timeout=timeout)
+                last_epochs[edge] = epoch
+                logged_errors.discard(edge)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if edge not in logged_errors:
+                    logger.warning(
+                        "[Orchestrator] SLO pressure feedback failed for "
+                        "edge %s->%s: %s: %s",
+                        *edge,
+                        type(error).__name__,
+                        error,
+                    )
+                    logged_errors.add(edge)
+
+    async def _slo_downstream_feedback_loop(self) -> None:
+        """Periodically refresh downstream pressure without blocking routing."""
+
+        while not self._shutdown_event.is_set():
+            await self._relay_slo_downstream_pressure_once()
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=_SLO_PRESSURE_FEEDBACK_INTERVAL_S,
+                )
+            except TimeoutError:
+                pass
 
     # ---- Request handling ----
 
