@@ -19,6 +19,7 @@ _DEFAULT_TRACE_DIR = os.path.join(
 _TRACE_DIR = os.environ.get("STAGE_QUEUE_TRACE_DIR", _DEFAULT_TRACE_DIR)
 _RUN_ID = os.environ.get("STAGE_QUEUE_RUN_ID", "server")
 _PID = os.getpid()
+TRACE_SCHEMA_VERSION = 2
 _REQUEST_METRICS_EVENTS = frozenset({"request_ingress", "stage_done_metrics"})
 
 
@@ -130,6 +131,36 @@ def _write_jsonl(filename: str, payload: dict[str, Any]) -> None:
         return
 
 
+def _request_identity_fields(
+    request_id: Any | None,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one canonical identity tuple for every request-scoped event."""
+
+    if request_id is None:
+        return {}
+    physical_request_id = str(fields.get("physical_request_id", request_id))
+    logical_request_id = str(
+        fields.get(
+            "logical_request_id",
+            fields.get("sched_logical_request_id", request_id),
+        )
+    )
+    execution_id = str(
+        fields.get(
+            "execution_id",
+            fields.get("new_execution_id", physical_request_id),
+        )
+    )
+    return {
+        "physical_request_id": physical_request_id,
+        "logical_request_id": logical_request_id,
+        "execution_id": execution_id,
+        "pipeline_attempt_id": fields.get("pipeline_attempt_id", 0),
+        "stage_attempt_id": fields.get("stage_attempt_id", 0),
+    }
+
+
 def emit_stage_event(
     event: str,
     *,
@@ -148,6 +179,8 @@ def emit_stage_event(
         "monotonic": time.monotonic(),
     }
     payload.update(fields)
+    payload.update(_request_identity_fields(request_id, fields))
+    payload["trace_schema_version"] = TRACE_SCHEMA_VERSION
     _write_jsonl("stage_events.jsonl", payload)
 
 
@@ -176,6 +209,8 @@ def emit_stage_duration_event(
         "monotonic_end": monotonic_end,
     }
     payload.update(fields)
+    payload.update(_request_identity_fields(request_id, fields))
+    payload["trace_schema_version"] = TRACE_SCHEMA_VERSION
     _write_jsonl("stage_events.jsonl", payload)
 
 
@@ -229,6 +264,7 @@ def emit_iteration_event(
         "monotonic": time.monotonic(),
     }
     payload.update(fields)
+    payload["trace_schema_version"] = TRACE_SCHEMA_VERSION
     _write_jsonl("iteration_events.jsonl", payload)
 
 
@@ -252,4 +288,6 @@ def emit_connector_event(
         "monotonic": time.monotonic(),
     }
     payload.update(fields)
+    payload.update(_request_identity_fields(request_id, fields))
+    payload["trace_schema_version"] = TRACE_SCHEMA_VERSION
     _write_jsonl("connector_events.jsonl", payload)
