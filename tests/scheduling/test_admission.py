@@ -225,7 +225,10 @@ def test_fully_idle_stage_can_reset_to_safe_cap_between_busy_periods() -> None:
             reset_to_safe_cap_when_fully_idle=True,
             require_downstream_pressure=True,
         ),
-        _envelope(safe_max_active_by_stage={0: 2}),
+        _envelope(
+            safe_max_active_by_stage={0: 2},
+            service_p95_limit_ms_by_stage={0: 20.0},
+        ),
         _snapshot(
             running_requests=0,
             waiting_requests=0,

@@ -38,6 +38,7 @@ def _dynamic_admission() -> dict:
             "queue_growth_high_rps": None,
             "connector_backlog_high": 2,
             "require_downstream_pressure": True,
+            "reset_to_safe_cap_when_fully_idle": False,
         },
     }
 

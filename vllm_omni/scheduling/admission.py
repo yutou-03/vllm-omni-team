@@ -204,6 +204,7 @@ class AdmissionControllerConfig:
     queue_growth_high_rps: float | None = None
     connector_backlog_high: int | None = None
     require_downstream_pressure: bool = False
+    reset_to_safe_cap_when_fully_idle: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -256,6 +257,10 @@ class AdmissionControllerConfig:
             )
         if not isinstance(self.require_downstream_pressure, bool):
             raise ValueError("require_downstream_pressure must be a boolean")
+        if not isinstance(self.reset_to_safe_cap_when_fully_idle, bool):
+            raise ValueError(
+                "reset_to_safe_cap_when_fully_idle must be a boolean"
+            )
 
     @classmethod
     def from_mapping(
@@ -310,6 +315,7 @@ class AdmissionAction(str, Enum):
     INCREASE = "increase"
     DECREASE = "decrease"
     CLAMP = "clamp"
+    RESET = "reset"
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +509,28 @@ def decide_admission_cap(
     decrease_streak = state.decrease_streak
     last_change_epoch = state.last_change_epoch
     trigger_reasons: tuple[str, ...] = ()
+    fully_idle = (
+        snapshot.running_requests == 0
+        and snapshot.waiting_requests == 0
+        and snapshot.input_waiting_requests == 0
+        and snapshot.downstream_waiting_requests in (None, 0)
+        and snapshot.connector_backlog in (None, 0)
+    )
+    reset_to_safe_cap = (
+        config.reset_to_safe_cap_when_fully_idle
+        and fully_idle
+        and old_cap < ceiling
+        and (
+            not config.require_downstream_pressure
+            or (
+                snapshot.downstream_waiting_requests is not None
+                and (
+                    config.connector_backlog_high is None
+                    or snapshot.connector_backlog is not None
+                )
+            )
+        )
+    )
 
     if old_cap > ceiling or old_cap < config.min_active:
         action = AdmissionAction.CLAMP
@@ -511,6 +539,14 @@ def decide_admission_cap(
         decrease_streak = 0
         last_change_epoch = snapshot.control_epoch
         trigger_reasons = ("hard_bound_changed",)
+        blockers = ()
+    elif reset_to_safe_cap:
+        action = AdmissionAction.RESET
+        new_cap = ceiling
+        increase_streak = 0
+        decrease_streak = 0
+        last_change_epoch = snapshot.control_epoch
+        trigger_reasons = ("fully_idle_reset",)
         blockers = ()
     else:
         in_cooldown = (

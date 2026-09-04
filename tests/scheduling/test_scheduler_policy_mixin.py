@@ -432,6 +432,7 @@ def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
 
     scheduler.running = []
     scheduler.chunk_transfer_adapter = SimpleNamespace(
+        requests_with_ready_chunks=set(),
         waiting_for_chunk_running_requests=[],
         waiting_for_chunk_waiting_requests=[],
         get_control_signal_snapshot=lambda: {
@@ -448,7 +449,7 @@ def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
         captured_monotonic_s=now,
     )
     assert pressure["physical_max_num_seqs"] == 2
-    assert pressure["effective_max_num_seqs"] == 1
+    assert pressure["effective_max_num_seqs"] == 2
 
 
 def test_clockwork_mode_loads_same_model_but_orders_by_e2e_laxity(monkeypatch):
