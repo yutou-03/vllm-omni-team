@@ -193,3 +193,40 @@ def test_retired_and_pre_attempt_stage_outputs_are_classified():
         )
         is None
     )
+
+
+def test_committed_output_emits_versioned_identity(monkeypatch):
+    orchestrator, state = _runtime()
+    events = []
+    monkeypatch.setattr(
+        "vllm_omni.engine.orchestrator.emit_stage_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    output = OmniRequestOutput(
+        request_id="req",
+        finished=False,
+        stage_id=0,
+        final_output_type="text",
+        request_output=SimpleNamespace(
+            outputs=[SimpleNamespace(token_ids=[1])],
+        ),
+    )
+
+    asyncio.run(orchestrator._route_output(0, 0, output, state, None))
+
+    assert events == [
+        (
+            "stage_output_committed",
+            {
+                "stage_id": 0,
+                "request_id": "req",
+                "logical_request_id": "req",
+                "execution_id": "req",
+                "pipeline_attempt_id": 0,
+                "stage_attempt_id": 0,
+                "output_stream_id": "stage:0",
+                "output_sequence": 0,
+                "finished": False,
+            },
+        )
+    ]
