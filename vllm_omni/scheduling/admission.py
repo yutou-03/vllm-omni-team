@@ -199,8 +199,6 @@ class AdmissionControllerConfig:
     gpu_low_watermark: float = 0.6
     kv_low_watermark: float = 0.7
     kv_high_watermark: float = 0.9
-    deadline_risk_low_watermark: float = 0.2
-    deadline_risk_high_watermark: float = 0.6
     queue_growth_high_rps: float | None = None
     connector_backlog_high: int | None = None
     require_downstream_pressure: bool = False
@@ -225,8 +223,6 @@ class AdmissionControllerConfig:
             "gpu_low_watermark",
             "kv_low_watermark",
             "kv_high_watermark",
-            "deadline_risk_low_watermark",
-            "deadline_risk_high_watermark",
         ):
             object.__setattr__(
                 self,
@@ -235,13 +231,6 @@ class AdmissionControllerConfig:
             )
         if self.kv_low_watermark >= self.kv_high_watermark:
             raise ValueError("KV low watermark must be below high watermark")
-        if (
-            self.deadline_risk_low_watermark
-            >= self.deadline_risk_high_watermark
-        ):
-            raise ValueError(
-                "deadline-risk low watermark must be below high watermark"
-            )
         if self.queue_growth_high_rps is not None:
             threshold = _finite(
                 self.queue_growth_high_rps,
@@ -362,12 +351,6 @@ def _pressure_reasons(
     ):
         reasons.append("connector_backlog_high")
     if (
-        snapshot.deadline_miss_risk is not None
-        and snapshot.deadline_miss_risk
-        >= config.deadline_risk_high_watermark
-    ):
-        reasons.append("deadline_risk_high")
-    if (
         snapshot.downstream_waiting_requests is not None
         and snapshot.downstream_effective_cap is not None
         and snapshot.downstream_waiting_requests
@@ -445,12 +428,6 @@ def _increase_blockers(
         and snapshot.kv_cache_usage_ratio > config.kv_low_watermark
     ):
         blockers.append("kv_not_below_low_watermark")
-    if (
-        snapshot.deadline_miss_risk is not None
-        and snapshot.deadline_miss_risk
-        > config.deadline_risk_low_watermark
-    ):
-        blockers.append("deadline_risk_not_low")
     if (
         snapshot.downstream_waiting_requests is not None
         and snapshot.downstream_effective_cap is not None
