@@ -127,6 +127,13 @@ stages:
         )
 
 
+def test_cli_default_additional_config_is_a_deploy_override_field():
+    """The parser's default {} must be nullified instead of erasing YAML."""
+    from vllm_omni.config.stage_config import deploy_override_field_names
+
+    assert "additional_config" in deploy_override_field_names()
+
+
 def test_vllm_config_resolves_typed_recovery_mode():
     config = SimpleNamespace(
         additional_config={

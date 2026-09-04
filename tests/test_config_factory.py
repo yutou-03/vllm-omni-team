@@ -829,6 +829,7 @@ class TestDeployConfigLoading:
         from vllm_omni.config.stage_config import deploy_override_field_names
 
         expected_fields = {
+            "additional_config",
             "async_chunk",
             "async_scheduling",
             "compilation_config",
