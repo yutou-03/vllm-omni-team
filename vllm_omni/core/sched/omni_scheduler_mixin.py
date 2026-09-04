@@ -157,6 +157,7 @@ class OmniSchedulerMixin:
         self._slo_admission_envelope: StaticConcurrencyEnvelope | None = None
         self._slo_admission_state: AdmissionControllerState | None = None
         self._slo_last_admission_decision = None
+        self._slo_last_admission_enforcement_cap: int | None = None
         if (
             self._slo_scheduling_config.enabled
             and self._slo_scheduling_config.mode
@@ -295,6 +296,7 @@ class OmniSchedulerMixin:
             initial_cap
         )
         self.effective_max_num_seqs = initial_cap
+        self._slo_last_admission_enforcement_cap = initial_cap
         # vLLM's native scheduling loops consume max_num_running_reqs.  Keep
         # the immutable physical ceiling separately and expose only the
         # controller-selected effective slots to those loops.
@@ -738,6 +740,7 @@ class OmniSchedulerMixin:
         envelope = self._slo_admission_envelope
         if state is None or config is None or envelope is None:
             self._slo_last_admission_decision = None
+            self._slo_last_admission_enforcement_cap = None
             return
         captured = self._stage_ddl_tick_monotonic_s
         if captured is None:
@@ -755,11 +758,19 @@ class OmniSchedulerMixin:
         self._slo_admission_state = decision.next_state
         self._slo_last_admission_decision = decision
         self.effective_max_num_seqs = decision.new_cap
-        self.max_num_running_reqs = decision.new_cap
+        # The native scheduler asserts running <= max_num_running_reqs before
+        # it can make progress.  During a drain-only decrease, retain enough
+        # enforcement capacity for the already-running population; because
+        # there is no free slot, this cannot admit a new waiting request.  The
+        # ceiling follows the population down on subsequent ticks.
+        enforcement_cap = max(decision.new_cap, len(self.running))
+        self._slo_last_admission_enforcement_cap = enforcement_cap
+        self.max_num_running_reqs = enforcement_cap
         emit_stage_event(
             "stage_admission_decision",
             stage_id=int(self._omni_stage_id_for_trace()),
             pressure_snapshot=snapshot.to_event_fields(),
+            scheduler_enforcement_max_num_seqs=enforcement_cap,
             **decision.to_event_fields(),
         )
 
@@ -1550,7 +1561,12 @@ class OmniSchedulerMixin:
             admission_decision=(
                 None
                 if self._slo_last_admission_decision is None
-                else self._slo_last_admission_decision.to_event_fields()
+                else {
+                    **self._slo_last_admission_decision.to_event_fields(),
+                    "scheduler_enforcement_max_num_seqs": (
+                        self._slo_last_admission_enforcement_cap
+                    ),
+                }
             ),
             **conformance_fields,
         )
