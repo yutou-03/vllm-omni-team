@@ -219,22 +219,6 @@ def test_stage_ddl_mode_loads_model_and_orders_only_waiting(monkeypatch):
 
     assert scheduler._baseline_policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED
     assert isinstance(scheduler.waiting, PolicyOrderedRequestQueue)
-
-
-def test_profiled_control_epoch_advances_once_per_scheduler_tick(monkeypatch):
-    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
-    monkeypatch.setattr(
-        "vllm_omni.core.sched.omni_scheduler_mixin."
-        "StaticMilestoneCostModel.from_json_file",
-        lambda *_args, **_kwargs: FakeMilestoneModel(),
-    )
-    scheduler = SchedulerHarness(1, additional_config=_stage_ddl_config())
-
-    assert scheduler._slo_control_epoch == 0
-    scheduler._baseline_prepare_schedule()
-    assert scheduler._slo_control_epoch == 1
-    scheduler._baseline_prepare_schedule()
-    assert scheduler._slo_control_epoch == 2
     assert scheduler.waiting.peek_request() is long
     assert loaded == [
         (
@@ -254,6 +238,22 @@ def test_profiled_control_epoch_advances_once_per_scheduler_tick(monkeypatch):
     scheduler.running = [short, long]
     scheduler._baseline_prepare_schedule()
     assert scheduler.running == [short, long]
+
+
+def test_profiled_control_epoch_advances_once_per_scheduler_tick(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *_args, **_kwargs: FakeMilestoneModel(),
+    )
+    scheduler = SchedulerHarness(1, additional_config=_stage_ddl_config())
+
+    assert scheduler._slo_control_epoch == 0
+    scheduler._baseline_prepare_schedule()
+    assert scheduler._slo_control_epoch == 1
+    scheduler._baseline_prepare_schedule()
+    assert scheduler._slo_control_epoch == 2
 
 
 def test_clockwork_mode_loads_same_model_but_orders_by_e2e_laxity(monkeypatch):

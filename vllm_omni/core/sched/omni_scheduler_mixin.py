@@ -144,6 +144,7 @@ class OmniSchedulerMixin:
         ] = {}
         self._stage_ddl_tick_monotonic_s: float | None = None
         self._stage_ddl_version = 0
+        self._slo_control_epoch = 0
         if (
             self._slo_scheduling_config.enabled
             and self._slo_scheduling_config.mode
@@ -573,6 +574,7 @@ class OmniSchedulerMixin:
 
         self._baseline_waiting_queue_choices = []
         if self._baseline_policy in _PROFILED_DEADLINE_POLICIES:
+            self._slo_control_epoch += 1
             self._stage_ddl_begin_tick()
         self._omni_request_progress_before_schedule = {
             str(request_id): int(request.num_computed_tokens)
