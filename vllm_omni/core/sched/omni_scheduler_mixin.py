@@ -49,6 +49,7 @@ from vllm_omni.scheduling.request_queue import (
     maybe_create_policy_ordered_queue,
 )
 from vllm_omni.scheduling.signals import (
+    NVMLGPUActiveSampler,
     QueueGrowthWindow,
     estimate_deadline_miss_risk,
     token_budget_utilization_ratio,
@@ -191,6 +192,11 @@ class OmniSchedulerMixin:
             self._baseline_policy = environment_policy
         self._baseline_stage_id = int(self._omni_stage_id_for_trace())
         self._stage_queue_growth_window = QueueGrowthWindow(window_s=1.0)
+        self._stage_gpu_active_sampler = (
+            NVMLGPUActiveSampler.from_environment(min_interval_s=0.1)
+            if self._stage_ddl_model is not None
+            else None
+        )
         self._baseline_data_ready_time: dict[str, float] = {}
         self._baseline_data_ready_order: dict[str, int] = {}
         self._baseline_next_data_ready_order = 0
@@ -411,6 +417,7 @@ class OmniSchedulerMixin:
         token_utilization = None
         queue_growth = None
         deadline_risk = None
+        gpu_active = None
         if update_control_signals:
             token_utilization = token_budget_utilization_ratio(
                 total=total_token_budget,
@@ -420,6 +427,10 @@ class OmniSchedulerMixin:
                 captured_monotonic_s=captured,
                 waiting_requests=waiting_requests,
             )
+            if self._stage_gpu_active_sampler is not None:
+                gpu_active = self._stage_gpu_active_sampler.sample(
+                    captured_monotonic_s=captured
+                )
             if self._stage_ddl_model is not None:
                 running_laxities = []
                 for request in self.running:
@@ -452,6 +463,20 @@ class OmniSchedulerMixin:
             token_budget_available=available_token_budget,
             token_budget_utilization_ratio=token_utilization,
             kv_cache_usage_ratio=getattr(kv_cache_manager, "usage", None),
+            gpu_active_ratio=(
+                None if gpu_active is None else gpu_active.ratio
+            ),
+            gpu_active_sample_age_ms=(
+                None if gpu_active is None else gpu_active.sample_age_ms
+            ),
+            gpu_active_source=(
+                None if gpu_active is None else gpu_active.source
+            ),
+            gpu_active_device_count=(
+                None
+                if gpu_active is None or gpu_active.ratio is None
+                else gpu_active.device_count
+            ),
             queue_growth_rate_rps=queue_growth,
             deadline_miss_risk=(
                 None if deadline_risk is None else deadline_risk.risk_ratio
