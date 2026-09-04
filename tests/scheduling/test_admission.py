@@ -56,8 +56,6 @@ def _config(**overrides) -> AdmissionControllerConfig:
         "gpu_low_watermark": 0.6,
         "kv_low_watermark": 0.6,
         "kv_high_watermark": 0.85,
-        "deadline_risk_low_watermark": 0.2,
-        "deadline_risk_high_watermark": 0.6,
         "queue_growth_high_rps": 5.0,
         "connector_backlog_high": 2,
         "require_downstream_pressure": False,
@@ -85,6 +83,10 @@ def test_envelope_and_config_fail_closed() -> None:
         _config(kv_low_watermark=0.9, kv_high_watermark=0.8)
     with pytest.raises(ValueError, match="decrease_factor must be in"):
         _config(decrease_factor=1.0)
+    with pytest.raises(ValueError, match="unknown dynamic admission"):
+        AdmissionControllerConfig.from_mapping(
+            {"deadline_risk_high_watermark": 0.6}
+        )
 
 
 def test_static_envelope_loads_only_hash_bound_artifact(tmp_path) -> None:
@@ -259,13 +261,13 @@ def test_fully_idle_stage_can_reset_to_safe_cap_between_busy_periods() -> None:
     assert decision.evicted_requests == 0
 
 
-def test_high_pressure_uses_aimd_decrease_and_never_evicts_running() -> None:
+def test_resource_pressure_uses_aimd_decrease_and_never_evicts_running() -> None:
     config = _config(decrease_hold=2)
     pressure = _snapshot(
         running_requests=5,
         effective_max_num_seqs=6,
         kv_cache_usage_ratio=0.9,
-        deadline_miss_risk=0.8,
+        deadline_miss_risk=1.0,
     )
     state = AdmissionControllerState.initial(6)
 
@@ -282,10 +284,21 @@ def test_high_pressure_uses_aimd_decrease_and_never_evicts_running() -> None:
     assert second.new_cap < pressure.running_requests
     assert second.drain_only is True
     assert second.evicted_requests == 0
-    assert second.trigger_reasons == (
-        "deadline_risk_high",
-        "kv_high_watermark",
+    assert second.trigger_reasons == ("kv_high_watermark",)
+
+
+def test_nonpositive_latest_start_laxity_is_telemetry_only() -> None:
+    decision = decide_admission_cap(
+        _config(),
+        _envelope(),
+        _snapshot(deadline_miss_risk=1.0),
+        AdmissionControllerState.initial(2),
     )
+
+    assert decision.action is AdmissionAction.HOLD
+    assert decision.trigger_reasons == ("safe_headroom_with_demand",)
+    assert "deadline_risk_not_low" not in decision.blocked_reasons
+    assert decision.next_state.increase_streak == 1
 
 
 def test_cap_is_clamped_to_all_hard_upper_bounds() -> None:

@@ -176,8 +176,6 @@ def _dynamic_stage_ddl_config(*, decrease_hold=20):
             "gpu_low_watermark": 0.6,
             "kv_low_watermark": 0.01,
             "kv_high_watermark": 0.9,
-            "deadline_risk_low_watermark": 0.2,
-            "deadline_risk_high_watermark": 0.6,
             "queue_growth_high_rps": None,
             "connector_backlog_high": 2,
             "require_downstream_pressure": True,
