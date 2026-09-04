@@ -168,6 +168,8 @@ def emit_stage_event(
     request_id: Any | None = None,
     **fields: Any,
 ) -> None:
+    if not _enabled():
+        return
     payload = {
         "run_id": _RUN_ID,
         "pid": _PID,
@@ -195,6 +197,8 @@ def emit_stage_duration_event(
     monotonic_end: float,
     **fields: Any,
 ) -> None:
+    if not _enabled():
+        return
     payload = {
         "run_id": _RUN_ID,
         "pid": _PID,
@@ -224,6 +228,13 @@ def stage_trace_span(
     nvtx_color: str | None = None,
     **fields: Any,
 ) -> Iterator[None]:
+    if not _enabled():
+        with nvtx_range(
+            nvtx_name or f"{event}:stage={stage_id}",
+            color=nvtx_color,
+        ):
+            yield
+        return
     timestamp_start = time.time()
     monotonic_start = time.monotonic()
     with nvtx_range(nvtx_name or f"{event}:stage={stage_id}", color=nvtx_color):
@@ -251,6 +262,8 @@ def emit_iteration_event(
     timestamp_end: float,
     **fields: Any,
 ) -> None:
+    if not _enabled():
+        return
     payload = {
         "run_id": _RUN_ID,
         "pid": _PID,
@@ -276,6 +289,8 @@ def emit_connector_event(
     request_id: Any | None = None,
     **fields: Any,
 ) -> None:
+    if not _enabled():
+        return
     payload = {
         "run_id": _RUN_ID,
         "pid": _PID,
