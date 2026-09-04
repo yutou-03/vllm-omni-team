@@ -12,6 +12,8 @@ from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.profiling import stage_queue_trace
 from vllm_omni.scheduling.policy import BASELINE_POLICY_ENV
+from vllm_omni.scheduling.deadline import MilestoneCostEstimate
+from vllm_omni.scheduling.policy import BaselineSchedulingPolicy
 from vllm_omni.scheduling.request_queue import PolicyOrderedRequestQueue
 
 
@@ -65,9 +67,16 @@ def _write_concurrent_trace_records(
 
 
 class FakeBaseScheduler:
-    def __init__(self, stage_id: int, *, chunk_adapter=None) -> None:
+    def __init__(
+        self,
+        stage_id: int,
+        *,
+        chunk_adapter=None,
+        additional_config=None,
+    ) -> None:
         self.vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(stage_id=stage_id)
+            model_config=SimpleNamespace(stage_id=stage_id),
+            additional_config=additional_config or {},
         )
         self.waiting = FCFSRequestQueue()
         self.skipped_waiting = FCFSRequestQueue()
@@ -87,8 +96,18 @@ class FakeBaseScheduler:
 
 
 class SchedulerHarness(OmniSchedulerMixin, FakeBaseScheduler):
-    def __init__(self, stage_id: int, *, chunk_adapter=None) -> None:
-        super().__init__(stage_id, chunk_adapter=chunk_adapter)
+    def __init__(
+        self,
+        stage_id: int,
+        *,
+        chunk_adapter=None,
+        additional_config=None,
+    ) -> None:
+        super().__init__(
+            stage_id,
+            chunk_adapter=chunk_adapter,
+            additional_config=additional_config,
+        )
         self._initialize_baseline_scheduling()
 
 
@@ -111,6 +130,165 @@ def test_stage_deadline_edf_activation(monkeypatch, stage_id):
     scheduler = SchedulerHarness(stage_id)
 
     assert isinstance(scheduler.waiting, PolicyOrderedRequestQueue)
+
+
+def _stage_ddl_config(mode="stage_ddl_fixed"):
+    return {
+        "slo_scheduling": {
+            "enabled": True,
+            "mode": mode,
+            "stage_ddl": {
+                "model_path": "/models/p3.json",
+                "model_sha256": "a" * 64,
+                "input_token_cutoff": 128,
+                "milestone_guard_ms": {
+                    "ttft": 5.0,
+                    "ttfp": 5.0,
+                    "e2e": 0.0,
+                },
+            },
+        }
+    }
+
+
+class FakeMilestoneModel:
+    cost_model_version = "p3-static:test"
+    cost_source = "static_component_p95_plus_first_output_guard"
+
+    def predict(self, *, request_path, stage_id, milestone, num_prompt_tokens):
+        del request_path, stage_id
+        name = getattr(milestone, "value", milestone)
+        if name == "ttft":
+            current = 900.0 if num_prompt_tokens > 128 else 100.0
+        elif name == "ttfp":
+            current = 200.0
+        else:
+            current = 500.0
+        return MilestoneCostEstimate(current_stage_service_ms=current)
+
+
+def _set_stage_ddl_metadata(request, *, ingress_order, ttft, e2e):
+    request.additional_information = {
+        "meta": {
+            "sched_schema_version": 2,
+            "sched_source_request_id": request.request_id,
+            "sched_ingress_order": ingress_order,
+            "sched_ingress_monotonic_s": 100.0,
+            "sched_logical_request_id": request.request_id,
+            "sched_request_path": "text",
+            "sched_service_class": "interactive",
+            "sched_milestone_deadlines_monotonic_s": {
+                "ttft": ttft,
+                "e2e": e2e,
+            },
+            "sched_max_preemptions": 1,
+        }
+    }
+    return request
+
+
+def test_stage_ddl_mode_loads_model_and_orders_only_waiting(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    loaded = []
+
+    def load_model(path, **kwargs):
+        loaded.append((path, kwargs))
+        return FakeMilestoneModel()
+
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        load_model,
+    )
+    scheduler = SchedulerHarness(0, additional_config=_stage_ddl_config())
+    short = _set_stage_ddl_metadata(
+        FakeRequest("short", deadline=None, num_prompt_tokens=36),
+        ingress_order=0,
+        ttft=102.0,
+        e2e=110.0,
+    )
+    long = _set_stage_ddl_metadata(
+        FakeRequest("long", deadline=None, num_prompt_tokens=216),
+        ingress_order=1,
+        ttft=102.0,
+        e2e=110.0,
+    )
+    scheduler.add_request(short)
+    scheduler.add_request(long)
+
+    assert scheduler._baseline_policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED
+    assert isinstance(scheduler.waiting, PolicyOrderedRequestQueue)
+    assert scheduler.waiting.peek_request() is long
+    assert loaded == [
+        (
+            "/models/p3.json",
+            {
+                "expected_sha256": "a" * 64,
+                "input_token_cutoff": 128,
+                "milestone_guard_ms": {
+                    "ttft": 5.0,
+                    "ttfp": 5.0,
+                    "e2e": 0.0,
+                },
+            },
+        )
+    ]
+
+    scheduler.running = [short, long]
+    scheduler._baseline_prepare_schedule()
+    assert scheduler.running == [short, long]
+
+
+def test_stage_ddl_freezes_one_snapshot_time_per_scheduler_tick(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *args, **kwargs: FakeMilestoneModel(),
+    )
+    scheduler = SchedulerHarness(0, additional_config=_stage_ddl_config())
+    first = _set_stage_ddl_metadata(
+        FakeRequest("first", deadline=None),
+        ingress_order=0,
+        ttft=999999.0,
+        e2e=1000000.0,
+    )
+    second = _set_stage_ddl_metadata(
+        FakeRequest("second", deadline=None),
+        ingress_order=1,
+        ttft=999999.0,
+        e2e=1000000.0,
+    )
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    list(scheduler.waiting)
+    initial = dict(scheduler._stage_ddl_snapshot_by_request)
+    assert len(initial) == 2
+    assert len({item.captured_monotonic_s for item in initial.values()}) == 1
+
+    scheduler._baseline_prepare_schedule()
+    list(scheduler.waiting)
+    refreshed = scheduler._stage_ddl_snapshot_by_request
+    assert len({item.captured_monotonic_s for item in refreshed.values()}) == 1
+    assert {item.deadline_version for item in refreshed.values()} == {
+        next(iter(initial.values())).deadline_version + 1
+    }
+
+
+def test_stage_ddl_rejects_legacy_metadata_and_policy_conflicts(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *args, **kwargs: FakeMilestoneModel(),
+    )
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    scheduler = SchedulerHarness(0, additional_config=_stage_ddl_config())
+    with pytest.raises(ValueError, match="schema_version"):
+        scheduler.add_request(FakeRequest("legacy", deadline=200.0))
+
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "final_deadline_edf_np")
+    with pytest.raises(ValueError, match="conflicts with enabled SLO mode"):
+        SchedulerHarness(0, additional_config=_stage_ddl_config())
 
 
 def test_stage_deadline_edf_uses_current_stage_subdeadline(monkeypatch):
