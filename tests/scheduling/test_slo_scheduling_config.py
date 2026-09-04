@@ -8,11 +8,38 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
 )
 from vllm_omni.recovery import PreemptionRecoveryMode
 from vllm_omni.scheduling.config import (
+    DynamicAdmissionConfig,
     StageDDLConfig,
     SloSchedulingConfig,
     SloSchedulingMode,
     effective_preemption_recovery_mode,
 )
+
+
+def _dynamic_admission() -> dict:
+    return {
+        "envelope_path": "/models/p4-envelope.json",
+        "envelope_sha256": "b" * 64,
+        "target_stage_ids": [1],
+        "initial_active_by_stage": {"1": 2},
+        "controller": {
+            "min_active": 1,
+            "max_active": 2,
+            "increase_hold": 50,
+            "decrease_hold": 20,
+            "cooldown_epochs": 100,
+            "increase_step": 1,
+            "decrease_factor": 0.5,
+            "gpu_low_watermark": 0.6,
+            "kv_low_watermark": 0.01,
+            "kv_high_watermark": 0.9,
+            "deadline_risk_low_watermark": 0.2,
+            "deadline_risk_high_watermark": 0.6,
+            "queue_growth_high_rps": None,
+            "connector_backlog_high": 2,
+            "require_downstream_pressure": True,
+        },
+    }
 
 
 def test_slo_config_defaults_are_disabled_and_native():
@@ -75,6 +102,32 @@ def test_clockwork_latest_start_reuses_hash_bound_cost_model():
 
     assert config.mode is SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED
     assert config.stage_ddl.is_configured
+
+
+def test_dynamic_admission_config_is_hash_bound_and_typed():
+    config = SloSchedulingConfig.from_mapping(
+        {
+            "enabled": True,
+            "mode": "stage_ddl_dynamic_admission",
+            "stage_ddl": {
+                "model_path": "/models/p3.json",
+                "model_sha256": "a" * 64,
+                "dynamic_admission": _dynamic_admission(),
+            },
+        }
+    )
+
+    dynamic = config.stage_ddl.dynamic_admission
+    assert isinstance(dynamic, DynamicAdmissionConfig)
+    assert dynamic.envelope_path == "/models/p4-envelope.json"
+    assert dynamic.envelope_sha256 == "b" * 64
+    assert dynamic.target_stage_ids == (1,)
+    assert dynamic.initial_active_by_stage == {1: 2}
+    assert dynamic.controller.max_active == 2
+    assert dynamic.controller.require_downstream_pressure is True
+    assert config.to_dict()["stage_ddl"]["dynamic_admission"] == (
+        _dynamic_admission()
+    )
 
 
 def test_enabled_stage_local_mode_must_be_explicitly_allowed():
@@ -162,6 +215,29 @@ def test_disabled_master_switch_forces_baseline_recovery():
         (
             {"stage_ddl": {"milestone_guard_ms": {"ttft": 5.0}}},
             "milestone_guard_ms.*missing",
+        ),
+        (
+            {
+                "enabled": True,
+                "mode": "stage_ddl_dynamic_admission",
+                "stage_ddl": {
+                    "model_path": "/models/p3.json",
+                    "model_sha256": "a" * 64,
+                },
+            },
+            "dynamic_admission.*required",
+        ),
+        (
+            {
+                "enabled": True,
+                "mode": "stage_ddl_fixed",
+                "stage_ddl": {
+                    "model_path": "/models/p3.json",
+                    "model_sha256": "a" * 64,
+                    "dynamic_admission": _dynamic_admission(),
+                },
+            },
+            "dynamic_admission.*only valid",
         ),
     ],
 )

@@ -58,6 +58,7 @@ def _config(**overrides) -> AdmissionControllerConfig:
         "deadline_risk_high_watermark": 0.6,
         "queue_growth_high_rps": 5.0,
         "connector_backlog_high": 2,
+        "require_downstream_pressure": False,
     }
     values.update(overrides)
     return AdmissionControllerConfig(**values)
@@ -132,6 +133,26 @@ def test_missing_required_signal_blocks_increase_without_implying_pressure() -> 
     assert decision.trigger_reasons == ()
     assert decision.blocked_reasons == ("missing:gpu_active_ratio",)
     assert decision.next_state.decrease_streak == 0
+
+
+def test_required_downstream_pressure_blocks_increase_when_missing() -> None:
+    decision = decide_admission_cap(
+        _config(
+            increase_hold=1,
+            require_downstream_pressure=True,
+            connector_backlog_high=None,
+        ),
+        _envelope(),
+        _snapshot(),
+        AdmissionControllerState.initial(2),
+    )
+
+    assert decision.action is AdmissionAction.HOLD
+    assert decision.trigger_reasons == ()
+    assert decision.blocked_reasons == (
+        "missing:downstream_effective_cap",
+        "missing:downstream_waiting_requests",
+    )
 
 
 def test_input_waiting_requests_are_not_runnable_demand() -> None:
