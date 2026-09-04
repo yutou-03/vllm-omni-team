@@ -17,7 +17,9 @@ from vllm_omni.profiling.stage_queue_trace import (
     conformance_trace_enabled,
     emit_iteration_event,
     emit_stage_event,
+    stage_trace_enabled,
 )
+from vllm_omni.scheduling.contracts import StageRuntimeSnapshot
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     preserve_scheduling_metadata,
@@ -851,6 +853,42 @@ class OmniSchedulerMixin:
                 preempted_requeue_order=preempted_requeue_order,
                 resumed_preempted_req_ids=resumed_preempted_req_ids,
             )
+        pressure_snapshot = None
+        if stage_trace_enabled():
+            physical_cap = max_running
+            effective_cap = int(
+                getattr(self, "effective_max_num_seqs", physical_cap)
+            )
+            total_token_budget = int(
+                getattr(self, "max_num_scheduled_tokens", 0)
+            )
+            available_token_budget = (
+                token_budget_after
+                if token_budget_after is not None
+                else max(total_token_budget - total_num_scheduled_tokens, 0)
+            )
+            pressure_snapshot = StageRuntimeSnapshot(
+                schema_version=1,
+                stage_id=int(stage_id),
+                captured_monotonic_s=time.monotonic(),
+                control_epoch=int(getattr(self, "_slo_control_epoch", 0)),
+                running_requests=len(self.running),
+                waiting_requests=(
+                    len(self.waiting) + len(getattr(self, "skipped_waiting", ()))
+                ),
+                input_waiting_requests=int(
+                    getattr(self, "num_waiting_for_streaming_input", 0)
+                ),
+                physical_max_num_seqs=physical_cap,
+                effective_max_num_seqs=effective_cap,
+                token_budget_total=total_token_budget,
+                token_budget_available=available_token_budget,
+                kv_cache_usage_ratio=getattr(
+                    self.kv_cache_manager,
+                    "usage",
+                    None,
+                ),
+            ).to_event_fields()
         emit_iteration_event(
             stage_id=stage_id,
             iteration_id=iteration_id,
@@ -865,6 +903,7 @@ class OmniSchedulerMixin:
             scheduled_req_ids=scheduled_req_ids,
             preempted_req_ids=sorted(preempted_req_ids),
             kv_cache_usage=getattr(self.kv_cache_manager, "usage", None),
+            pressure_snapshot=pressure_snapshot,
             **conformance_fields,
         )
         self._baseline_conformance_snapshot = None

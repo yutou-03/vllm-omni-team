@@ -49,6 +49,12 @@ def _enabled() -> bool:
     )
 
 
+def stage_trace_enabled() -> bool:
+    """Return whether JSON trace payload construction is enabled."""
+
+    return _enabled()
+
+
 def conformance_trace_enabled() -> bool:
     """Return whether replayable per-iteration policy details are requested."""
 
