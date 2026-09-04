@@ -13,6 +13,7 @@ from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.profiling import stage_queue_trace
 from vllm_omni.scheduling.policy import BASELINE_POLICY_ENV
 from vllm_omni.scheduling.deadline import MilestoneCostEstimate
+from vllm_omni.scheduling.admission import StaticConcurrencyEnvelope
 from vllm_omni.scheduling.policy import BaselineSchedulingPolicy
 from vllm_omni.scheduling.request_queue import PolicyOrderedRequestQueue
 from vllm_omni.scheduling.signals import GPUActiveSample
@@ -74,6 +75,7 @@ class FakeBaseScheduler:
         *,
         chunk_adapter=None,
         additional_config=None,
+        max_num_running_reqs=None,
     ) -> None:
         self.vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(stage_id=stage_id),
@@ -83,6 +85,8 @@ class FakeBaseScheduler:
         self.skipped_waiting = FCFSRequestQueue()
         self.running = []
         self.chunk_transfer_adapter = chunk_adapter
+        if max_num_running_reqs is not None:
+            self.max_num_running_reqs = max_num_running_reqs
         self.native_waiting = self.waiting
         self.native_skipped_waiting = self.skipped_waiting
 
@@ -103,11 +107,13 @@ class SchedulerHarness(OmniSchedulerMixin, FakeBaseScheduler):
         *,
         chunk_adapter=None,
         additional_config=None,
+        max_num_running_reqs=None,
     ) -> None:
         super().__init__(
             stage_id,
             chunk_adapter=chunk_adapter,
             additional_config=additional_config,
+            max_num_running_reqs=max_num_running_reqs,
         )
         self._initialize_baseline_scheduling()
 
@@ -150,6 +156,34 @@ def _stage_ddl_config(mode="stage_ddl_fixed"):
             },
         }
     }
+
+
+def _dynamic_stage_ddl_config(*, decrease_hold=20):
+    config = _stage_ddl_config("stage_ddl_dynamic_admission")
+    config["slo_scheduling"]["stage_ddl"]["dynamic_admission"] = {
+        "envelope_path": "/models/p4-envelope.json",
+        "envelope_sha256": "b" * 64,
+        "target_stage_ids": [1],
+        "initial_active_by_stage": {"1": 2},
+        "controller": {
+            "min_active": 1,
+            "max_active": 2,
+            "increase_hold": 50,
+            "decrease_hold": decrease_hold,
+            "cooldown_epochs": 100,
+            "increase_step": 1,
+            "decrease_factor": 0.5,
+            "gpu_low_watermark": 0.6,
+            "kv_low_watermark": 0.01,
+            "kv_high_watermark": 0.9,
+            "deadline_risk_low_watermark": 0.2,
+            "deadline_risk_high_watermark": 0.6,
+            "queue_growth_high_rps": None,
+            "connector_backlog_high": 2,
+            "require_downstream_pressure": True,
+        },
+    }
+    return config
 
 
 class FakeMilestoneModel:
@@ -254,6 +288,135 @@ def test_profiled_control_epoch_advances_once_per_scheduler_tick(monkeypatch):
     assert scheduler._slo_control_epoch == 1
     scheduler._baseline_prepare_schedule()
     assert scheduler._slo_control_epoch == 2
+
+
+def test_dynamic_stage1_loads_envelope_and_applies_initial_cap(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *_args, **_kwargs: FakeMilestoneModel(),
+    )
+    loaded = []
+
+    def load_envelope(path, **kwargs):
+        loaded.append((path, kwargs))
+        return StaticConcurrencyEnvelope(
+            schema_version=1,
+            artifact_id="p4-stage1-cap-v3",
+            safe_max_active_by_stage={0: 1, 1: 2, 2: 1},
+        )
+
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticConcurrencyEnvelope.from_json_file",
+        load_envelope,
+    )
+    scheduler = SchedulerHarness(
+        1,
+        additional_config=_dynamic_stage_ddl_config(),
+        max_num_running_reqs=2,
+    )
+
+    assert scheduler._baseline_policy is (
+        BaselineSchedulingPolicy.STAGE_DDL_FIXED
+    )
+    assert scheduler._slo_physical_max_num_seqs == 2
+    assert scheduler.effective_max_num_seqs == 2
+    assert scheduler.max_num_running_reqs == 2
+    assert scheduler._slo_admission_state.current_cap == 2
+    assert loaded == [
+        (
+            "/models/p4-envelope.json",
+            {"expected_sha256": "b" * 64},
+        )
+    ]
+
+
+def test_dynamic_stage1_applies_drain_only_cap_decision(monkeypatch):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *_args, **_kwargs: FakeMilestoneModel(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticConcurrencyEnvelope.from_json_file",
+        lambda *_args, **_kwargs: StaticConcurrencyEnvelope(
+            schema_version=1,
+            artifact_id="p4-stage1-cap-v3",
+            safe_max_active_by_stage={0: 1, 1: 2, 2: 1},
+        ),
+    )
+    decisions = []
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.emit_stage_event",
+        lambda event, **fields: decisions.append((event, fields)),
+    )
+    scheduler = SchedulerHarness(
+        1,
+        additional_config=_dynamic_stage_ddl_config(decrease_hold=1),
+        max_num_running_reqs=2,
+    )
+    scheduler.max_num_scheduled_tokens = 100
+    scheduler.kv_cache_manager = SimpleNamespace(usage=0.001)
+    scheduler._stage_gpu_active_sampler = SimpleNamespace(
+        sample=lambda **_kwargs: GPUActiveSample(
+            ratio=0.7,
+            source="nvml_mean_visible_devices",
+            device_count=1,
+            sample_age_ms=5.0,
+        )
+    )
+    now = 100.0
+    at_risk = _set_stage_ddl_metadata(
+        FakeRequest("at-risk", deadline=None),
+        ingress_order=0,
+        ttft=99.0,
+        e2e=101.0,
+    )
+    at_risk.status = SimpleNamespace(name="RUNNING")
+    safe = _set_stage_ddl_metadata(
+        FakeRequest("safe", deadline=None),
+        ingress_order=1,
+        ttft=99.0,
+        e2e=101.0,
+    )
+    safe.status = SimpleNamespace(name="RUNNING")
+    scheduler.running = [at_risk, safe]
+    scheduler._update_slo_downstream_pressure(
+        {
+            "pressure_feedback_schema_version": 1,
+            "stage_id": 2,
+            "control_epoch": 9,
+            "captured_monotonic_s": now,
+            "waiting_requests": 0,
+            "effective_max_num_seqs": 1,
+        }
+    )
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.time.monotonic",
+        lambda: now,
+    )
+
+    scheduler._baseline_prepare_schedule(token_budget_before=100)
+
+    assert scheduler.effective_max_num_seqs == 1
+    assert scheduler.max_num_running_reqs == 1
+    assert len(scheduler.running) == 2
+    decision = scheduler._slo_last_admission_decision
+    assert decision.action.value == "decrease"
+    assert decision.drain_only is True
+    assert decision.evicted_requests == 0
+    assert decisions[-1][0] == "stage_admission_decision"
+    assert decisions[-1][1]["new_effective_max_num_seqs"] == 1
+
+    pressure = scheduler._capture_stage_runtime_snapshot(
+        captured_monotonic_s=now,
+    )
+    assert pressure["physical_max_num_seqs"] == 2
+    assert pressure["effective_max_num_seqs"] == 1
 
 
 def test_clockwork_mode_loads_same_model_but_orders_by_e2e_laxity(monkeypatch):
