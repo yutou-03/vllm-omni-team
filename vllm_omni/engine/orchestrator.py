@@ -602,7 +602,7 @@ class Orchestrator:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     def _slo_downstream_feedback_enabled(self) -> bool:
-        """Enable the relay only for configured fixed Stage-DDL stages."""
+        """Enable the relay for Stage-DDL modes that consume pressure."""
 
         if len(self.stage_pools) < 2:
             return False
@@ -614,10 +614,10 @@ class Orchestrator:
                 slo_config = extract_slo_scheduling_config(config)
             except (TypeError, ValueError):
                 continue
-            if (
-                slo_config.enabled
-                and slo_config.mode is SloSchedulingMode.STAGE_DDL_FIXED
-            ):
+            if slo_config.enabled and slo_config.mode in {
+                SloSchedulingMode.STAGE_DDL_FIXED,
+                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
+            }:
                 return True
         return False
 

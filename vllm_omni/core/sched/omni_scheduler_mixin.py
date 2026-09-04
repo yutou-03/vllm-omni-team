@@ -19,6 +19,11 @@ from vllm_omni.profiling.stage_queue_trace import (
     emit_stage_event,
     stage_trace_enabled,
 )
+from vllm_omni.scheduling.admission import (
+    AdmissionControllerState,
+    StaticConcurrencyEnvelope,
+    decide_admission_cap,
+)
 from vllm_omni.scheduling.config import (
     SloSchedulingMode,
     extract_slo_scheduling_config,
@@ -147,12 +152,18 @@ class OmniSchedulerMixin:
         self._stage_ddl_version = 0
         self._slo_control_epoch = 0
         self._slo_downstream_pressure: dict[str, Any] | None = None
+        self._slo_physical_max_num_seqs: int | None = None
+        self._slo_admission_config = None
+        self._slo_admission_envelope: StaticConcurrencyEnvelope | None = None
+        self._slo_admission_state: AdmissionControllerState | None = None
+        self._slo_last_admission_decision = None
         if (
             self._slo_scheduling_config.enabled
             and self._slo_scheduling_config.mode
             in {
                 SloSchedulingMode.STAGE_DDL_FIXED,
                 SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED,
+                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
             }
         ):
             if environment_policy is not BaselineSchedulingPolicy.NATIVE_FCFS:
@@ -169,23 +180,23 @@ class OmniSchedulerMixin:
                 input_token_cutoff=stage_ddl_config.input_token_cutoff,
                 milestone_guard_ms=stage_ddl_config.milestone_guard_ms,
             )
-            if (
-                self._slo_scheduling_config.mode
-                is SloSchedulingMode.STAGE_DDL_FIXED
+            if self._slo_scheduling_config.mode is (
+                SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED
             ):
-                self._baseline_policy = BaselineSchedulingPolicy.STAGE_DDL_FIXED
-            else:
                 self._baseline_policy = (
                     BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP
                 )
+            else:
+                self._baseline_policy = BaselineSchedulingPolicy.STAGE_DDL_FIXED
+            if self._slo_scheduling_config.mode is (
+                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION
+            ):
+                self._initialize_dynamic_admission()
             self._stage_ddl_begin_tick()
         elif (
             self._slo_scheduling_config.enabled
-            and self._slo_scheduling_config.mode
-            in {
-                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
-                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
-            }
+            and self._slo_scheduling_config.mode is
+            SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR
         ):
             raise NotImplementedError(
                 f"SLO mode {self._slo_scheduling_config.mode.value!r} is not "
@@ -246,6 +257,48 @@ class OmniSchedulerMixin:
                 stage_id=self._baseline_stage_id,
                 data_ready_time=self._baseline_request_data_ready_time,
             )
+
+    def _initialize_dynamic_admission(self) -> None:
+        """Load the offline envelope and activate only configured stages."""
+
+        dynamic = self._slo_scheduling_config.stage_ddl.dynamic_admission
+        assert dynamic.envelope_path is not None
+        assert dynamic.envelope_sha256 is not None
+        envelope = StaticConcurrencyEnvelope.from_json_file(
+            dynamic.envelope_path,
+            expected_sha256=dynamic.envelope_sha256,
+        )
+        stage_id = int(self._omni_stage_id_for_trace())
+        if stage_id not in dynamic.target_stage_ids:
+            return
+        physical_cap = int(getattr(self, "max_num_running_reqs", 0))
+        if physical_cap <= 0:
+            raise ValueError(
+                "dynamic admission requires a positive physical max_num_seqs"
+            )
+        safe_cap = envelope.safe_cap(stage_id)
+        if safe_cap > physical_cap:
+            raise ValueError(
+                f"stage {stage_id} safe cap {safe_cap} exceeds physical cap "
+                f"{physical_cap}"
+            )
+        initial_cap = dynamic.initial_active_by_stage[stage_id]
+        if initial_cap > safe_cap:
+            raise ValueError(
+                f"stage {stage_id} initial cap {initial_cap} exceeds safe cap "
+                f"{safe_cap}"
+            )
+        self._slo_physical_max_num_seqs = physical_cap
+        self._slo_admission_config = dynamic.controller
+        self._slo_admission_envelope = envelope
+        self._slo_admission_state = AdmissionControllerState.initial(
+            initial_cap
+        )
+        self.effective_max_num_seqs = initial_cap
+        # vLLM's native scheduling loops consume max_num_running_reqs.  Keep
+        # the immutable physical ceiling separately and expose only the
+        # controller-selected effective slots to those loops.
+        self.max_num_running_reqs = initial_cap
 
     def _baseline_policy_applies(self) -> bool:
         policy = getattr(
@@ -399,7 +452,9 @@ class OmniSchedulerMixin:
             self._stage_runtime_request_counts()
         )
         physical_cap = int(
-            getattr(self, "max_num_running_reqs", len(self.running))
+            self._slo_physical_max_num_seqs
+            if self._slo_physical_max_num_seqs is not None
+            else getattr(self, "max_num_running_reqs", len(self.running))
         )
         effective_cap = int(
             getattr(self, "effective_max_num_seqs", physical_cap)
@@ -653,6 +708,61 @@ class OmniSchedulerMixin:
             return None
         return {**sample, "sample_age_ms": age_s * 1000.0}
 
+    def _runtime_snapshot_contract(
+        self,
+        *,
+        captured_monotonic_s: float,
+        token_budget_available: int | None,
+    ) -> StageRuntimeSnapshot:
+        fields = self._capture_stage_runtime_snapshot(
+            captured_monotonic_s=captured_monotonic_s,
+            token_budget_available=token_budget_available,
+            update_control_signals=True,
+        )
+        values = {
+            name: fields[name]
+            for name in StageRuntimeSnapshot.__dataclass_fields__
+            if name in fields
+        }
+        values["schema_version"] = fields["pressure_schema_version"]
+        values["stage_id"] = int(self._omni_stage_id_for_trace())
+        return StageRuntimeSnapshot(**values)
+
+    def _apply_slo_dynamic_admission(
+        self,
+        *,
+        token_budget_available: int | None,
+    ) -> None:
+        state = self._slo_admission_state
+        config = self._slo_admission_config
+        envelope = self._slo_admission_envelope
+        if state is None or config is None or envelope is None:
+            self._slo_last_admission_decision = None
+            return
+        captured = self._stage_ddl_tick_monotonic_s
+        if captured is None:
+            raise RuntimeError("dynamic admission requires a scheduler tick")
+        snapshot = self._runtime_snapshot_contract(
+            captured_monotonic_s=captured,
+            token_budget_available=token_budget_available,
+        )
+        decision = decide_admission_cap(
+            config,
+            envelope,
+            snapshot,
+            state,
+        )
+        self._slo_admission_state = decision.next_state
+        self._slo_last_admission_decision = decision
+        self.effective_max_num_seqs = decision.new_cap
+        self.max_num_running_reqs = decision.new_cap
+        emit_stage_event(
+            "stage_admission_decision",
+            stage_id=int(self._omni_stage_id_for_trace()),
+            pressure_snapshot=snapshot.to_event_fields(),
+            **decision.to_event_fields(),
+        )
+
     def _stage_runtime_request_counts(self) -> tuple[int, int, int]:
         """Count runnable and input-blocked requests without double counting.
 
@@ -739,6 +849,9 @@ class OmniSchedulerMixin:
         if self._baseline_policy in _PROFILED_DEADLINE_POLICIES:
             self._slo_control_epoch += 1
             self._stage_ddl_begin_tick()
+        self._apply_slo_dynamic_admission(
+            token_budget_available=token_budget_before,
+        )
         self._omni_request_progress_before_schedule = {
             str(request_id): int(request.num_computed_tokens)
             for request_id, request in getattr(self, "requests", {}).items()
@@ -1434,6 +1547,11 @@ class OmniSchedulerMixin:
             preempted_req_ids=sorted(preempted_req_ids),
             kv_cache_usage=getattr(self.kv_cache_manager, "usage", None),
             pressure_snapshot=pressure_snapshot,
+            admission_decision=(
+                None
+                if self._slo_last_admission_decision is None
+                else self._slo_last_admission_decision.to_event_fields()
+            ),
             **conformance_fields,
         )
         self._baseline_conformance_snapshot = None
