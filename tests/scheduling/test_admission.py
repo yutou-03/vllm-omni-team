@@ -32,6 +32,8 @@ def _snapshot(**overrides) -> StageRuntimeSnapshot:
         "gpu_active_ratio": 0.5,
         "service_time_p95_ms": 10.0,
         "deadline_miss_risk": 0.1,
+        "deadline_miss_risk_population": 2,
+        "deadline_miss_risk_scope": "runnable_running",
     }
     values.update(overrides)
     return StageRuntimeSnapshot(**values)

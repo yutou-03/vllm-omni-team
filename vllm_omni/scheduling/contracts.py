@@ -288,6 +288,7 @@ class StageRuntimeSnapshot:
     effective_max_num_seqs: int
     token_budget_total: int
     token_budget_available: int
+    token_budget_utilization_ratio: float | None = None
     kv_cache_usage_ratio: float | None = None
     gpu_active_ratio: float | None = None
     service_time_ewma_ms: float | None = None
@@ -297,6 +298,8 @@ class StageRuntimeSnapshot:
     downstream_effective_cap: int | None = None
     connector_backlog: int | None = None
     deadline_miss_risk: float | None = None
+    deadline_miss_risk_population: int | None = None
+    deadline_miss_risk_scope: str | None = None
     last_admission_rejection: str | None = None
 
     def __post_init__(self) -> None:
@@ -336,6 +339,7 @@ class StageRuntimeSnapshot:
             "downstream_waiting_requests",
             "downstream_effective_cap",
             "connector_backlog",
+            "deadline_miss_risk_population",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -353,6 +357,7 @@ class StageRuntimeSnapshot:
                 ),
             )
         for field_name in (
+            "token_budget_utilization_ratio",
             "kv_cache_usage_ratio",
             "gpu_active_ratio",
             "deadline_miss_risk",
@@ -362,6 +367,30 @@ class StageRuntimeSnapshot:
                 field_name,
                 _optional_ratio(getattr(self, field_name), field=field_name),
             )
+        deadline_metadata = (
+            self.deadline_miss_risk_population,
+            self.deadline_miss_risk_scope,
+        )
+        if self.deadline_miss_risk is not None or any(
+            value is not None for value in deadline_metadata
+        ):
+            if self.deadline_miss_risk is None or any(
+                value is None for value in deadline_metadata
+            ):
+                raise ValueError(
+                    "deadline risk fields must be provided together"
+                )
+            if self.deadline_miss_risk_scope != "runnable_running":
+                raise ValueError(
+                    "deadline_miss_risk_scope must be runnable_running"
+                )
+            if (
+                self.deadline_miss_risk_population == 0
+                and self.deadline_miss_risk != 0.0
+            ):
+                raise ValueError(
+                    "empty deadline risk population must have zero risk"
+                )
         if self.queue_growth_rate_rps is not None:
             object.__setattr__(
                 self,
@@ -395,6 +424,7 @@ class StageRuntimeSnapshot:
                 "runnable_excludes_input_blocked"
             )
         for field_name in (
+            "token_budget_utilization_ratio",
             "kv_cache_usage_ratio",
             "gpu_active_ratio",
             "service_time_ewma_ms",
@@ -404,6 +434,8 @@ class StageRuntimeSnapshot:
             "downstream_effective_cap",
             "connector_backlog",
             "deadline_miss_risk",
+            "deadline_miss_risk_population",
+            "deadline_miss_risk_scope",
             "last_admission_rejection",
         ):
             value = getattr(self, field_name)
