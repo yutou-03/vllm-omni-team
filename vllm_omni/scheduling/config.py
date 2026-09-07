@@ -24,6 +24,7 @@ class SloSchedulingMode(str, Enum):
     SRPF_FIXED = "srpf_fixed"
     PATH_RR_FIXED = "path_rr_fixed"
     STAGE_DDL_FIXED = "stage_ddl_fixed"
+    STAGE_DDL_FAIR_FIXED = "stage_ddl_fair_fixed"
     CLOCKWORK_LATEST_START_FIXED = "clockwork_latest_start_fixed"
     STAGE_DDL_DYNAMIC_ADMISSION = "stage_ddl_dynamic_admission"
     STAGE_DDL_DYNAMIC_ADMISSION_FAIR = "stage_ddl_dynamic_admission_fair"
@@ -35,6 +36,7 @@ class SloSchedulingMode(str, Enum):
 _PROFILED_DEADLINE_MODES = frozenset(
     {
         SloSchedulingMode.STAGE_DDL_FIXED,
+        SloSchedulingMode.STAGE_DDL_FAIR_FIXED,
         SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED,
         SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
         SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
@@ -213,6 +215,84 @@ class DynamicAdmissionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class BoundedWaitFairnessConfig:
+    """Stage-scoped max-wait escape thresholds for eligible requests."""
+
+    bounded_wait_ms_by_stage: Mapping[int, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "bounded_wait_ms_by_stage",
+            MappingProxyType(dict(self.bounded_wait_ms_by_stage)),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.bounded_wait_ms_by_stage)
+
+    def threshold_ms(self, stage_id: int) -> float | None:
+        return self.bounded_wait_ms_by_stage.get(stage_id)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: Mapping[str, Any] | None,
+    ) -> BoundedWaitFairnessConfig:
+        if raw is None:
+            return cls()
+        if not isinstance(raw, Mapping):
+            raise ValueError("slo_scheduling.stage_ddl.fairness must be an object")
+        expected = {"bounded_wait_ms_by_stage"}
+        _reject_unknown_fields(
+            raw,
+            allowed=expected,
+            scope="slo_scheduling.stage_ddl.fairness",
+        )
+        missing = sorted(expected - raw.keys())
+        if missing:
+            raise ValueError(
+                "slo_scheduling.stage_ddl.fairness missing fields: "
+                f"{missing}"
+            )
+        raw_thresholds = raw["bounded_wait_ms_by_stage"]
+        if not isinstance(raw_thresholds, Mapping):
+            raise ValueError("bounded_wait_ms_by_stage must be an object")
+        thresholds: dict[int, float] = {}
+        for raw_stage, raw_threshold in raw_thresholds.items():
+            try:
+                stage = int(raw_stage)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "bounded-wait fairness stage ids must be non-negative integers"
+                ) from error
+            if str(stage) != str(raw_stage) or stage < 0:
+                raise ValueError(
+                    "bounded-wait fairness stage ids must be non-negative integers"
+                )
+            threshold = _nonnegative_finite(
+                raw_threshold,
+                field_name=f"bounded-wait threshold for stage {stage}",
+            )
+            if threshold <= 0:
+                raise ValueError("bounded-wait fairness thresholds must be positive")
+            thresholds[stage] = threshold
+        if not thresholds:
+            raise ValueError("bounded_wait_ms_by_stage must not be empty")
+        return cls(bounded_wait_ms_by_stage=thresholds)
+
+    def to_dict(self) -> dict[str, Any] | None:
+        if not self.is_configured:
+            return None
+        return {
+            "bounded_wait_ms_by_stage": {
+                str(stage): threshold
+                for stage, threshold in self.bounded_wait_ms_by_stage.items()
+            }
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class StageDDLConfig:
     """Hash-bound static milestone cost controls shared by every stage."""
 
@@ -223,6 +303,7 @@ class StageDDLConfig:
         default_factory=lambda: {"ttft": 5.0, "ttfp": 5.0, "e2e": 0.0}
     )
     dynamic_admission: DynamicAdmissionConfig = DynamicAdmissionConfig()
+    fairness: BoundedWaitFairnessConfig = BoundedWaitFairnessConfig()
 
     def __post_init__(self) -> None:
         guards = dict(self.milestone_guard_ms)
@@ -246,6 +327,7 @@ class StageDDLConfig:
                 "input_token_cutoff",
                 "milestone_guard_ms",
                 "dynamic_admission",
+                "fairness",
             },
             scope="slo_scheduling.stage_ddl",
         )
@@ -310,6 +392,7 @@ class StageDDLConfig:
             dynamic_admission=DynamicAdmissionConfig.from_mapping(
                 raw.get("dynamic_admission")
             ),
+            fairness=BoundedWaitFairnessConfig.from_mapping(raw.get("fairness")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -322,6 +405,9 @@ class StageDDLConfig:
         dynamic = self.dynamic_admission.to_dict()
         if dynamic is not None:
             result["dynamic_admission"] = dynamic
+        fairness = self.fairness.to_dict()
+        if fairness is not None:
+            result["fairness"] = fairness
         return result
 
 
@@ -445,6 +531,10 @@ class SloSchedulingConfig:
             SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
             SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
         }
+        fairness_modes = {
+            SloSchedulingMode.STAGE_DDL_FAIR_FIXED,
+            SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
+        }
         if enabled and mode in dynamic_modes and not (
             stage_ddl.dynamic_admission.is_configured
         ):
@@ -458,6 +548,16 @@ class SloSchedulingConfig:
             raise ValueError(
                 "slo_scheduling.stage_ddl.dynamic_admission is only valid "
                 "for dynamic admission modes"
+            )
+        if enabled and mode in fairness_modes and not (
+            stage_ddl.fairness.is_configured
+        ):
+            raise ValueError(
+                "slo_scheduling.stage_ddl.fairness is required for fair modes"
+            )
+        if mode not in fairness_modes and stage_ddl.fairness.is_configured:
+            raise ValueError(
+                "slo_scheduling.stage_ddl.fairness is only valid for fair modes"
             )
         return cls(
             enabled=enabled,
