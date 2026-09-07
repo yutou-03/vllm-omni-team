@@ -219,6 +219,7 @@ class BoundedWaitFairnessConfig:
     """Stage-scoped max-wait escape thresholds for eligible requests."""
 
     bounded_wait_ms_by_stage: Mapping[int, float] = field(default_factory=dict)
+    min_base_admissions_between_protected: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -243,13 +244,16 @@ class BoundedWaitFairnessConfig:
             return cls()
         if not isinstance(raw, Mapping):
             raise ValueError("slo_scheduling.stage_ddl.fairness must be an object")
-        expected = {"bounded_wait_ms_by_stage"}
+        expected = {
+            "bounded_wait_ms_by_stage",
+            "min_base_admissions_between_protected",
+        }
         _reject_unknown_fields(
             raw,
             allowed=expected,
             scope="slo_scheduling.stage_ddl.fairness",
         )
-        missing = sorted(expected - raw.keys())
+        missing = sorted({"bounded_wait_ms_by_stage"} - raw.keys())
         if missing:
             raise ValueError(
                 "slo_scheduling.stage_ddl.fairness missing fields: "
@@ -279,17 +283,35 @@ class BoundedWaitFairnessConfig:
             thresholds[stage] = threshold
         if not thresholds:
             raise ValueError("bounded_wait_ms_by_stage must not be empty")
-        return cls(bounded_wait_ms_by_stage=thresholds)
+        admission_gap = raw.get("min_base_admissions_between_protected", 0)
+        if (
+            isinstance(admission_gap, bool)
+            or not isinstance(admission_gap, int)
+            or admission_gap < 0
+        ):
+            raise ValueError(
+                "min_base_admissions_between_protected must be a "
+                "non-negative integer"
+            )
+        return cls(
+            bounded_wait_ms_by_stage=thresholds,
+            min_base_admissions_between_protected=admission_gap,
+        )
 
     def to_dict(self) -> dict[str, Any] | None:
         if not self.is_configured:
             return None
-        return {
+        result = {
             "bounded_wait_ms_by_stage": {
                 str(stage): threshold
                 for stage, threshold in self.bounded_wait_ms_by_stage.items()
             }
         }
+        if self.min_base_admissions_between_protected:
+            result["min_base_admissions_between_protected"] = (
+                self.min_base_admissions_between_protected
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
