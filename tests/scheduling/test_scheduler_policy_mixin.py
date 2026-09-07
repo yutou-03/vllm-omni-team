@@ -158,6 +158,14 @@ def _stage_ddl_config(mode="stage_ddl_fixed"):
     }
 
 
+def _fair_stage_ddl_config():
+    config = _stage_ddl_config("stage_ddl_fair_fixed")
+    config["slo_scheduling"]["stage_ddl"]["fairness"] = {
+        "bounded_wait_ms_by_stage": {"0": 2000.0}
+    }
+    return config
+
+
 def _dynamic_stage_ddl_config(*, decrease_hold=20):
     config = _stage_ddl_config("stage_ddl_dynamic_admission")
     config["slo_scheduling"]["stage_ddl"]["dynamic_admission"] = {
@@ -271,6 +279,97 @@ def test_stage_ddl_mode_loads_model_and_orders_only_waiting(monkeypatch):
     scheduler.running = [short, long]
     scheduler._baseline_prepare_schedule()
     assert scheduler.running == [short, long]
+
+
+def test_fair_fixed_mode_promotes_waiter_without_initializing_dynamic_cap(
+    monkeypatch,
+):
+    monkeypatch.delenv(BASELINE_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *_args, **_kwargs: FakeMilestoneModel(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.time.monotonic",
+        lambda: 102.0,
+    )
+    scheduler = SchedulerHarness(
+        0,
+        additional_config=_fair_stage_ddl_config(),
+        max_num_running_reqs=1,
+    )
+    urgent = _set_stage_ddl_metadata(
+        FakeRequest("urgent", deadline=None, num_prompt_tokens=216),
+        ingress_order=1,
+        ttft=103.0,
+        e2e=110.0,
+    )
+    loose = _set_stage_ddl_metadata(
+        FakeRequest("loose", deadline=None, num_prompt_tokens=36),
+        ingress_order=0,
+        ttft=112.0,
+        e2e=120.0,
+    )
+    scheduler.add_request(urgent)
+    scheduler.add_request(loose)
+    scheduler._baseline_data_ready_time["urgent"] = 101.9
+    scheduler._baseline_data_ready_time["loose"] = 100.0
+
+    assert scheduler._baseline_policy is (
+        BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED
+    )
+    assert isinstance(scheduler.waiting, PolicyOrderedRequestQueue)
+    assert scheduler._slo_admission_state is None
+    assert scheduler._slo_physical_max_num_seqs is None
+    assert scheduler.max_num_running_reqs == 1
+    assert scheduler.waiting.peek_request() is loose
+
+
+def test_fair_fixed_conformance_trace_marks_protected_candidates(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_CONFORMANCE_TRACE", "1")
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *_args, **_kwargs: FakeMilestoneModel(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.time.monotonic",
+        lambda: 102.0,
+    )
+    scheduler = SchedulerHarness(
+        0,
+        additional_config=_fair_stage_ddl_config(),
+        max_num_running_reqs=1,
+    )
+    protected = _set_stage_ddl_metadata(
+        FakeRequest("protected", deadline=None),
+        ingress_order=0,
+        ttft=112.0,
+        e2e=120.0,
+    )
+    unprotected = _set_stage_ddl_metadata(
+        FakeRequest("unprotected", deadline=None),
+        ingress_order=1,
+        ttft=103.0,
+        e2e=110.0,
+    )
+    scheduler.add_request(protected)
+    scheduler.add_request(unprotected)
+    scheduler._baseline_data_ready_time["protected"] = 100.0
+    scheduler._baseline_data_ready_time["unprotected"] = 101.9
+
+    scheduler._baseline_prepare_schedule(token_budget_before=1)
+
+    snapshot = scheduler._baseline_conformance_snapshot
+    assert snapshot is not None
+    assert snapshot["bounded_wait_fairness"] == {
+        "threshold_ms": 2000.0,
+        "protected_by_request": {
+            "protected": True,
+            "unprotected": False,
+        },
+    }
 
 
 def test_profiled_control_epoch_advances_once_per_scheduler_tick(monkeypatch):
