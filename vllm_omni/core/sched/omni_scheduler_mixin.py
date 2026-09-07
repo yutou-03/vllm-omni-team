@@ -38,6 +38,11 @@ from vllm_omni.scheduling.deadline import (
     active_stage_milestones,
     derive_stage_deadline_snapshot,
 )
+from vllm_omni.scheduling.fairness import (
+    ProtectedAdmissionQuotaState,
+    advance_protected_quota,
+    decide_protected_promotion,
+)
 from vllm_omni.scheduling.metadata import (
     extract_scheduling_metadata,
     preserve_scheduling_metadata,
@@ -152,6 +157,17 @@ class OmniSchedulerMixin:
         self._stage_ddl_tick_monotonic_s: float | None = None
         self._stage_ddl_version = 0
         self._bounded_wait_ms: float | None = None
+        self._slo_fairness_min_base_admissions = 0
+        self._slo_fairness_state = ProtectedAdmissionQuotaState.initial(0)
+        self._slo_fairness_decision = decide_protected_promotion(
+            min_base_admissions=0,
+            state=self._slo_fairness_state,
+            has_protected=False,
+            has_unprotected=False,
+        )
+        self._slo_fairness_waiting_ids_before_tick: set[str] = set()
+        self._slo_fairness_protected_ids_before_tick: set[str] = set()
+        self._slo_fairness_quota_consumed = False
         self._slo_control_epoch = 0
         self._slo_downstream_pressure: dict[str, Any] | None = None
         self._slo_physical_max_num_seqs: int | None = None
@@ -199,6 +215,20 @@ class OmniSchedulerMixin:
                     if self._bounded_wait_ms is not None
                     else BaselineSchedulingPolicy.STAGE_DDL_FIXED
                 )
+                if self._bounded_wait_ms is not None:
+                    gap = (
+                        stage_ddl_config.fairness
+                        .min_base_admissions_between_protected
+                    )
+                    if gap > 0 and int(self.max_num_running_reqs) != 1:
+                        raise ValueError(
+                            "quota-gated bounded-wait fairness requires "
+                            "physical max_num_seqs=1 on its target stage"
+                        )
+                    self._slo_fairness_min_base_admissions = gap
+                    self._slo_fairness_state = (
+                        ProtectedAdmissionQuotaState.initial(gap)
+                    )
             if mode in {
                 SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
                 SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
@@ -339,6 +369,11 @@ class OmniSchedulerMixin:
             now=time.monotonic() if now is None else now,
             stage_deadline_snapshot=snapshot,
             bounded_wait_ms=self._bounded_wait_ms,
+            bounded_wait_promotion_enabled=(
+                self._slo_fairness_decision.promotion_allowed
+                if self._slo_fairness_min_base_admissions > 0
+                else True
+            ),
         )
 
     def _baseline_bounded_wait_protected(self, request: Request) -> bool:
@@ -348,6 +383,68 @@ class OmniSchedulerMixin:
             return False
         ready = self._baseline_request_data_ready_time(request)
         return (captured - ready) * 1000.0 >= threshold_ms
+
+    def _baseline_prepare_fairness_decision(self) -> None:
+        if self._bounded_wait_ms is None:
+            return
+        waiting = self._baseline_queue_insertion_order(self.waiting)
+        waiting.extend(
+            self._baseline_queue_insertion_order(self.skipped_waiting)
+        )
+        self._slo_fairness_waiting_ids_before_tick = {
+            str(request.request_id) for request in waiting
+        }
+        self._slo_fairness_protected_ids_before_tick = {
+            str(request.request_id)
+            for request in waiting
+            if self._baseline_bounded_wait_protected(request)
+        }
+        protected = self._slo_fairness_protected_ids_before_tick
+        self._slo_fairness_decision = decide_protected_promotion(
+            min_base_admissions=self._slo_fairness_min_base_admissions,
+            state=self._slo_fairness_state,
+            has_protected=bool(protected),
+            has_unprotected=bool(
+                self._slo_fairness_waiting_ids_before_tick - protected
+            ),
+        )
+        self._slo_fairness_quota_consumed = False
+
+    def _baseline_record_fairness_admissions(
+        self, scheduled_req_ids: list[str]
+    ) -> None:
+        if (
+            self._bounded_wait_ms is None
+            or self._slo_fairness_min_base_admissions <= 0
+        ):
+            return
+        admitted = [
+            request_id
+            for request_id in scheduled_req_ids
+            if request_id in self._slo_fairness_waiting_ids_before_tick
+        ]
+        if len(admitted) > 1:
+            raise RuntimeError(
+                "quota-gated fairness observed multiple admissions in one tick"
+            )
+        admitted_protected = bool(
+            admitted
+            and admitted[0] in self._slo_fairness_protected_ids_before_tick
+        )
+        previous = self._slo_fairness_state
+        self._slo_fairness_state = advance_protected_quota(
+            min_base_admissions=self._slo_fairness_min_base_admissions,
+            state=previous,
+            decision=self._slo_fairness_decision,
+            admitted=bool(admitted),
+            admitted_protected=admitted_protected,
+        )
+        self._slo_fairness_quota_consumed = (
+            admitted_protected
+            and self._slo_fairness_decision.quota_enforced
+            and self._slo_fairness_decision.promotion_allowed
+            and self._slo_fairness_state.base_admissions_since_promotion == 0
+        )
 
     def _stage_ddl_begin_tick(self) -> None:
         self._stage_ddl_version += 1
@@ -904,6 +1001,7 @@ class OmniSchedulerMixin:
                     str(request_id),
                     ready_time=ready_time,
                 )
+        self._baseline_prepare_fairness_decision()
         if (
             self._baseline_policy_applies()
             and self._baseline_policy
@@ -1166,6 +1264,25 @@ class OmniSchedulerMixin:
                             )
                             for request in ordered_requests
                         },
+                        **(
+                            {
+                                "min_base_admissions_between_protected": (
+                                    self._slo_fairness_min_base_admissions
+                                ),
+                                "base_admissions_since_promotion": (
+                                    self._slo_fairness_state
+                                    .base_admissions_since_promotion
+                                ),
+                                "promotion_allowed": (
+                                    self._slo_fairness_decision.promotion_allowed
+                                ),
+                                "quota_enforced": (
+                                    self._slo_fairness_decision.quota_enforced
+                                ),
+                            }
+                            if self._slo_fairness_min_base_admissions > 0
+                            else {}
+                        ),
                     }
                 }
                 if self._bounded_wait_ms is not None
@@ -1413,6 +1530,7 @@ class OmniSchedulerMixin:
         schedule_duration_ms = (timestamp_end - timestamp_start) * 1000.0
         num_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         scheduled_req_ids = [str(rid) for rid in num_scheduled_tokens.keys()]
+        self._baseline_record_fairness_admissions(scheduled_req_ids)
         preempted_req_ids = {
             str(rid)
             for rid in (
@@ -1462,6 +1580,16 @@ class OmniSchedulerMixin:
             or 0
         )
         conformance = self._baseline_conformance_snapshot or {}
+        fairness_trace = conformance.get("bounded_wait_fairness")
+        if isinstance(fairness_trace, dict) and (
+            self._slo_fairness_min_base_admissions > 0
+        ):
+            fairness_trace["quota_consumed"] = (
+                self._slo_fairness_quota_consumed
+            )
+            fairness_trace["next_base_admissions_since_promotion"] = (
+                self._slo_fairness_state.base_admissions_since_promotion
+            )
         runnable_req_ids = list(conformance.get("runnable_req_ids", ()))
         runnable_set = set(runnable_req_ids)
         selected_set = set(scheduled_req_ids) & runnable_set
