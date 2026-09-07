@@ -24,6 +24,7 @@ class BaselineSchedulingPolicy(str, Enum):
     FINAL_DEADLINE_EDF_NP = "final_deadline_edf_np"
     STAGE_DEADLINE_EDF_NP = "stage_deadline_edf_np"
     STAGE_DDL_FIXED = "stage_ddl_fixed"
+    STAGE_DDL_FAIR_FIXED = "stage_ddl_fair_fixed"
     CLOCKWORK_LATEST_START_NP = "clockwork_latest_start_np"
 
 
@@ -148,6 +149,7 @@ def policy_key(
     data_ready_time: float,
     now: float,
     stage_deadline_snapshot: StageDeadlineSnapshot | None = None,
+    bounded_wait_ms: float | None = None,
 ) -> PolicyKey:
     """Compute a deterministic total-order key for one eligible request.
 
@@ -155,8 +157,6 @@ def policy_key(
     prevents accidental replacement of vLLM's native queue.
     """
 
-    # Reserved for future age-aware policies; current keys remain time-stable.
-    del now, data_ready_time
     if not policy_applies_to_stage(policy, stage_id):
         raise ValueError(
             f"policy {policy.value!r} does not reorder stage {stage_id}"
@@ -174,6 +174,7 @@ def policy_key(
 
     if policy in {
         BaselineSchedulingPolicy.STAGE_DDL_FIXED,
+        BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
         BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP,
     }:
         if stage_deadline_snapshot is None:
@@ -196,7 +197,10 @@ def policy_key(
                 f"request {request_id!r} profiled deadline snapshot identity "
                 "does not match"
             )
-        if policy is BaselineSchedulingPolicy.STAGE_DDL_FIXED:
+        if policy in {
+            BaselineSchedulingPolicy.STAGE_DDL_FIXED,
+            BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
+        }:
             scheduling_laxity = float(stage_deadline_snapshot.base_laxity_s)
         else:
             try:
@@ -220,7 +224,33 @@ def policy_key(
                 request_id=request_id,
             )
         )
-        return scheduling_laxity, ingress_order, logical_request_id, request_id
+        base_key: PolicyKey = (
+            scheduling_laxity,
+            ingress_order,
+            logical_request_id,
+            request_id,
+        )
+        if policy is not BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED:
+            return base_key
+        if (
+            bounded_wait_ms is None
+            or not math.isfinite(bounded_wait_ms)
+            or bounded_wait_ms <= 0
+        ):
+            raise ValueError(
+                "bounded_wait_ms must be finite and positive for "
+                "stage_ddl_fair_fixed"
+            )
+        wait_ms = (now - data_ready_time) * 1000.0
+        if wait_ms >= bounded_wait_ms:
+            return (
+                0,
+                data_ready_time,
+                ingress_order,
+                logical_request_id,
+                request_id,
+            )
+        return (1, *base_key)
 
     if policy in (
         BaselineSchedulingPolicy.FINAL_DEADLINE_EDF_NP,
