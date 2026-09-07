@@ -65,6 +65,7 @@ _DOWNSTREAM_PRESSURE_MAX_AGE_S = 0.5
 _PROFILED_DEADLINE_POLICIES = frozenset(
     {
         BaselineSchedulingPolicy.STAGE_DDL_FIXED,
+        BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
         BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP,
     }
 )
@@ -150,6 +151,7 @@ class OmniSchedulerMixin:
         ] = {}
         self._stage_ddl_tick_monotonic_s: float | None = None
         self._stage_ddl_version = 0
+        self._bounded_wait_ms: float | None = None
         self._slo_control_epoch = 0
         self._slo_downstream_pressure: dict[str, Any] | None = None
         self._slo_physical_max_num_seqs: int | None = None
@@ -163,8 +165,10 @@ class OmniSchedulerMixin:
             and self._slo_scheduling_config.mode
             in {
                 SloSchedulingMode.STAGE_DDL_FIXED,
+                SloSchedulingMode.STAGE_DDL_FAIR_FIXED,
                 SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED,
                 SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
+                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
             }
         ):
             if environment_policy is not BaselineSchedulingPolicy.NATIVE_FCFS:
@@ -181,28 +185,26 @@ class OmniSchedulerMixin:
                 input_token_cutoff=stage_ddl_config.input_token_cutoff,
                 milestone_guard_ms=stage_ddl_config.milestone_guard_ms,
             )
-            if self._slo_scheduling_config.mode is (
-                SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED
-            ):
+            mode = self._slo_scheduling_config.mode
+            if mode is SloSchedulingMode.CLOCKWORK_LATEST_START_FIXED:
                 self._baseline_policy = (
                     BaselineSchedulingPolicy.CLOCKWORK_LATEST_START_NP
                 )
             else:
-                self._baseline_policy = BaselineSchedulingPolicy.STAGE_DDL_FIXED
-            if self._slo_scheduling_config.mode is (
-                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION
-            ):
+                self._bounded_wait_ms = stage_ddl_config.fairness.threshold_ms(
+                    int(self._omni_stage_id_for_trace())
+                )
+                self._baseline_policy = (
+                    BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED
+                    if self._bounded_wait_ms is not None
+                    else BaselineSchedulingPolicy.STAGE_DDL_FIXED
+                )
+            if mode in {
+                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION,
+                SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR,
+            }:
                 self._initialize_dynamic_admission()
             self._stage_ddl_begin_tick()
-        elif (
-            self._slo_scheduling_config.enabled
-            and self._slo_scheduling_config.mode is
-            SloSchedulingMode.STAGE_DDL_DYNAMIC_ADMISSION_FAIR
-        ):
-            raise NotImplementedError(
-                f"SLO mode {self._slo_scheduling_config.mode.value!r} is not "
-                "implemented; use stage_ddl_fixed"
-            )
         else:
             self._baseline_policy = environment_policy
         self._baseline_stage_id = int(self._omni_stage_id_for_trace())
@@ -324,14 +326,28 @@ class OmniSchedulerMixin:
         snapshot = None
         if self._baseline_policy in _PROFILED_DEADLINE_POLICIES:
             snapshot = self._stage_ddl_request_snapshot(request)
+        now = (
+            self._stage_ddl_tick_monotonic_s
+            if self._baseline_policy in _PROFILED_DEADLINE_POLICIES
+            else None
+        )
         return policy_key(
             request,
             policy=self._baseline_policy,
             stage_id=self._baseline_stage_id,
             data_ready_time=self._baseline_request_data_ready_time(request),
-            now=time.monotonic(),
+            now=time.monotonic() if now is None else now,
             stage_deadline_snapshot=snapshot,
+            bounded_wait_ms=self._bounded_wait_ms,
         )
+
+    def _baseline_bounded_wait_protected(self, request: Request) -> bool:
+        threshold_ms = self._bounded_wait_ms
+        captured = self._stage_ddl_tick_monotonic_s
+        if threshold_ms is None or captured is None:
+            return False
+        ready = self._baseline_request_data_ready_time(request)
+        return (captured - ready) * 1000.0 >= threshold_ms
 
     def _stage_ddl_begin_tick(self) -> None:
         self._stage_ddl_version += 1
@@ -1140,6 +1156,21 @@ class OmniSchedulerMixin:
                 request_id: snapshot.to_event_fields()
                 for request_id, snapshot in self._stage_ddl_snapshot_by_request.items()
             },
+            **(
+                {
+                    "bounded_wait_fairness": {
+                        "threshold_ms": self._bounded_wait_ms,
+                        "protected_by_request": {
+                            str(request.request_id): (
+                                self._baseline_bounded_wait_protected(request)
+                            )
+                            for request in ordered_requests
+                        },
+                    }
+                }
+                if self._bounded_wait_ms is not None
+                else {}
+            ),
             **(self._baseline_policy_order_snapshot or {}),
         }
 
