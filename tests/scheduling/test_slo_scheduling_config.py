@@ -140,6 +140,7 @@ def test_bounded_wait_fair_fixed_config_is_typed_and_stage_scoped():
                 "model_sha256": "a" * 64,
                 "fairness": {
                     "bounded_wait_ms_by_stage": {"0": 2000.0},
+                    "min_base_admissions_between_protected": 19,
                 },
             },
         }
@@ -148,10 +149,12 @@ def test_bounded_wait_fair_fixed_config_is_typed_and_stage_scoped():
     assert config.mode is SloSchedulingMode.STAGE_DDL_FAIR_FIXED
     assert isinstance(config.stage_ddl.fairness, BoundedWaitFairnessConfig)
     assert config.stage_ddl.fairness.bounded_wait_ms_by_stage == {0: 2000.0}
+    assert config.stage_ddl.fairness.min_base_admissions_between_protected == 19
     assert config.stage_ddl.fairness.threshold_ms(0) == 2000.0
     assert config.stage_ddl.fairness.threshold_ms(1) is None
     assert config.to_dict()["stage_ddl"]["fairness"] == {
-        "bounded_wait_ms_by_stage": {"0": 2000.0}
+        "bounded_wait_ms_by_stage": {"0": 2000.0},
+        "min_base_admissions_between_protected": 19,
     }
 
 
@@ -208,6 +211,21 @@ def test_bounded_wait_fair_fixed_config_is_typed_and_stage_scoped():
                 },
             },
             "stage ids",
+        ),
+        (
+            {
+                "enabled": True,
+                "mode": "stage_ddl_fair_fixed",
+                "stage_ddl": {
+                    "model_path": "/models/p3.json",
+                    "model_sha256": "a" * 64,
+                    "fairness": {
+                        "bounded_wait_ms_by_stage": {"0": 2000.0},
+                        "min_base_admissions_between_protected": -1,
+                    },
+                },
+            },
+            "non-negative integer",
         ),
     ],
 )
