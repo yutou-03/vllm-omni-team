@@ -216,6 +216,120 @@ def test_multi_milestone_stage_ddl_orders_by_base_laxity_not_final_deadline():
     assert ordered == [tighter_ttft, earlier_final]
 
 
+def test_bounded_wait_preserves_stage_ddl_order_before_threshold():
+    loose = _stage_ddl_request("loose", 0, 110.0, 120.0)
+    urgent = _stage_ddl_request("urgent", 1, 101.0, 105.0)
+    snapshots = {
+        loose.request_id: _stage_ddl_snapshot(
+            loose, ttft_cost_ms=100.0, e2e_cost_ms=500.0
+        ),
+        urgent.request_id: _stage_ddl_snapshot(
+            urgent, ttft_cost_ms=700.0, e2e_cost_ms=500.0
+        ),
+    }
+
+    ordered = sorted(
+        [loose, urgent],
+        key=lambda request: policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
+            stage_id=0,
+            data_ready_time=100.0,
+            now=101.999,
+            stage_deadline_snapshot=snapshots[request.request_id],
+            bounded_wait_ms=2000.0,
+        ),
+    )
+
+    assert ordered == [urgent, loose]
+
+
+def test_bounded_wait_promotes_at_threshold_over_more_urgent_request():
+    loose = _stage_ddl_request("loose", 0, 110.0, 120.0)
+    urgent = _stage_ddl_request("urgent", 1, 101.0, 105.0)
+    snapshots = {
+        loose.request_id: _stage_ddl_snapshot(
+            loose, ttft_cost_ms=100.0, e2e_cost_ms=500.0
+        ),
+        urgent.request_id: _stage_ddl_snapshot(
+            urgent, ttft_cost_ms=700.0, e2e_cost_ms=500.0
+        ),
+    }
+    keys = {
+        loose.request_id: policy_key(
+            loose,
+            policy=BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
+            stage_id=0,
+            data_ready_time=100.0,
+            now=102.0,
+            stage_deadline_snapshot=snapshots[loose.request_id],
+            bounded_wait_ms=2000.0,
+        ),
+        urgent.request_id: policy_key(
+            urgent,
+            policy=BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
+            stage_id=0,
+            data_ready_time=101.9,
+            now=102.0,
+            stage_deadline_snapshot=snapshots[urgent.request_id],
+            bounded_wait_ms=2000.0,
+        ),
+    }
+
+    assert keys[loose.request_id][0] == 0
+    assert keys[urgent.request_id][0] == 1
+    assert sorted([urgent, loose], key=lambda request: keys[request.request_id]) == [
+        loose,
+        urgent,
+    ]
+
+
+def test_bounded_wait_orders_protected_requests_by_stage_data_ready_time():
+    earlier_ready = _stage_ddl_request("later-ingress", 9, 110.0, 120.0)
+    later_ready = _stage_ddl_request("earlier-ingress", 0, 101.0, 105.0)
+    snapshots = {
+        request.request_id: _stage_ddl_snapshot(
+            request, ttft_cost_ms=100.0, e2e_cost_ms=500.0
+        )
+        for request in (earlier_ready, later_ready)
+    }
+    ready_times = {"later-ingress": 100.0, "earlier-ingress": 100.1}
+
+    ordered = sorted(
+        [later_ready, earlier_ready],
+        key=lambda request: policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
+            stage_id=0,
+            data_ready_time=ready_times[request.request_id],
+            now=103.0,
+            stage_deadline_snapshot=snapshots[request.request_id],
+            bounded_wait_ms=2000.0,
+        ),
+    )
+
+    assert ordered == [earlier_ready, later_ready]
+
+
+def test_bounded_wait_policy_requires_positive_threshold():
+    request = _stage_ddl_request("request-a", 0, 101.0, 105.0)
+    snapshot = _stage_ddl_snapshot(
+        request, ttft_cost_ms=100.0, e2e_cost_ms=500.0
+    )
+
+    for threshold in (None, 0.0):
+        with pytest.raises(ValueError, match="bounded_wait_ms"):
+            policy_key(
+                request,
+                policy=BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
+                stage_id=0,
+                data_ready_time=100.0,
+                now=101.0,
+                stage_deadline_snapshot=snapshot,
+                bounded_wait_ms=threshold,
+            )
+
+
 def test_clockwork_latest_start_uses_profiled_e2e_remaining_time_only():
     earlier_e2e = _stage_ddl_request("e2e-first", 0, 102.0, 104.0)
     tighter_ttft = _stage_ddl_request("ttft-first", 1, 101.0, 110.0)
