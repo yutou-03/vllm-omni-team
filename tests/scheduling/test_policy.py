@@ -284,6 +284,35 @@ def test_bounded_wait_promotes_at_threshold_over_more_urgent_request():
     ]
 
 
+def test_quota_closed_preserves_stage_ddl_order_after_wait_threshold():
+    loose = _stage_ddl_request("loose", 0, 110.0, 120.0)
+    urgent = _stage_ddl_request("urgent", 1, 101.0, 105.0)
+    snapshots = {
+        loose.request_id: _stage_ddl_snapshot(
+            loose, ttft_cost_ms=100.0, e2e_cost_ms=500.0
+        ),
+        urgent.request_id: _stage_ddl_snapshot(
+            urgent, ttft_cost_ms=700.0, e2e_cost_ms=500.0
+        ),
+    }
+
+    ordered = sorted(
+        [loose, urgent],
+        key=lambda request: policy_key(
+            request,
+            policy=BaselineSchedulingPolicy.STAGE_DDL_FAIR_FIXED,
+            stage_id=0,
+            data_ready_time=100.0,
+            now=103.0,
+            stage_deadline_snapshot=snapshots[request.request_id],
+            bounded_wait_ms=2000.0,
+            bounded_wait_promotion_enabled=False,
+        ),
+    )
+
+    assert ordered == [urgent, loose]
+
+
 def test_bounded_wait_orders_protected_requests_by_stage_data_ready_time():
     earlier_ready = _stage_ddl_request("later-ingress", 9, 110.0, 120.0)
     later_ready = _stage_ddl_request("earlier-ingress", 0, 101.0, 105.0)
