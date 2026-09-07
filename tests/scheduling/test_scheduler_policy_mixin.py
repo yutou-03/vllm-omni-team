@@ -166,6 +166,14 @@ def _fair_stage_ddl_config():
     return config
 
 
+def _quota_fair_stage_ddl_config():
+    config = _fair_stage_ddl_config()
+    config["slo_scheduling"]["stage_ddl"]["fairness"][
+        "min_base_admissions_between_protected"
+    ] = 19
+    return config
+
+
 def _dynamic_stage_ddl_config(*, decrease_hold=20):
     config = _stage_ddl_config("stage_ddl_dynamic_admission")
     config["slo_scheduling"]["stage_ddl"]["dynamic_admission"] = {
@@ -370,6 +378,74 @@ def test_fair_fixed_conformance_trace_marks_protected_candidates(monkeypatch):
             "unprotected": False,
         },
     }
+
+
+def test_quota_fair_scheduler_consumes_one_opportunity_then_restores_stage_ddl(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *_args, **_kwargs: FakeMilestoneModel(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin.time.monotonic",
+        lambda: 102.0,
+    )
+    scheduler = SchedulerHarness(
+        0,
+        additional_config=_quota_fair_stage_ddl_config(),
+        max_num_running_reqs=1,
+    )
+    first_old = _set_stage_ddl_metadata(
+        FakeRequest("first-old", deadline=None, num_prompt_tokens=36),
+        ingress_order=0,
+        ttft=112.0,
+        e2e=120.0,
+    )
+    second_old = _set_stage_ddl_metadata(
+        FakeRequest("second-old", deadline=None, num_prompt_tokens=36),
+        ingress_order=1,
+        ttft=112.0,
+        e2e=120.0,
+    )
+    urgent = _set_stage_ddl_metadata(
+        FakeRequest("urgent", deadline=None, num_prompt_tokens=216),
+        ingress_order=2,
+        ttft=103.0,
+        e2e=110.0,
+    )
+    for request in (first_old, second_old, urgent):
+        scheduler.add_request(request)
+    scheduler._baseline_data_ready_time.update(
+        {"first-old": 100.0, "second-old": 100.1, "urgent": 101.9}
+    )
+
+    scheduler._baseline_prepare_schedule(token_budget_before=1)
+    assert scheduler._slo_fairness_decision.promotion_allowed is True
+    assert scheduler.waiting.peek_request() is first_old
+    scheduler._baseline_record_fairness_admissions(["first-old"])
+    scheduler.waiting.remove_request(first_old)
+
+    scheduler._baseline_prepare_schedule(token_budget_before=1)
+    assert scheduler._slo_fairness_state.base_admissions_since_promotion == 0
+    assert scheduler._slo_fairness_decision.promotion_allowed is False
+    assert scheduler.waiting.peek_request() is urgent
+
+
+def test_quota_fair_mode_rejects_multi_slot_target_stage(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.core.sched.omni_scheduler_mixin."
+        "StaticMilestoneCostModel.from_json_file",
+        lambda *_args, **_kwargs: FakeMilestoneModel(),
+    )
+
+    with pytest.raises(ValueError, match="physical max_num_seqs=1"):
+        SchedulerHarness(
+            0,
+            additional_config=_quota_fair_stage_ddl_config(),
+            max_num_running_reqs=2,
+        )
 
 
 def test_profiled_control_epoch_advances_once_per_scheduler_tick(monkeypatch):
