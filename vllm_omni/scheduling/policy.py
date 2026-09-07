@@ -150,6 +150,7 @@ def policy_key(
     now: float,
     stage_deadline_snapshot: StageDeadlineSnapshot | None = None,
     bounded_wait_ms: float | None = None,
+    bounded_wait_promotion_enabled: bool = True,
 ) -> PolicyKey:
     """Compute a deterministic total-order key for one eligible request.
 
@@ -242,7 +243,7 @@ def policy_key(
                 "stage_ddl_fair_fixed"
             )
         wait_ms = (now - data_ready_time) * 1000.0
-        if wait_ms >= bounded_wait_ms:
+        if wait_ms >= bounded_wait_ms and bounded_wait_promotion_enabled:
             return (
                 0,
                 data_ready_time,
