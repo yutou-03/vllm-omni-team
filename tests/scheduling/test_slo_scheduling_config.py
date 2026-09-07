@@ -8,6 +8,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
 )
 from vllm_omni.recovery import PreemptionRecoveryMode
 from vllm_omni.scheduling.config import (
+    BoundedWaitFairnessConfig,
     DynamicAdmissionConfig,
     StageDDLConfig,
     SloSchedulingConfig,
@@ -127,6 +128,92 @@ def test_dynamic_admission_config_is_hash_bound_and_typed():
     assert config.to_dict()["stage_ddl"]["dynamic_admission"] == (
         _dynamic_admission()
     )
+
+
+def test_bounded_wait_fair_fixed_config_is_typed_and_stage_scoped():
+    config = SloSchedulingConfig.from_mapping(
+        {
+            "enabled": True,
+            "mode": "stage_ddl_fair_fixed",
+            "stage_ddl": {
+                "model_path": "/models/p3.json",
+                "model_sha256": "a" * 64,
+                "fairness": {
+                    "bounded_wait_ms_by_stage": {"0": 2000.0},
+                },
+            },
+        }
+    )
+
+    assert config.mode is SloSchedulingMode.STAGE_DDL_FAIR_FIXED
+    assert isinstance(config.stage_ddl.fairness, BoundedWaitFairnessConfig)
+    assert config.stage_ddl.fairness.bounded_wait_ms_by_stage == {0: 2000.0}
+    assert config.stage_ddl.fairness.threshold_ms(0) == 2000.0
+    assert config.stage_ddl.fairness.threshold_ms(1) is None
+    assert config.to_dict()["stage_ddl"]["fairness"] == {
+        "bounded_wait_ms_by_stage": {"0": 2000.0}
+    }
+
+
+@pytest.mark.parametrize(
+    "raw, match",
+    [
+        (
+            {
+                "enabled": True,
+                "mode": "stage_ddl_fair_fixed",
+                "stage_ddl": {
+                    "model_path": "/models/p3.json",
+                    "model_sha256": "a" * 64,
+                },
+            },
+            "fairness.*required",
+        ),
+        (
+            {
+                "enabled": True,
+                "mode": "stage_ddl_fixed",
+                "stage_ddl": {
+                    "model_path": "/models/p3.json",
+                    "model_sha256": "a" * 64,
+                    "fairness": {
+                        "bounded_wait_ms_by_stage": {"0": 2000.0},
+                    },
+                },
+            },
+            "fairness.*only valid",
+        ),
+        (
+            {
+                "enabled": True,
+                "mode": "stage_ddl_fair_fixed",
+                "stage_ddl": {
+                    "model_path": "/models/p3.json",
+                    "model_sha256": "a" * 64,
+                    "fairness": {"bounded_wait_ms_by_stage": {"0": 0.0}},
+                },
+            },
+            "positive",
+        ),
+        (
+            {
+                "enabled": True,
+                "mode": "stage_ddl_fair_fixed",
+                "stage_ddl": {
+                    "model_path": "/models/p3.json",
+                    "model_sha256": "a" * 64,
+                    "fairness": {
+                        "bounded_wait_ms_by_stage": {"stage-zero": 2000.0}
+                    },
+                },
+            },
+            "stage ids",
+        ),
+    ],
+)
+def test_invalid_bounded_wait_fairness_config_fails_closed(raw, match):
+    with pytest.raises(ValueError, match=match):
+        SloSchedulingConfig.from_mapping(raw)
 
 
 def test_enabled_stage_local_mode_must_be_explicitly_allowed():
