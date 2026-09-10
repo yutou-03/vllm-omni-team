@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import Any, Callable, Mapping
 
 
@@ -75,6 +76,7 @@ class PathRoundRobin:
                 counts[path(candidate)] += 1
         actual = path(request)
         self.pending = (request, {
+            "selected_monotonic_s": time.monotonic(),
             "request_id": str(request.request_id),
             "weights": [self.text, self.audio], "cursor_before": self.cursor,
             "target_path": self.target, "actual_path": actual,

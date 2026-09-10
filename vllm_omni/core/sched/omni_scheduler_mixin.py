@@ -1452,6 +1452,7 @@ class OmniSchedulerMixin:
 
     def _path_rr_emit(self, record):
         emit_stage_event("path_rr_selection_resolved", stage_id=0,
+                         resolved_monotonic_s=time.monotonic(),
                          iteration_id=getattr(self, "_omni_stage_queue_iteration_id", 0),
                          **record)
 
