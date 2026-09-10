@@ -118,6 +118,38 @@ class SchedulerHarness(OmniSchedulerMixin, FakeBaseScheduler):
         self._initialize_baseline_scheduling()
 
 
+def test_path_rr_integration_counts_success_and_leaves_other_stages_native(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_PATH_RR", "1:2")
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "native_fcfs")
+    scheduler = SchedulerHarness(0)
+    events = []
+    scheduler._path_rr_emit = events.append
+    for index, path in enumerate(["audio", "audio", "text", "text"]):
+        request = FakeRequest(str(index), deadline=100, ingress_order=index)
+        request.additional_information["meta"]["sched_request_path"] = path
+        scheduler.add_request(request)
+    chosen = []
+    for _ in range(4):
+        queue = scheduler._select_waiting_queue_for_scheduling()
+        request = queue.pop_request()
+        chosen.append(request.request_id)
+        scheduler.running.append(request)
+    scheduler._path_rr.reconcile(scheduler.running, events.append)
+    assert chosen == ["2", "0", "1", "3"]
+    assert scheduler._path_rr.admissions == 4
+    for stage in (1, 2):
+        other = SchedulerHarness(stage)
+        assert other._path_rr is None
+        assert other.waiting is other.native_waiting
+
+
+def test_path_rr_rejects_conflicting_policy(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_PATH_RR", "1:1")
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "srpf_local_np")
+    with pytest.raises(ValueError, match="path RR requires"):
+        SchedulerHarness(0)
+
+
 @pytest.fixture(autouse=True)
 def disable_stage_trace(monkeypatch):
     monkeypatch.setenv("STAGE_QUEUE_TRACE_DISABLE", "1")

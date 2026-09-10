@@ -58,6 +58,7 @@ from vllm_omni.scheduling.request_queue import (
     PolicyOrderedRequestQueue,
     maybe_create_policy_ordered_queue,
 )
+from vllm_omni.scheduling.path_round_robin import PathRoundRobin
 from vllm_omni.scheduling.signals import (
     NVMLGPUActiveSampler,
     QueueGrowthWindow,
@@ -262,6 +263,21 @@ class OmniSchedulerMixin:
         self._omni_first_recovery_progress_seen: set[str] = set()
         self._omni_recovery_catchup_seen: set[str] = set()
         self._omni_request_progress_before_schedule: dict[str, int] = {}
+
+        self._path_rr = PathRoundRobin.from_environment()
+        if self._path_rr is not None:
+            if environment_policy is not BaselineSchedulingPolicy.NATIVE_FCFS or self._slo_scheduling_config.enabled:
+                raise ValueError("path RR requires native baseline and disabled SLO modes")
+            if self._baseline_stage_id != 0:
+                self._path_rr = None
+            else:
+                if self.waiting or self.skipped_waiting:
+                    raise ValueError("path RR requires empty initial queues")
+                self.waiting = PolicyOrderedRequestQueue(key=self._path_rr_key)
+                self.skipped_waiting = PolicyOrderedRequestQueue(key=self._path_rr_key)
+                emit_stage_event("path_rr_initialized", stage_id=0,
+                                 weights=[self._path_rr.text, self._path_rr.audio],
+                                 cursor=self._path_rr.cursor)
 
         if not self._baseline_policy_applies():
             return
@@ -951,6 +967,8 @@ class OmniSchedulerMixin:
             )
         if self._baseline_policy_applies():
             self._baseline_request_key(request)
+        if getattr(self, "_path_rr", None) is not None:
+            self._path_rr_key(request)
 
     @staticmethod
     def _baseline_queue_insertion_order(queue: Any) -> list[Request]:
@@ -1034,6 +1052,12 @@ class OmniSchedulerMixin:
         self._baseline_capture_conformance_snapshot(
             token_budget_before=token_budget_before,
         )
+        if getattr(self, "_path_rr", None) is not None and self._baseline_conformance_snapshot is not None:
+            self._baseline_conformance_snapshot["admission_override"] = {
+                "policy": "path_round_robin_admission_v1",
+                "weights": [self._path_rr.text, self._path_rr.audio],
+                "cursor": self._path_rr.cursor,
+            }
 
     def _baseline_capture_conformance_snapshot(
         self,
@@ -1417,7 +1441,27 @@ class OmniSchedulerMixin:
             result = super().add_request(request, *args, **kwargs)
         return result
 
+    def _path_rr_path(self, request):
+        return request_scheduling_metadata(request).get("sched_request_path")
+
+    def _path_rr_key(self, request):
+        return self._path_rr.key(
+            request, path=self._path_rr_path(request),
+            ready_order=self._baseline_data_ready_order[str(request.request_id)],
+        )
+
+    def _path_rr_emit(self, record):
+        emit_stage_event("path_rr_selection_resolved", stage_id=0,
+                         iteration_id=getattr(self, "_omni_stage_queue_iteration_id", 0),
+                         **record)
+
     def _select_waiting_queue_for_scheduling(self):
+        if getattr(self, "_path_rr", None) is not None:
+            return self._path_rr.select(
+                [self.waiting, self.skipped_waiting], running=self.running,
+                key=self._path_rr_key, path=self._path_rr_path,
+                emit=self._path_rr_emit,
+            )
         if not self._baseline_policy_applies():
             return super()._select_waiting_queue_for_scheduling()
         if self.waiting and self.skipped_waiting:
@@ -1528,6 +1572,8 @@ class OmniSchedulerMixin:
     ) -> None:
         stage_id = self._omni_stage_id_for_trace()
         schedule_duration_ms = (timestamp_end - timestamp_start) * 1000.0
+        if getattr(self, "_path_rr", None) is not None:
+            self._path_rr.reconcile(self.running, self._path_rr_emit)
         num_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         scheduled_req_ids = [str(rid) for rid in num_scheduled_tokens.keys()]
         self._baseline_record_fairness_admissions(scheduled_req_ids)
