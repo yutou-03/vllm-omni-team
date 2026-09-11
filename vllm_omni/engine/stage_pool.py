@@ -14,7 +14,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
-from vllm_omni.profiling.stage_queue_trace import stage_trace_span
+from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
@@ -346,6 +346,27 @@ class StagePool:
         return self.clients[replica_id].get_diffusion_output_nowait()
 
     # ---- Stage-local control plane ----
+
+    def discard_terminal_output_states(self, request_ids: list[str]) -> None:
+        """Release local processor state after the logical request is terminal.
+
+        A downstream terminal output can beat an upstream terminal envelope to
+        the orchestrator. Once the logical request is removed, that envelope is
+        deliberately rejected and cannot trigger OutputProcessor's own cleanup.
+        This does not send engine aborts or accept any late output.
+        """
+        states = getattr(self._output_processor, "request_states", {})
+        remaining = [rid for rid in dict.fromkeys(request_ids) if rid in states]
+        if not remaining:
+            return
+        self._output_processor.abort_requests(remaining, internal=True)
+        for request_id in remaining:
+            emit_stage_event(
+                "stage_terminal_output_state_released",
+                stage_id=self.stage_id,
+                request_id=request_id,
+                reason="logical_request_terminal",
+            )
 
     async def abort_requests(self, request_ids: list[str]) -> None:
         """Abort the given requests in this stage pool.

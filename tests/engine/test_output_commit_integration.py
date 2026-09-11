@@ -17,6 +17,10 @@ class _Pool:
         self.aborted = []
         self.released = []
         self.submitted = []
+        self.discarded_output_states = []
+
+    def discard_terminal_output_states(self, request_ids):
+        self.discarded_output_states.extend(request_ids)
 
     async def abort_requests(self, request_ids):
         self.aborted.extend(request_ids)

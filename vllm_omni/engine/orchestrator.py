@@ -1789,6 +1789,11 @@ class Orchestrator:
         )
         if abort or has_recovery_attempts:
             await self._abort_request_ids(physical_request_ids)
+        # No further output for these logical requests can be accepted. Clean
+        # remaining upstream processor state even if its final envelope has
+        # not yet arrived; dropping that late envelope must not leak state.
+        for pool in self.stage_pools:
+            pool.discard_terminal_output_states(physical_request_ids)
         self._release_request_bindings(physical_request_ids)
         for request_id in logical_request_ids:
             self._pd_kv_params.pop(request_id, None)

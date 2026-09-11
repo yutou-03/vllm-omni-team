@@ -31,6 +31,10 @@ class _Pool:
         self.aborted = []
         self.released = []
         self.submitted = []
+        self.discarded_output_states = []
+
+    def discard_terminal_output_states(self, request_ids):
+        self.discarded_output_states.extend(request_ids)
 
     async def abort_requests(self, request_ids):
         self.aborted.extend(request_ids)
@@ -714,6 +718,7 @@ def test_logical_completion_aborts_and_releases_all_executions():
     expected = {"logical", "logical__execution1", "logical__execution2"}
     assert all(set(pool.released) == expected for pool in orchestrator.stage_pools)
     assert all(set(pool.aborted) == expected for pool in orchestrator.stage_pools)
+    assert all(set(pool.discarded_output_states) == expected for pool in orchestrator.stage_pools)
     assert orchestrator.request_states == {}
     assert orchestrator._physical_to_logical_request_ids == {}
 
@@ -751,5 +756,6 @@ def test_cleanup_uses_ledger_history_when_registry_only_has_current_execution():
     expected = {"logical", "logical__execution1", "logical__execution2"}
     assert all(set(pool.released) == expected for pool in orchestrator.stage_pools)
     assert all(set(pool.aborted) == expected for pool in orchestrator.stage_pools)
+    assert all(set(pool.discarded_output_states) == expected for pool in orchestrator.stage_pools)
     assert orchestrator.request_states == {}
     assert orchestrator._physical_to_logical_request_ids == {}

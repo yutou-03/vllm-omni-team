@@ -1048,6 +1048,46 @@ async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client
 
 
 @pytest.mark.asyncio
+async def test_terminal_cleanup_releases_late_upstream_output_state() -> None:
+    """Final downstream output can arrive before an upstream terminal envelope."""
+    class StatefulProcessor(FakeOutputProcessor):
+        def __init__(self):
+            super().__init__()
+            self.request_states = {"done": object(), "live": object()}
+
+        def abort_requests(self, request_ids, internal=False):
+            assert internal is True
+            for rid in request_ids:
+                self.request_states.pop(rid, None)
+            return super().abort_requests(request_ids, internal=internal)
+
+    stage = FakeStageClient(stage_type="llm")
+    processor = StatefulProcessor()
+    pool = StagePool(0, [stage], output_processor=processor)
+    pool.select_replica_id("done")
+    pool.select_replica_id("live")
+    orchestrator = _make_drain_only_orchestrator(pool)
+    orchestrator.request_states = {
+        "done": SimpleNamespace(execution_ledger=None),
+        "live": SimpleNamespace(execution_ledger=None),
+    }
+    orchestrator._pd_kv_params = {}
+
+    await orchestrator._cleanup_request_ids(["done"])
+
+    assert set(processor.request_states) == {"live"}
+    assert set(orchestrator.request_states) == {"live"}
+    assert pool.get_bound_replica_id("done") is None
+    assert pool.get_bound_replica_id("live") == 0
+    assert not stage.abort_calls  # Only local terminal state, not an engine abort.
+    assert processor.abort_calls == [["done"]]
+    # Late upstream envelopes remain rejected, rather than reviving the request.
+    assert orchestrator._classify_stage_output(0, "done", 0.).value == "unknown_logical_request"
+    await orchestrator._cleanup_request_ids(["done"])
+    assert processor.abort_calls == [["done"]]  # Idempotent cleanup.
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     pool = StagePool(
