@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import multiprocessing.connection
+import os
 import socket
 import threading
 import weakref
@@ -208,6 +209,23 @@ class StageEngineCoreClientBase:
             self.stage_id,
             self.replica_id,
         )
+
+    def _ensure_output_queue_task(self):
+        # AsyncMPClient calls this during its __init__, after creating the
+        # queue and before the socket receiver captures a reference to it.
+        if self.resources.output_queue_task is None and getattr(self, "stage_id", None) == 2:
+            mode = os.environ.get("VLLM_OMNI_OUTPUT_QUEUE_DIAGNOSTIC", "off")
+            if mode != "off":
+                from vllm_omni.profiling.output_queue_diagnostic import DiagnosticOutputQueue
+                from vllm_omni.profiling.stage_queue_trace import emit_stage_event
+
+                if not isinstance(self.outputs_queue, DiagnosticOutputQueue):
+                    if not self.outputs_queue.empty():
+                        raise RuntimeError("cannot replace a nonempty output queue")
+                    self.outputs_queue = DiagnosticOutputQueue(
+                        stage_id=self.stage_id, mode=mode, emit=emit_stage_event,
+                    )
+        return super()._ensure_output_queue_task()
 
     def get_output_nowait(self) -> EngineCoreOutputs | None:
         """Return a ready output immediately, or ``None`` when the queue is empty."""
