@@ -215,7 +215,16 @@ class StageEngineCoreClientBase:
         # queue and before the socket receiver captures a reference to it.
         if self.resources.output_queue_task is None and getattr(self, "stage_id", None) == 2:
             mode = os.environ.get("VLLM_OMNI_OUTPUT_QUEUE_DIAGNOSTIC", "off")
-            if mode != "off":
+            if mode == "off":
+                from vllm_omni.engine.snapshot_output_queue import SnapshotOutputQueue
+
+                if not isinstance(self.outputs_queue, SnapshotOutputQueue):
+                    if not self.outputs_queue.empty():
+                        raise RuntimeError("cannot replace a nonempty output queue")
+                    self.outputs_queue = SnapshotOutputQueue()
+                    logger.info("Stage-%s output queue: adjacent status snapshot coalescing", self.stage_id)
+            else:
+                # Explicit historical diagnostics bypass the production fix.
                 from vllm_omni.profiling.output_queue_diagnostic import DiagnosticOutputQueue
                 from vllm_omni.profiling.stage_queue_trace import emit_stage_event
 

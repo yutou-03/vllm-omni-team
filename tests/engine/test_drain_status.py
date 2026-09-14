@@ -159,6 +159,9 @@ def _make_chunk_adapter() -> OmniChunkTransferAdapter:
     adapter._recv_inflight = 0
     adapter._save_inflight = 0
     adapter._background_fault = None
+    # __init__ is bypassed by this fixture; sender fault tests must reach the
+    # injected connector failure, not fail early and wait forever in save_loop.
+    adapter._abandoned_sender_ids = set()
     adapter._finished_load_reqs = set()
     adapter._finished_save_reqs = set()
     adapter.finished_requests = set()
