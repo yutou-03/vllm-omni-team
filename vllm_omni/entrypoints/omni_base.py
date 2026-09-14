@@ -372,7 +372,7 @@ class OmniBase(PDDisaggregationMixin):
                 )
             raise RuntimeError(error_text)
 
-        if msg_type != "output":
+        if msg_type not in {"output", "request_done"}:
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg_type)
             return True, None, None, None
 
@@ -439,6 +439,10 @@ class OmniBase(PDDisaggregationMixin):
         wall_start_ts: float,
         final_stage_id_for_e2e: int,
     ) -> OmniRequestOutput | None:
+        # A FIFO lifecycle notification, not a generated output or metric.
+        # Both sync and async consumers handle its finished flag after this.
+        if result.get("type") == "request_done":
+            return None
         req_id = result.get("request_id")
         engine_outputs = result.get("engine_outputs")
         stage_durations = getattr(result["engine_outputs"], "stage_durations", {})

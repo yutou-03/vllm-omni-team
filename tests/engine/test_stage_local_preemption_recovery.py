@@ -187,6 +187,7 @@ def test_talker_stage_local_preemption_requeues_only_immutable_input(monkeypatch
 
 def test_stage_local_talker_recompute_replaces_only_downstream(monkeypatch):
     orchestrator, state, _ = _orchestrator_with_request()
+    state.processed_terminal_stages.update({0, 1, 2})
     state.streaming.bridge_states = {
         "qwen3_omni": {
             "logical": {"dirty": True},
@@ -226,6 +227,7 @@ def test_stage_local_talker_recompute_replaces_only_downstream(monkeypatch):
     assert state.current_execution_id == "logical"
     assert state.execution_attempt == 0
     assert state.stage_request_ids == {0: "logical", 1: "logical", 2: stage2_id}
+    assert state.processed_terminal_stages == {0}
     assert state.execution_ledger is not None
     assert state.execution_ledger.pipeline_attempt_id == 0
     assert {

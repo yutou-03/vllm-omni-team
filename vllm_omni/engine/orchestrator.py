@@ -315,6 +315,17 @@ class OrchestratorRequestState:
     execution_ledger: ExecutionLedger | None = None
     output_commit_ledger: OutputCommitLedger | None = None
     output_attempt_sequences: dict[int, int] = field(default_factory=dict)
+    # Backend generation order need not equal frontend queue-consumption order.
+    # Only processed terminal envelopes from the current execution count here.
+    processed_terminal_stages: set[int] = field(default_factory=set)
+    completion_deferred: bool = False
+
+    def outputs_drained(self) -> bool:
+        return (
+            self.final_stage_id in self.processed_terminal_stages
+            and not self.pending_restart_stages
+            and set(self.stage_submit_ts).issubset(self.processed_terminal_stages)
+        )
 
     def __post_init__(self) -> None:
         """Create the explicit execution ledger for a valid pipeline request."""
@@ -1542,6 +1553,9 @@ class Orchestrator:
                     if self.stage_pools[downstream_stage_id].final_output
                 ]
                 req_state.begin_output_replay(replay_stage_ids)
+                req_state.processed_terminal_stages.difference_update(
+                    range(stage_id, final_stage_id + 1)
+                )
                 for downstream_stage_id in range(stage_id + 1, final_stage_id + 1):
                     retired_request_id = retired[
                         downstream_stage_id
@@ -1607,6 +1621,7 @@ class Orchestrator:
                 if self.stage_pools[pipeline_stage_id].final_output
             ]
             req_state.begin_output_replay(replay_stage_ids)
+            req_state.processed_terminal_stages.clear()
             for pipeline_stage_id in range(final_stage_id + 1):
                 req_state.discard_stage_outputs_before[pipeline_stage_id] = cutoff
 
@@ -1869,6 +1884,18 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id])
             return
 
+        if finished:
+            req_state.processed_terminal_stages.add(stage_id)
+            if stage_id == req_state.final_stage_id and not req_state.outputs_drained():
+                req_state.completion_deferred = True
+                emit_stage_event(
+                    "request_completion_deferred",
+                    stage_id=stage_id,
+                    request_id=req_id,
+                    pending_stages=sorted(set(req_state.stage_submit_ts)
+                                          - req_state.processed_terminal_stages),
+                )
+
         if self.stage_pools[stage_id].final_output:
             output_sequence = req_state.output_attempt_sequences.get(stage_id, 0)
             output_decision = req_state.classify_and_commit_output(
@@ -1939,9 +1966,14 @@ class Orchestrator:
                 "replica_id": replica_id,
                 "engine_outputs": terminal_only_output or output,
                 "metrics": stage_metrics,
-                "finished": finished and stage_id == req_state.final_stage_id,
+                "finished": finished and stage_id == req_state.final_stage_id
+                and req_state.outputs_drained(),
                 "stage_submit_ts": submit_ts,
             }
+            if queue_payload["finished"] and (
+                terminal_only_output is not None or output_decision is OutputDecision.COMMIT
+            ):
+                req_state.completion_deferred = False
             if terminal_only_output is not None:
                 await self.output_async_queue.put(queue_payload)
             elif output_decision is not OutputDecision.COMMIT:
@@ -2014,11 +2046,27 @@ class Orchestrator:
                         is_final_update=True,
                     )
 
-        if finished and stage_id == req_state.final_stage_id:
+        if finished and req_state.outputs_drained():
+            if req_state.completion_deferred:
+                # FIFO control envelope, after every required output. No fake
+                # audio/text chunk and no holding back the real final audio.
+                await self.output_async_queue.put({
+                    "type": "request_done",
+                    "request_id": req_id,
+                    "stage_id": req_state.final_stage_id,
+                    "finished": True,
+                })
+                req_state.completion_deferred = False
+                emit_stage_event(
+                    "request_completion_released",
+                    stage_id=req_state.final_stage_id,
+                    request_id=req_id,
+                    processed_terminal_stages=sorted(req_state.processed_terminal_stages),
+                )
             if req_state.execution_attempt > 0:
                 emit_stage_event(
                     "full_pipeline_recovery_completed",
-                    stage_id=stage_id,
+                    stage_id=req_state.final_stage_id,
                     request_id=req_state.request_id,
                     execution_id=req_state.current_execution_id,
                     pipeline_attempt_id=req_state.execution_attempt,

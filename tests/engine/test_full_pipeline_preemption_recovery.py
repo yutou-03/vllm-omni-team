@@ -127,6 +127,9 @@ def test_suppressed_replay_terminal_still_reaches_frontend(monkeypatch):
     state.execution_attempt = 1
     state.current_execution_id = "logical__execution1"
     state.begin_output_replay([2])
+    # This test models upstream terminal envelopes already consumed; a late
+    # upstream terminal is covered by test_terminal_output_barrier instead.
+    state.processed_terminal_stages.update({0, 1})
     cleanup_calls = []
     events = []
 
@@ -469,6 +472,7 @@ def test_slo_active_switch_replaces_later_deadline_running_request(monkeypatch):
 
 def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
     orchestrator, state, template = _orchestrator_with_request()
+    state.processed_terminal_stages.update({0, 1, 2})
     prewarm_calls = []
 
     async def _prewarm(request_id, stage0_request, req_state, **kwargs):
@@ -503,6 +507,7 @@ def test_preemption_restarts_entire_pipeline_with_new_execution(monkeypatch):
         for stage_id, ref in state.execution_ledger.current_stages.items()
     } == {0: execution_id, 1: execution_id, 2: execution_id}
     assert state.stage_submit_ts.keys() == {0}
+    assert state.processed_terminal_stages == set()
     assert state.streaming.bridge_states == {}
     assert state.replay_outputs_to_drop == {2: 7}
     assert set(state.discard_stage_outputs_before) == {0, 1, 2}
