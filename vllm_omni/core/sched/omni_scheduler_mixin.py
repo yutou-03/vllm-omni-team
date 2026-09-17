@@ -279,6 +279,8 @@ class OmniSchedulerMixin:
                                  weights=[self._path_rr.text, self._path_rr.audio],
                                  cursor=self._path_rr.cursor)
 
+        from vllm_omni.scheduling.admission_probe import AdmissionProbe
+        self._admission_probe = AdmissionProbe.from_environment(self)
         if not self._baseline_policy_applies():
             return
 
@@ -1457,6 +1459,9 @@ class OmniSchedulerMixin:
                          **record)
 
     def _select_waiting_queue_for_scheduling(self):
+        probe = getattr(self, "_admission_probe", None)
+        if probe is not None:
+            return probe.select(emit_stage_event)
         if getattr(self, "_path_rr", None) is not None:
             return self._path_rr.select(
                 [self.waiting, self.skipped_waiting], running=self.running,
