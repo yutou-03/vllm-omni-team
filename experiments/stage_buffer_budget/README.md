@@ -27,3 +27,5 @@ CPU 检查：`python3 experiments/stage_buffer_budget/verify_budget_policy_cpu.p
 ## 版本管理
 
 代码、实验分支及提交对应关系见 [VERSIONING.md](VERSIONING.md)。新运行以固定工作树的完整 Git commit 和配置 hash 记录版本。
+
+提交关系快照见 [branch_graph/README.md](branch_graph/README.md)。

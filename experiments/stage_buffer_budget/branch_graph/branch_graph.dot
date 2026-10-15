@@ -1,0 +1,20 @@
+digraph branches {
+ graph [rankdir=TB, bgcolor="white", pad="0.30", nodesep="0.46", ranksep="0.54", splines=polyline, fontname="DejaVu Sans", labelloc=t, label="KV study: local Git branch snapshot at 23b1ad11", fontsize=21];
+ node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, color="#cbd5e1", penwidth=1.2, margin="0.18,0.10", fillcolor="#f8fafc"];
+ edge [arrowhead=none, penwidth=2.7];
+ head [label="23b1ad11  versioning docs\nexp/stage-buffer-inventory  [snapshot HEAD]\n/home/zhongyu/project/vllm-omni-buffer", fillcolor="#dbeafe", color="#2563eb", penwidth=2.0];
+ ipc_buffer [label="5c055572  IPC fix (cherry-pick)", fillcolor="#dbeafe", color="#2563eb"];
+ buffer [label="4f5f3c86  stage buffer policy", fillcolor="#dbeafe", color="#2563eb"];
+ ipc_topic [label="63e795fa  IPC fix topic\nresearch/kv-residency\nfix/compact-cpu-tensor-storage", fillcolor="#f3e8ff", color="#9333ea"];
+ slots [label="93e362cf  K/R execution slots\nexp/keep-execution-slots", fillcolor="#f3e8ff", color="#9333ea"];
+ baseline [label="e7faad0c  frozen 2026-10-12 baseline\nkv-residency-historical-active-20261012", fillcolor="#dcfce7", color="#16a34a"];
+ admission [label="b66ec86a  admission experiment", fillcolor="#f8fafc"];
+ common [label="acab50f9  earlier common history", fillcolor="#f8fafc"];
+ qps [label="695c5a00  exp/qps-sweep-nonpreemptive\n/home/zhongyu/project/vllm-omni-team", fillcolor="#f1f5f9"];
+ head -> ipc_buffer -> buffer -> baseline [color="#2563eb"];
+ ipc_topic -> slots -> baseline [color="#9333ea"];
+ baseline -> admission -> common [color="#64748b", penwidth=1.8];
+ common -> qps [color="#94a3b8", style=dashed, penwidth=1.7, label="older commits omitted", fontsize=10, fontcolor="#64748b"];
+ ipc_buffer -> ipc_topic [color="#f59e0b", style=dotted, penwidth=2.1, constraint=false, label="same patch; cherry-picked\nnot a Git merge", fontsize=10, fontcolor="#92400e"];
+ {rank=same; buffer; ipc_topic}
+}
