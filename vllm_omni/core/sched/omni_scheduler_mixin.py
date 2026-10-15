@@ -316,6 +316,19 @@ class OmniSchedulerMixin:
         else:
             self._baseline_policy = environment_policy
         self._baseline_stage_id = int(self._omni_stage_id_for_trace())
+        if os.environ.get("VLLM_OMNI_URGENT_KEEP_ADMISSION", "0") == "1":
+            target = os.environ.get("VLLM_OMNI_SMALL_HOLD_STAGES")
+            if target not in {"0", "1"}:
+                raise ValueError("urgent keep requires exactly one target Stage 0 or 1")
+            if self._baseline_stage_id == int(target):
+                if (environment_policy is not BaselineSchedulingPolicy.NATIVE_FCFS
+                        or self._slo_scheduling_config.enabled):
+                    raise ValueError("urgent keep requires native baseline before stage-local EDF override")
+                self._baseline_policy = BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP
+                emit_stage_event("urgent_keep_stage_edf_enabled",
+                    stage_id=self._baseline_stage_id,
+                    policy=self._baseline_policy.value,
+                    other_stages_unchanged=True)
         self._stage_queue_growth_window = QueueGrowthWindow(window_s=1.0)
         self._stage_gpu_active_sampler = (
             NVMLGPUActiveSampler.from_environment(min_interval_s=0.1)

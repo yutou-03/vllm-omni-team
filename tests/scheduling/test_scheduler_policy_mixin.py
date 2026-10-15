@@ -118,6 +118,21 @@ class SchedulerHarness(OmniSchedulerMixin, FakeBaseScheduler):
         self._initialize_baseline_scheduling()
 
 
+def test_urgent_keep_edf_is_confined_to_one_stage(monkeypatch):
+    monkeypatch.setenv(BASELINE_POLICY_ENV, "native_fcfs")
+    monkeypatch.setenv("VLLM_OMNI_URGENT_KEEP_ADMISSION", "1")
+    monkeypatch.setenv("VLLM_OMNI_SMALL_HOLD_STAGES", "1")
+    schedulers = [SchedulerHarness(stage) for stage in (0, 1, 2)]
+    assert [scheduler._baseline_policy for scheduler in schedulers] == [
+        BaselineSchedulingPolicy.NATIVE_FCFS,
+        BaselineSchedulingPolicy.STAGE_DEADLINE_EDF_NP,
+        BaselineSchedulingPolicy.NATIVE_FCFS,
+    ]
+    assert isinstance(schedulers[1].waiting, PolicyOrderedRequestQueue)
+    assert all(scheduler.waiting is scheduler.native_waiting
+               for scheduler in (schedulers[0], schedulers[2]))
+
+
 def test_path_rr_integration_counts_success_and_leaves_other_stages_native(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_PATH_RR", "1:2")
     monkeypatch.setenv(BASELINE_POLICY_ENV, "native_fcfs")

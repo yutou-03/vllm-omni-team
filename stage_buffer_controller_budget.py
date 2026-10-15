@@ -193,13 +193,86 @@ class Controller:
 
     def record(self, rid, now, reason, fields, **extra):
         self.reasons[reason] += 1
-        action = reason in ('pause_accepted', 'resume_requested')
+        action = reason in ('pause_accepted', 'resume_requested', 'urgent_hold_accepted')
         if not action and now-self.last_log.get(rid, 0.) < self.config['no_action_log_interval_s']:
             return
         self.last_log[rid] = now
         self.sequence += 1
         emit_stage_event('stage_buffer_decision', stage_id=self.stage, request_id=rid,
                         sequence=self.sequence, reason=reason, **fields, **extra)
+
+    def _try_urgent_keep(self, scheduler, now, guard):
+        """Accept at most one deadline inversion using a KV-preserving hold."""
+        probe = scheduler._small_hold_probe
+        if probe.holds or probe._urgent_pending:
+            return
+        waiting = list(scheduler.waiting)
+        if not waiting:
+            return
+        urgent = min(waiting, key=lambda request: (
+            scheduler._slo_stage_fields(request)[0], str(request.request_id)))
+        urgent_deadline, predicted_ms = scheduler._slo_stage_fields(urgent)
+        skipped = getattr(scheduler, "skipped_waiting", ())
+        if skipped and min(scheduler._slo_stage_fields(request)[0]
+                           for request in skipped) <= urgent_deadline:
+            self.record(urgent.request_id, now, 'higher_priority_resume_waiting', {},
+                        urgent_request_id=urgent.request_id)
+            return
+        active = [request for request in scheduler.running
+                  if request.request_id not in probe.holds and
+                  (probe._execution_active_ids is None or
+                   request.request_id in probe._execution_active_ids)]
+        if len(active) < probe.execution_cap:
+            self.record(urgent.request_id, now, 'execution_slot_available', {},
+                        urgent_request_id=urgent.request_id)
+            return
+        resident = probe._resident_fields()['resident_count']
+        if resident >= probe.resident_cap:
+            self.record(urgent.request_id, now, 'resident_cap_full', {},
+                        urgent_request_id=urgent.request_id, resident_count=resident)
+            return
+        eligible = []
+        for request in active:
+            rid = request.request_id
+            if rid in probe.accepted_request_ids or not probe._at_decode_boundary(request):
+                continue
+            fields = self.fields(rid, now, guard)
+            if (fields['coverage_s'] is None or fields['coverage_s'] < fields['high_s']
+                    or fields['requested_hold_s'] < self.config['min_hold_s']
+                    or now - self.last_end.get(rid, 0.) < self.config['cooldown_s']):
+                continue
+            deadline, _ = scheduler._slo_stage_fields(request)
+            eligible.append((deadline, str(rid), request, fields))
+        if not eligible:
+            self.record(urgent.request_id, now, 'no_eligible_victim', {},
+                        urgent_request_id=urgent.request_id)
+            return
+        victim_deadline, _, victim, fields = max(eligible)
+        if urgent_deadline >= victim_deadline:
+            self.record(urgent.request_id, now, 'no_deadline_inversion', {},
+                        urgent_request_id=urgent.request_id,
+                        victim_request_id=victim.request_id)
+            return
+        slack_ms = (urgent_deadline - now) * 1000.0
+        trigger_ms = predicted_ms + self.config['urgent_guard_ms']
+        if slack_ms > trigger_ms:
+            self.record(urgent.request_id, now, 'urgent_slack_sufficient', {},
+                        urgent_request_id=urgent.request_id,
+                        victim_request_id=victim.request_id,
+                        slack_ms=slack_ms, trigger_ms=trigger_ms)
+            return
+        evidence = dict(fields, urgent_request_id=str(urgent.request_id),
+                        urgent_stage_deadline_monotonic_s=urgent_deadline,
+                        victim_stage_deadline_monotonic_s=victim_deadline,
+                        urgent_predicted_stage_ms=predicted_ms,
+                        urgent_slack_ms=slack_ms, trigger_ms=trigger_ms)
+        accepted = scheduler.request_hold(victim.request_id,
+            fields['requested_hold_s'], 'urgent_inversion', evidence)
+        self.record(victim.request_id, now,
+                    'urgent_hold_accepted' if accepted else 'urgent_hold_rejected',
+                    fields, urgent_request_id=urgent.request_id,
+                    victim_request_id=victim.request_id,
+                    resident_count=resident, execution_cap=probe.execution_cap)
 
     def __call__(self, scheduler, now):
         start = time.monotonic()
@@ -227,6 +300,9 @@ class Controller:
                 probe.release_hold(rid, cause)
                 self.last_end[rid] = now
                 self.record(rid, now, 'resume_requested', fields, resume_reason=cause)
+        if getattr(probe, 'urgent_keep_mode', False):
+            self._try_urgent_keep(scheduler, now, guard)
+            return
         for request in list(scheduler.running):
             rid = request.request_id
             if rid in probe.holds:

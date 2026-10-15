@@ -1,0 +1,29 @@
+base_config: /home/zhongyu/project/vllm-omni-buffer/vllm_omni/deploy/qwen3_omni_moe.yaml
+stages:
+  - stage_id: 0
+    async_scheduling: false
+    kv_cache_memory_bytes: 14136115200
+    limit_mm_per_prompt:
+      image: 16
+      video: 1
+      audio: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: 1
+      seed: 42
+      max_tokens: 1024
+      ignore_eos: false
+  - stage_id: 1
+    async_scheduling: false
+    kv_cache_memory_bytes: 1894318080
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 1.0
+      top_k: 50
+      seed: 42
+      max_tokens: 4096
+      ignore_eos: false
+    subtalker_sampling_params:
+      do_sample: false
+      top_k: 1

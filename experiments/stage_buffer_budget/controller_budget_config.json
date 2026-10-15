@@ -24,5 +24,6 @@
   "scope": "separate Stage0/Stage1; receiver-ready inventory capped by published inventory; no client playback credit",
   "performance_claim": false,
   "min_hold_s": 0.01,
-  "deadline_limit": "100 ms requested hold cap; synchronous GPU work is non-interruptible; held slices admit resident decode only and suspend policy after more than 50 ms of deadline lateness"
+  "deadline_limit": "100 ms requested hold cap; synchronous GPU work is non-interruptible; held slices admit resident decode only and suspend policy after more than 50 ms of deadline lateness",
+  "urgent_guard_ms": 0.0
 }
