@@ -34,6 +34,7 @@ from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_
 from vllm_omni.recovery import PreemptionRecoveryMode
 from vllm_omni.scheduling.config import effective_preemption_recovery_mode
 from vllm_omni.scheduling.policy import request_scheduling_metadata
+from vllm_omni.scheduling.small_hold_probe import SmallHoldProbe
 
 logger = init_logger(__name__)
 
@@ -226,6 +227,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._slo_priority_trace_enabled,
         ) = _load_slo_active_preemption_config()
         self._slo_priority_witness_seen: set[tuple[str, str, int]] = set()
+        self._small_hold_probe = SmallHoldProbe(self, emit=emit_stage_event)
+
+    def request_hold(
+        self, request_id: str, duration_s: float, reason: str, evidence: dict[str, Any]
+    ) -> bool:
+        """Request one bounded Stage 1 hold from the scheduler thread."""
+        return self._small_hold_probe.request_hold(request_id, duration_s, reason, evidence)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -486,6 +494,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         request may replace the latest-deadline running request once its slack
         can no longer cover its own predicted Stage service time.
         """
+        if os.environ.get("VLLM_OMNI_TRADEOFF_CONTROL_FILE"):
+            from tradeoff_controller import decide
+            return decide(self, timestamp, monotonic_now)
         stage_id = int(self._omni_stage_id_for_trace())
         if not (
             getattr(self, "_slo_active_preemption_enabled", False)
@@ -710,6 +721,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         controlled_preempted_req_ids = self._inject_controlled_preemptions(
             schedule_start
         )
+        self._small_hold_probe.before_schedule()
 
         try:
             with (
@@ -722,8 +734,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     active_reqs=num_running_before,
                 ),
                 nvtx_range("omni:base_schedule"),
+                self._small_hold_probe.scheduling_context(),
             ):
                 scheduler_output = super().schedule()
+            self._small_hold_probe.record_scheduled(scheduler_output)
             scheduler_output.preempted_req_ids = set(
                 scheduler_output.preempted_req_ids
             ) | controlled_preempted_req_ids | slo_active_preempted_req_ids

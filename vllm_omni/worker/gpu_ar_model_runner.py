@@ -41,6 +41,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.profiling import conditioning_audit
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
@@ -180,6 +181,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def capture_model(self) -> int:
         result = super().capture_model()
         self._capture_talker_mtp_graphs()
+        from vllm_omni.profiling.small_batch_cost import startup_cost_screen
+        startup_cost_screen(self)
         return result
 
     def _capture_talker_mtp_graphs(self) -> None:
@@ -842,7 +845,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             ),
             record_function_or_nullcontext("gpu_model_runner: sample"),
         ):
+            audit_rows = conditioning_audit.before_sample(self, logits)
             sampler_output = self._sample(logits, spec_decode_metadata)
+            conditioning_audit.after_sample(audit_rows, sampler_output.sampled_token_ids)
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import time
+import os
+
+from vllm_omni.profiling import stage_study
 from typing import Any
 
 from vllm.v1.engine import EngineCoreEventType
@@ -144,6 +147,80 @@ def extract_request_recovery_trace_fields(request: Any) -> dict[str, Any]:
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
+    def _stage_study_snapshot(self, *, point: str, force: bool = False) -> None:
+        if not stage_study.enabled():
+            return
+        from vllm_omni.profiling.profile_allocations import install
+        install(self)
+        try:
+            now = time.monotonic()
+            interval = float(os.environ.get("VLLM_OMNI_STAGE_STUDY_SAMPLE_MS", "50")) / 1000.0
+            if not force and now - getattr(self, "_study_last_snapshot", -1.0) < max(interval, 0.0):
+                return
+            self._study_last_snapshot = now
+            # Chunk-waiting requests are temporarily removed from scheduler
+            # queues before this hook, while their KV remains allocated. The
+            # request map is the primary population; queue union preserves any
+            # residual queue-only entries for cancellation/drain diagnostics.
+            request_map = list(getattr(self, "requests", {}).values())
+            running = list(self.running)
+            waiting = list(self.waiting)
+            adapter = getattr(self, "chunk_transfer_adapter", None)
+            collections = {
+                "request_map": request_map,
+                "running": running,
+                "waiting": waiting,
+                "adapter_waiting_for_chunk_running": list(getattr(
+                    adapter, "waiting_for_chunk_running_requests", ())),
+                "adapter_waiting_for_chunk_waiting": list(getattr(
+                    adapter, "waiting_for_chunk_waiting_requests", ())),
+            }
+            membership = {
+                name: {str(request.request_id) for request in members}
+                for name, members in collections.items()
+            }
+            unique = {}
+            for request in request_map + running + waiting:
+                unique.setdefault(str(request.request_id), request)
+            rows = []
+            for request_id, request in unique.items():
+                row = stage_study.request_progress(self, request)
+                row.update(stage_study.identity(deserialize_additional_information(
+                    getattr(request, "additional_information", None)), request.request_id))
+                row["queue_membership"] = [
+                    name for name, members in membership.items() if request_id in members
+                ]
+                row["waiting_for_chunk"] = (
+                    "WAITING_FOR_CHUNK" in str(getattr(request.status, "name", request.status)).upper()
+                )
+                probe = getattr(self, "_small_hold_probe", None)
+                hold = getattr(probe, "holds", {}).get(request_id)
+                row["explicit_buffer_hold"] = bool(hold is not None and hold.released_monotonic_s is None)
+                row["snapshot_request_population_version"] = 3
+                rows.append(row)
+            stage_study.emit("kv_snapshot", stage_id=self._omni_stage_id_for_trace(),
+                             observation_point=point, requests=rows,
+                             request_snapshot_scope="request_map_union_scheduler_queues_v2",
+                             request_collection_counts={name: len(members) for name, members in collections.items()},
+                             **stage_study.kv_counts(self))
+        except Exception:
+            return
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        if stage_study.enabled():
+            try:
+                info = deserialize_additional_information(getattr(request, "additional_information", None))
+                progress = stage_study.request_progress(self, request)
+                progress.pop("request_id", None)
+                stage_study.emit("before_preempt", stage_id=self._omni_stage_id_for_trace(),
+                                 request_id=request.request_id, info=info,
+                                 observation_point="before_kv_free",
+                                 **stage_study.kv_counts(self), **progress)
+                self._stage_study_snapshot(point="before_preempt", force=True)
+            except Exception:
+                pass
+        return super()._preempt_request(request, timestamp)
+
     def _initialize_baseline_scheduling(self) -> None:
         """Configure optional baseline ordering after the native scheduler init."""
 
@@ -279,8 +356,6 @@ class OmniSchedulerMixin:
                                  weights=[self._path_rr.text, self._path_rr.audio],
                                  cursor=self._path_rr.cursor)
 
-        from vllm_omni.scheduling.admission_probe import AdmissionProbe
-        self._admission_probe = AdmissionProbe.from_environment(self)
         if not self._baseline_policy_applies():
             return
 
@@ -989,6 +1064,7 @@ class OmniSchedulerMixin:
     ) -> None:
         """Refresh data-ready times and order runnable requests in place."""
 
+        self._stage_study_snapshot(point="before_schedule")
         self._baseline_waiting_queue_choices = []
         if self._baseline_policy in _PROFILED_DEADLINE_POLICIES:
             self._slo_control_epoch += 1
@@ -1459,9 +1535,6 @@ class OmniSchedulerMixin:
                          **record)
 
     def _select_waiting_queue_for_scheduling(self):
-        probe = getattr(self, "_admission_probe", None)
-        if probe is not None:
-            return probe.select(emit_stage_event)
         if getattr(self, "_path_rr", None) is not None:
             return self._path_rr.select(
                 [self.waiting, self.skipped_waiting], running=self.running,
@@ -1754,7 +1827,10 @@ class OmniSchedulerMixin:
                 ),
                 update_control_signals=True,
             )
+        study_kv_fields = stage_study.kv_counts(self) if stage_study.enabled() else {}
+        study_kv_fields.pop("kv_cache_usage", None)
         emit_iteration_event(
+            **study_kv_fields,
             stage_id=stage_id,
             iteration_id=iteration_id,
             timestamp_start=timestamp_start,

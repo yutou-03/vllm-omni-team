@@ -39,6 +39,11 @@ from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
+from vllm_omni.profiling.small_inventory import (
+    emit_inventory_event,
+    scheduled_inventory_fields,
+    small_inventory_enabled,
+)
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -306,6 +311,18 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 batch_num_seqs=int(num_reqs),
             )
         self._omni_stage_queue_first_forward_seen = first_forward_seen
+        if stage_id == 2 and small_inventory_enabled():
+            self._small_hold_inventory_steps = scheduled_inventory_fields(scheduler_output)
+            for req_id, fields in self._small_hold_inventory_steps.items():
+                emit_inventory_event(
+                    "small_hold_chunk_conversion_started",
+                    stage_id=stage_id,
+                    request_id=req_id,
+                    fields=fields,
+                    scheduled_codec_elements=traced_scheduled_tokens[req_id],
+                    batch_num_seqs=int(num_reqs),
+                    observation_point="before_model_call",
+                )
         with (
             set_forward_context(
                 attn_metadata,
@@ -460,6 +477,25 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+        if stage_id == 2 and small_inventory_enabled():
+            inventory_steps = getattr(self, "_small_hold_inventory_steps", {})
+            for req_id, fields in inventory_steps.items():
+                payload = pooler_output[req_id_to_index_output_copy[req_id]]
+                audio = payload.get("audio") if isinstance(payload, dict) else None
+                if audio is None and isinstance(payload, dict):
+                    # Qwen3-Omni exposes each decoded waveform under model_outputs.
+                    audio = payload.get("model_outputs")
+                emit_inventory_event(
+                    "small_hold_chunk_conversion_completed",
+                    stage_id=stage_id,
+                    request_id=req_id,
+                    fields=fields,
+                    audio_shape=list(audio.shape) if isinstance(audio, torch.Tensor) else None,
+                    audio_samples=int(audio.shape[-1]) if isinstance(audio, torch.Tensor) and audio.ndim else None,
+                    observation_point="after_existing_cpu_output_copy",
+                    client_delivery_confirmed=False,
+                )
+            self._small_hold_inventory_steps = {}
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,

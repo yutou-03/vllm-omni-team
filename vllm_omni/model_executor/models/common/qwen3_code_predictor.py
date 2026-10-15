@@ -19,6 +19,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -82,7 +83,13 @@ class _RotaryEmbedding(nn.Module):
             "head_dim",
             config.hidden_size // config.num_attention_heads,
         )
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        # Transformers 5 stores the same checkpoint parameter in this mapping.
+        # Reading only the legacy attribute silently uses 1e4 for Qwen's 1e6.
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+            rope_theta = rope_parameters["rope_theta"]
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000.0)
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -520,6 +527,17 @@ class CodePredictorWrapper(nn.Module):
                 logger.warning_once("code_predictor: torch.compile disabled")
             return
 
+        if envs.VLLM_BATCH_INVARIANT:
+            # This standalone torch.compile path can lower ATen operators
+            # without retaining vLLM's batch-invariant CUDA implementations.
+            # Keep their dispatcher path; CUDA graph replay remains supported.
+            self._compiled_model_fwd = self.model.forward
+            self._warmup_buckets()
+            if self._wrapper_config.use_cuda_graphs:
+                self._capture_cuda_graphs()
+            logger.info("code_predictor: eager operators for batch invariance (CUDA graphs supported)")
+            return
+
         # torch.compile fuses RMSNorm/RoPE in ways that lose float32
         # precision, compounding across AR steps. Use epilogue_fusion=False
         # to disable the problematic fusions while still getting kernel
@@ -660,11 +678,11 @@ class CodePredictorWrapper(nn.Module):
 
         # Prepare sampling parameters
         stored_mode = self._wrapper_config.sampling_mode == "stored"
+        use_sampling = do_sample and temperature > 0
         if stored_mode:
             s_top_k = self._top_k
             s_top_p = self._top_p
         else:
-            use_sampling = do_sample and temperature > 0
             inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
             if use_sampling and top_p != 1.0:
                 raise NotImplementedError(
@@ -691,7 +709,11 @@ class CodePredictorWrapper(nn.Module):
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
             # Sample next code
-            if stored_mode:
+            if not use_sampling:
+                # Greedy decoding applies to both wrappers. In particular,
+                # stored top-k/top-p must not override an explicit do_sample=False.
+                code = logits.argmax(dim=-1, keepdim=True)
+            elif stored_mode:
                 # "stored" mode: top-k -> top-p -> softmax -> multinomial
                 if s_top_k > 0:
                     topk_vals, _ = logits.topk(s_top_k, dim=-1)

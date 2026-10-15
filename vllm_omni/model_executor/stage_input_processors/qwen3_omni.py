@@ -4,6 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
+from vllm_omni.profiling import stage_study
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +22,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_speaker_from_request,
 )
 from vllm_omni.profiling.nvtx import nvtx_mark
+from vllm_omni.profiling.small_inventory import small_inventory_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +295,14 @@ def thinker2talker_async_chunk(
         or request.external_req_id
     )
     chunk_id = transfer_manager.put_req_chunk[request_id]
+    study_identity = None
+    if stage_study.enabled():
+        from vllm_omni.engine.serialization import deserialize_additional_information
+        study_info = deserialize_additional_information(getattr(request, "additional_information", None))
+        study_identity = stage_study.identity(study_info, request_id)
+        stage_study.emit("thinker_output_produced", stage_id=0, request_id=request_id,
+                         info=study_info, generated_output_tokens_total=len(request.output_token_ids),
+                         prompt_tokens=len(request.prompt_token_ids), chunk_id=chunk_id)
     nvtx_mark(
         f"s0_payload_start:req={str(request_id)[-8:]}:"
         f"chunk={chunk_id}:finished={int(bool(is_finished))}"
@@ -392,6 +402,12 @@ def thinker2talker_async_chunk(
             talker_additional_info["embed"] = {"prefill": thinker_emb.detach().cpu()}
             talker_additional_info["hidden_states"] = {"output": thinker_hid.detach().cpu()}
         nvtx_mark(f"s0_payload_ready:req={str(request_id)[-8:]}:chunk={chunk_id}:kind=decode")
+    if study_identity is not None:
+        talker_additional_info.setdefault("meta", {})["stage_study_identity"] = study_identity
+        stage_study.emit("text_payload_ready", stage_id=0, request_id=request_id,
+                         info=talker_additional_info, chunk_id=chunk_id,
+                         **stage_study.text_ready_fields(talker_additional_info),
+                         **stage_study.text_entity_fields(talker_additional_info, prefix="raw_"))
     return talker_additional_info
 
 
@@ -571,6 +587,11 @@ def talker2code2wav_async_chunk(
     )
     transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    if stage_study.enabled():
+        from vllm_omni.engine.serialization import deserialize_additional_information
+        study_info = deserialize_additional_information(getattr(request, "additional_information", None))
+        stage_study.emit("codec_frame_produced", stage_id=1, request_id=request_id, info=study_info,
+                         codec_total_frames=length, new_frames=1, unit="codec_frame")
 
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not is_finished:
@@ -588,10 +609,28 @@ def talker2code2wav_async_chunk(
         .tolist()
     )
 
-    return {
-        "codes": {"audio": codes},
-        "meta": {"left_context_size": left_context_size, "finished": torch.tensor(is_finished, dtype=torch.bool)},
-    }
+    meta = {"left_context_size": left_context_size, "finished": torch.tensor(is_finished, dtype=torch.bool)}
+    if small_inventory_enabled():
+        # These are codec-frame counts, including explicitly identified replay
+        # context. They are not audio duration or proof of downstream receipt.
+        from vllm_omni.engine.serialization import deserialize_additional_information
+
+        request_info = deserialize_additional_information(getattr(request, "additional_information", None))
+        scheduling_meta = request_info.get("meta", {})
+        study_identity = stage_study.identity(request_info, request_id)
+        meta.update({"small_hold_" + key: value for key, value in study_identity.items()})
+        meta.update({
+            "small_hold_chunk_id": int(transfer_manager.put_req_chunk.get(request_id, 0)),
+            "small_hold_connector_request_id": str(request_id),
+            "small_hold_logical_request_id": study_identity["logical_request_id"],
+            "small_hold_codec_total_frames": length,
+            "small_hold_codec_payload_frames": end_index,
+            "small_hold_left_context_frames": left_context_size,
+            "small_hold_new_frames": context_length,
+            "small_hold_raw_codec_shape": list(code_predictor_codes.shape),
+            "small_hold_stream_finished": bool(is_finished),
+        })
+    return {"codes": {"audio": codes}, "meta": meta}
 
 
 def talker2code2wav(

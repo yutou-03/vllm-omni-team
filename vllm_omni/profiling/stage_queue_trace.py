@@ -85,6 +85,24 @@ def _record_enabled(filename: str, payload: dict[str, Any]) -> bool:
     mode = os.environ.get("STAGE_QUEUE_TRACE_MODE", "full").strip().lower()
     if mode in ("", "full"):
         return True
+    if mode == "stage_study":
+        # Keep event-level evidence without full per-token/forward traces.
+        event = payload.get("event", "")
+        return (
+            (filename == "iteration_events.jsonl" and event == "iteration")
+            or (filename == "stage_events.jsonl" and (
+                event.startswith("stage_study_")
+                or event.startswith("stage_buffer_")
+                or event.startswith("small_hold_")
+                or event in {"request_ingress", "stage_data_ready", "stage_done_metrics", "stage_first_forward",
+                             "stage_enqueue", "stage_route_to_next", "first_recomputed_progress",
+                             "stage_output_version_rejected", "stage_output_commit_rejected",
+                             "request_completion_deferred", "request_completion_released",
+                             "kv_allocation_failed", "preempt", "stage_reentered",
+                             "recovery_catchup", "stage_recovery_catchup"}
+                or "recover" in event or "preempt" in event or "restart" in event
+            ))
+        )
     if mode == "request_metrics":
         return (
             filename == "stage_events.jsonl"

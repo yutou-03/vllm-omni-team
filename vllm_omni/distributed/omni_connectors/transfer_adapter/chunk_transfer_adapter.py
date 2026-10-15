@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+from vllm_omni.profiling import stage_study
 from collections import defaultdict, deque
 from types import SimpleNamespace
 from typing import Any
@@ -12,12 +13,21 @@ from vllm.v1.request import Request, RequestStatus
 from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
+from vllm_omni.profiling.small_inventory import (
+    emit_inventory_event,
+    inventory_fields,
+    small_inventory_enabled,
+)
 from vllm_omni.scheduling.metadata import preserve_scheduling_metadata
 
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
+from .talker_conditioning import (
+    is_qwen3_omni_async_talker,
+    qwen3_talker_conditioning_ready,
+)
 
 logger = get_connector_logger(__name__)
 
@@ -46,6 +56,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+        self._qwen3_talker_conditioning_gate = is_qwen3_omni_async_talker(model_config)
+        logger.info(
+            f"Talker conditioning gate: stage={getattr(model_config, 'stage_id', None)}, "
+            f"model_arch={getattr(model_config, 'model_arch', None)}, "
+            f"model_stage={getattr(model_config, 'model_stage', None)}, "
+            f"enabled={self._qwen3_talker_conditioning_gate}"
+        )
+        stage_study.emit(
+            "talker_conditioning_gate_config",
+            stage_id=int(getattr(model_config, "stage_id", -1)),
+            enabled=self._qwen3_talker_conditioning_gate,
+            model_arch=str(getattr(model_config, "model_arch", None)),
+            model_stage=str(getattr(model_config, "model_stage", None)),
+        )
         # State specific to Chunk management
         self.custom_process_next_stage_input_func = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -66,6 +90,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
         self.requests_origin_status = {}
+        # Keep the initial Talker prefill payload while an embedding-lag gate
+        # waits for later Thinker chunks. It is no longer needed once the first
+        # scheduler output carries the cumulative payload to the worker.
+        self._qwen3_bootstrap_published: set[str] = set()
+        # Physical Thinker forward rows, including prompt rows. Keep this
+        # independent of optional tracing so the gate also works with trace off.
+        self._qwen3_received_entity_rows: dict[str, int] = {}
+        self._qwen3_prompt_rows: dict[str, int] = {}
+        self._qwen3_entity_layout_invalid: set[str] = set()
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -226,6 +259,36 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 getattr(request, "additional_information", None)
             )
             meta = payload_data.get("meta", {})
+            raw_bootstrap = {}
+            raw_entity_rows = 0
+            raw_prompt_rows = None
+            raw_entity_layout_invalid = False
+            raw_entity_fields = (stage_study.text_entity_fields(payload_data, prefix="raw_")
+                                 if stage_study.enabled() and stage_id == 1 else {})
+            if stage_id == 1 and self._qwen3_talker_conditioning_gate:
+                raw_embed = payload_data.get("embed", {})
+                raw_ids = payload_data.get("ids", {})
+                if isinstance(raw_embed, dict) and isinstance(raw_ids, dict):
+                    raw_prefill = raw_embed.get("prefill")
+                    raw_decode = raw_embed.get("decode")
+                    for entity in (raw_prefill, raw_decode):
+                        if entity is None:
+                            continue
+                        if (not isinstance(entity, torch.Tensor)
+                                or entity.ndim != 2 or entity.shape[1] <= 0):
+                            raw_entity_layout_invalid = True
+                        else:
+                            raw_entity_rows += int(entity.shape[0])
+                    if raw_ids.get("prompt") is not None:
+                        raw_prompt_rows = len(raw_ids["prompt"])
+                    raw_bootstrap = {
+                        "raw_prefill_rows": (int(raw_prefill.shape[0])
+                                             if isinstance(raw_prefill, torch.Tensor) else 0),
+                        "raw_decode_rows": (int(raw_decode.shape[0])
+                                            if isinstance(raw_decode, torch.Tensor) else 0),
+                        "raw_all_ids": len(raw_ids.get("all", [])),
+                        "raw_output_ids": len(raw_ids.get("output", [])),
+                    }
             # cleanup_receiver() can run while connector.get()/deserialization
             # is in flight (for example when a downstream AR stage terminates
             # while a later upstream chunk is arriving).  Serialize the final
@@ -240,9 +303,49 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 # Update connector state.
                 self.get_req_chunk[req_id] += 1
+                if stage_id == 1 and self._qwen3_talker_conditioning_gate:
+                    self._qwen3_received_entity_rows[req_id] = (
+                        self._qwen3_received_entity_rows.get(req_id, 0)
+                        + raw_entity_rows
+                    )
+                    if raw_prompt_rows is not None:
+                        self._qwen3_prompt_rows[req_id] = raw_prompt_rows
+                    if raw_entity_layout_invalid:
+                        self._qwen3_entity_layout_invalid.add(req_id)
 
                 if self.model_mode == "ar":
-                    merged_payload = self._update_request_payload(external_req_id, payload_data)
+                    bootstrap_pending = (
+                        self._qwen3_talker_conditioning_gate
+                        and req_id not in self._qwen3_bootstrap_published
+                    )
+                    merged_payload = self._update_request_payload(
+                        external_req_id, payload_data,
+                        preserve_bootstrap=bootstrap_pending,
+                    )
+                    if bootstrap_pending:
+                        promoted = self._prepare_qwen3_talker_bootstrap(merged_payload)
+                        ids = merged_payload.get("ids", {})
+                        embed = merged_payload.get("embed", {})
+                        prefill = embed.get("prefill")
+                        decode = embed.get("decode")
+                        if stage_study.enabled():
+                            stage_study.emit(
+                                "talker_bootstrap_state", stage_id=stage_id,
+                                request_id=req_id, info=merged_payload, chunk_id=chunk_id,
+                                prompt_ids=len(ids.get("prompt", [])),
+                                all_ids=len(ids.get("all", [])),
+                                prefill_rows=(int(prefill.shape[0])
+                                              if isinstance(prefill, torch.Tensor) else None),
+                                pending_decode_rows=(int(decode.shape[0])
+                                                     if isinstance(decode, torch.Tensor) else 0),
+                                promoted_first_decode_row=promoted,
+                                physical_output_rows=max(
+                                    self._qwen3_received_entity_rows[req_id]
+                                    - self._qwen3_prompt_rows.get(req_id, 0), 0
+                                ),
+                                **raw_bootstrap, **raw_entity_fields,
+                                **stage_study.text_entity_fields(merged_payload, prefix="merged_"),
+                            )
                     request.additional_information = preserve_scheduling_metadata(
                         previous_additional_information,
                         merged_payload,
@@ -285,19 +388,113 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     f"chunk={chunk_id}:finished={int(bool(meta.get('finished')))}"
                 )
                 self._finished_load_reqs.add(req_id)
+                if stage_id == 1 and stage_study.enabled():
+                    stage_study.emit("text_payload_received", stage_id=1, request_id=req_id,
+                                     info=payload_data, chunk_id=chunk_id,
+                                     receiver_state="published_ready", size_bytes=size,
+                                     **stage_study.text_ready_fields(payload_data),
+                                     **raw_entity_fields)
+                if stage_id == 2 and small_inventory_enabled():
+                    emit_inventory_event(
+                        "small_hold_chunk_received",
+                        stage_id=stage_id,
+                        request_id=req_id,
+                        fields=inventory_fields(payload_data),
+                        received_chunk_id=chunk_id,
+                        received_codec_elements=len(request.prompt_token_ids),
+                        receiver_state="published_ready",
+                    )
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
 
         return False
 
-    def _update_request_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
-        """Update the stored payload for *req_id* with the latest chunk."""
+    @staticmethod
+    def _prepare_qwen3_talker_bootstrap(payload: dict[str, Any]) -> bool:
+        """Align first generated forward row in prefill and decode cache.
+
+        The first Thinker packet may include an output ID before its forward
+        embedding. In that case a later decode row must fill the assistant
+        prefill first-word slot. The worker's cached_decode indexes are
+        absolute output positions starting at zero, so any rows already in
+        prefill must also lead the cache exactly once.
+        """
+        ids = payload.get("ids", {})
+        embed = payload.get("embed", {})
+        meta = payload.setdefault("meta", {})
+        if not isinstance(ids, dict) or not isinstance(embed, dict) or not isinstance(meta, dict):
+            return False
+        if meta.get("_qwen3_bootstrap_decode_normalized"):
+            return False
+        prompt_ids, all_ids = ids.get("prompt"), ids.get("all")
+        prefill, decode = embed.get("prefill"), embed.get("decode")
+        if (prompt_ids is None or all_ids is None
+                or not isinstance(prefill, torch.Tensor)):
+            return False
+        prompt_rows = len(prompt_ids)
+        if prefill.shape[0] < prompt_rows:
+            return False
+        prefill_output_rows = prefill.shape[0] - prompt_rows
+        if prefill_output_rows > 0:
+            prior_output = prefill[prompt_rows:]
+            embed["decode"] = (torch.cat([prior_output, decode], dim=0)
+                               if isinstance(decode, torch.Tensor)
+                               else prior_output)
+            meta["_qwen3_bootstrap_decode_normalized"] = True
+            return False
+        if len(all_ids) > prompt_rows and isinstance(decode, torch.Tensor) and decode.shape[0] > 0:
+            embed["prefill"] = torch.cat([prefill, decode[:1]], dim=0)
+            meta["_qwen3_bootstrap_promoted_decode_rows"] = 1
+            meta["_qwen3_bootstrap_decode_normalized"] = True
+            return True
+        return False
+
+    def _update_request_payload(
+        self, req_id: str, payload_data: dict[str, Any], *,
+        preserve_bootstrap: bool = False,
+    ) -> dict[str, Any]:
+        """Update receiver state with one chunk.
+
+        Before the first Qwen3 Talker schedule, preserve disjoint keys from the
+        initial prefill chunk while waiting for its first text embedding. Once
+        scheduled, retain the existing incremental replacement behavior so a
+        decode delta is delivered to the worker exactly once.
+        """
         if req_id not in self.request_payload:
-            self.request_payload[req_id] = payload_data
-            return payload_data
+            initial = ({key: dict(value) if isinstance(value, dict) else value
+                        for key, value in payload_data.items()}
+                       if preserve_bootstrap else payload_data)
+            self.request_payload[req_id] = initial
+            return initial
         origin = self.request_payload[req_id]
         raw_ok = payload_data.get("meta", {}).pop("override_keys", [])
         override_keys = {tuple(k) if isinstance(k, list) else k for k in raw_ok}
+
+        if preserve_bootstrap:
+            merged = {
+                key: dict(value) if isinstance(value, dict) else value
+                for key, value in origin.items()
+            }
+            for type_key, new_val in payload_data.items():
+                if not isinstance(new_val, dict):
+                    merged[type_key] = new_val
+                    continue
+                origin_sub = origin.get(type_key)
+                merged_sub = dict(merged.get(type_key, {}))
+                for qual, value in new_val.items():
+                    previous = origin_sub.get(qual) if isinstance(origin_sub, dict) else None
+                    accumulate = (type_key, qual) not in override_keys or (
+                        type_key, qual) == ("embed", "decode")
+                    if (type_key, qual) == ("meta", "finished"):
+                        accumulate = False
+                    if accumulate and isinstance(previous, torch.Tensor) and isinstance(value, torch.Tensor):
+                        value = torch.cat([previous, value], dim=0)
+                    elif accumulate and isinstance(previous, list) and isinstance(value, list):
+                        value = previous + value
+                    merged_sub[qual] = value
+                merged[type_key] = merged_sub
+            self.request_payload[req_id] = merged
+            return merged
 
         for type_key, new_val in payload_data.items():
             if not isinstance(new_val, dict):
@@ -420,6 +617,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 f"key={connector_put_key}, metadata={metadata!r}"
             )
 
+        if stage_id == 0 and stage_study.enabled():
+            stage_study.emit("text_payload_sent", stage_id=0, request_id=request.request_id,
+                             info=payload_data, chunk_id=chunk_id, size_bytes=size,
+                             **stage_study.text_ready_fields(payload_data),
+                             **stage_study.text_entity_fields(payload_data, prefix="raw_"))
+        if stage_id == 1 and small_inventory_enabled():
+            emit_inventory_event(
+                "small_hold_chunk_sent",
+                stage_id=stage_id,
+                request_id=request.request_id,
+                fields=inventory_fields(payload_data),
+                sent_chunk_id=chunk_id,
+                connector_key=connector_put_key,
+                size_bytes=size,
+            )
+
         self.put_req_chunk[external_req_id] += 1
         logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
         finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
@@ -482,6 +695,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.finished_requests.discard(request_id)
             self.get_req_chunk.pop(request_id, None)
             self.requests_with_ready_chunks.discard(request_id)
+            self._qwen3_bootstrap_published.discard(request_id)
+            self._qwen3_received_entity_rows.pop(request_id, None)
+            self._qwen3_prompt_rows.pop(request_id, None)
+            self._qwen3_entity_layout_invalid.discard(request_id)
             self.request_ids_mapping.pop(request_id, None)
             self.requests_origin_status.pop(request_id, None)
             # Receiver accumulation is keyed by the immutable upstream
@@ -678,19 +895,62 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
+        if self._qwen3_talker_conditioning_gate:
+            with self._drain_state_lock:
+                for req_data in scheduler_output.scheduled_new_reqs:
+                    self._qwen3_bootstrap_published.add(req_data.req_id)
         self._clear_chunk_ready(scheduler_output)
 
-    @staticmethod
-    def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:
+    def attach_cached_additional_information(self, scheduler_output: Any, requests: dict[str, Request]) -> None:
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if not cached_reqs:
             return
         if not hasattr(cached_reqs, "additional_information"):
             cached_reqs.additional_information = {}
         for req_id in cached_reqs.req_ids:
+            # For Qwen3 Talker, a cached request can advance through another
+            # prompt span using prior conditioning. Only a newly received
+            # connector chunk may be injected into the worker again; otherwise
+            # embed.decode would be appended to cached_decode twice.
+            if (self._qwen3_talker_conditioning_gate
+                    and req_id not in self.requests_with_ready_chunks):
+                continue
             request = requests.get(req_id) if req_id else None
             additional_info = getattr(request, "additional_information", None) if request else None
             cached_reqs.additional_information[req_id] = additional_info
+
+    def _talker_has_next_conditioning(self, request: Request) -> bool:
+        external_req_id = self.request_ids_mapping.get(request.request_id, request.request_id)
+        payload = self.request_payload.get(external_req_id)
+        finished = request.request_id in self.finished_requests
+        if not qwen3_talker_conditioning_ready(
+            payload, request.num_output_tokens, upstream_finished=finished,
+        ):
+            return False
+        if finished:
+            return True
+        if request.request_id in self._qwen3_entity_layout_invalid:
+            return False
+        prompt_rows = self._qwen3_prompt_rows.get(request.request_id)
+        if prompt_rows is None:
+            return False
+        physical_output_rows = max(
+            self._qwen3_received_entity_rows.get(request.request_id, 0)
+            - prompt_rows, 0
+        )
+        if physical_output_rows < max(int(request.num_output_tokens) + 1, 1):
+            return False
+        if request.request_id in self._qwen3_bootstrap_published:
+            return True
+        # Before the first scheduled new request, the actual first generated
+        # embedding must exist in prefill. ids.output alone is insufficient:
+        # the last prefill forward can sample a text ID one step earlier.
+        ids = payload.get("ids", {}) if isinstance(payload, dict) else {}
+        embed = payload.get("embed", {}) if isinstance(payload, dict) else {}
+        prompt = ids.get("prompt") if isinstance(ids, dict) else None
+        prefill = embed.get("prefill") if isinstance(embed, dict) else None
+        return (prompt is not None and isinstance(prefill, torch.Tensor)
+                and prefill.shape[0] > len(prompt))
 
     def _process_chunk_queue(
         self,
@@ -703,20 +963,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         for request in queue_snapshot:
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
-                    # Requests that have loaded chunk from last round
-                    # of schedule, but have not scheduled
-                    continue
+                    # A ready request can remain unscheduled while KV is busy.
+                    # Recheck at the current codec cursor: fresh data is not
+                    # permanent permission to decode.
+                    if (not self._qwen3_talker_conditioning_gate
+                            or self._talker_has_next_conditioning(request)):
+                        continue
+                    self.requests_with_ready_chunks.discard(request.request_id)
                 if request.request_id in self.finished_requests:
                     continue
-                # Requests that waiting for chunk
+                if self._qwen3_talker_conditioning_gate and self._talker_has_next_conditioning(request):
+                    # Chunked prefill may have more prompt tokens to process
+                    # with cached conditioning. Do not mark this as a fresh
+                    # connector chunk: that would re-inject embed.decode.
+                    continue
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
                 if request.request_id in finished_load_reqs:
-                    request.status = target_status
                     finished_load_reqs.remove(request.request_id)
-                    self.requests_with_ready_chunks.add(request.request_id)
-                    continue
+                    if (not self._qwen3_talker_conditioning_gate
+                            or self._talker_has_next_conditioning(request)):
+                        request.status = target_status
+                        self.requests_with_ready_chunks.add(request.request_id)
+                        continue
+                    # A chunk arrived, but the next text embedding is still
+                    # one sampled token behind. Keep polling without admitting
+                    # Talker decode or interpreting the gap as EOS.
+                    self.load_async(request)
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
             waiting_for_chunk_list.append(request)

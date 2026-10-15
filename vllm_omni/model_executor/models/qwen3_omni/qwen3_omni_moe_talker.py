@@ -156,7 +156,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         inputs_embeds: torch.Tensor | None = None,
         *,
         last_talker_hidden: torch.Tensor | None = None,
-        **_: object,
+        **sampling_kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate full RVQ codes + summed embeddings (single-loop, no KV cache).
 
@@ -208,6 +208,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 layer0_code,
                 layer0_embed,
                 last_talker_hidden,
+                **sampling_kwargs,
             )
 
             result_codes[:, :, pos : pos + 1] = pos_all_layers

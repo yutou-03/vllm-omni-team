@@ -48,6 +48,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     """Build the dict of modules to inject into sys.modules."""
     platforms_mock = mocker.MagicMock()
     platforms_mock.current_omni_platform.supports_torch_inductor.return_value = False
+    platforms_mock.current_omni_platform.is_npu.return_value = False
 
     logger_mock = mocker.MagicMock()
     logger_mock.init_logger = lambda name: mocker.MagicMock()
@@ -166,6 +167,29 @@ def _make_vllm_config(mocker: MockerFixture, max_num_seqs: int = 4):
 
 class TestCodePredictorDtypeAlignment:
     """Test that code predictor buffers match model parameter dtype."""
+
+    @pytest.mark.parametrize("sampling_mode", ["stored", "per_call"])
+    @pytest.mark.parametrize("sampling_kwargs", [{"do_sample": False}, {"temperature": 0.0}])
+    def test_explicit_greedy_never_samples(
+        self, mocker: MockerFixture, loaded_target_classes, sampling_mode, sampling_kwargs
+    ) -> None:
+        """Omni's stored mode must honor greedy settings just like TTS."""
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        predictor = code_predictor_wrapper(
+            vllm_config=_make_vllm_config(mocker, max_num_seqs=2),
+            config=cp_config,
+            talker_config=talker_config,
+        )
+        predictor._wrapper_config.sampling_mode = sampling_mode
+        predictor._wrapper_config.use_cuda_graphs = False
+        mocker.patch.object(torch, "multinomial", side_effect=AssertionError("greedy decode sampled"))
+        ids = torch.zeros(1, dtype=torch.long)
+        embeds = torch.zeros(1, talker_config.hidden_size)
+        first = predictor(ids, embeds, embeds, **sampling_kwargs)
+        torch.manual_seed(4321)
+        second = predictor(ids, embeds, embeds, **sampling_kwargs)
+        assert torch.equal(first, second)
 
     def test_ensure_buffers_uses_given_dtype(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """_ensure_buffers should create proj_buf with the given dtype."""

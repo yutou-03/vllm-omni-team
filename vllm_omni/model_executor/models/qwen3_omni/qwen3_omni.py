@@ -4,6 +4,7 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+from vllm_omni.profiling import stage_study
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
 from typing import Any
@@ -58,6 +59,13 @@ AUDIO_PAD_TOKEN_ID = 151675  # <|audio_pad|>
 
 # TTS text tokens (thinker vocabulary, for text-to-speech control)
 TTS_PAD_TOKEN_ID = 151671  # <tts_pad>
+
+
+
+class TalkerConditioningUnavailable(RuntimeError):
+    """A live Thinker has not produced the embedding needed by Talker."""
+
+
 TTS_BOS_TOKEN_ID = 151672  # <tts_text_bos>
 TTS_EOS_TOKEN_ID = 151673  # <tts_text_eod> (end of dialogue)
 TTS_BOS_SINGLE_TOKEN_ID = 151674  # <tts_text_bos_single>
@@ -112,6 +120,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Keep vllm_config for later submodule init
         self.vllm_config = vllm_config
         self.config = config
+        # Capture/warmup invoke talker_mtp without per-call kwargs. Resolve the
+        # static deployment settings here so captured and eager paths agree.
+        raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        self._subtalker_sampling_params = {
+            key: value for key, value in (raw_subtalker_sampling or {}).items() if value is not None
+        }
 
         # Initialize thinker components
         thinker_config: Qwen3OmniMoeThinkerConfig = config.thinker_config
@@ -128,6 +142,8 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         # Determine model stage
         self.model_stage = vllm_config.model_config.model_stage
+        if self.model_stage == "talker":
+            logger.info("Residual codec sampling for capture and execution: %s", self._subtalker_sampling_params)
 
         if self.model_stage == "thinker":
             # Initialize thinker model (multimodal processing + text generation)
@@ -760,9 +776,13 @@ class Qwen3OmniMoeForConditionalGeneration(
         # for profiling
         if inputs_embeds.shape[-1] == 2048:
             inputs_embeds = self.text_projection(inputs_embeds)
+        # The runner passes None for unset sampling options. Keep predictor
+        # defaults for those fields, but propagate explicit greedy settings.
+        sampling_kwargs = dict(self._subtalker_sampling_params)
+        sampling_kwargs.update({key: value for key, value in kwargs.items() if value is not None})
         with nvtx_range("talker_mtp_code_predictor"):
             code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
-                input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden
+                input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden, **sampling_kwargs
             )
         # summed_embeddings is [B, seq_len, H] (3D) while text_step is [B, H] (2D).
         # Flatten to 2D first to avoid wrong broadcasting: [B,1,H]+[B,H] → [B,B,H]
@@ -868,7 +888,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             thinker_sequences = ids_chatml
 
         speaker_id = self._get_text_spk_token_id(voice_type)
-        req_input_ids, req_embeds, trailing_text_hidden = self._thinker_to_talker_prefill(
+        req_input_ids, req_embeds, trailing_text_hidden, first_text_detail = self._thinker_to_talker_prefill(
             thinker_embed=thinker_sequence_embeds.to(self._module_device(self.talker)),
             thinker_hidden=thinker_hidden_states.to(self._module_device(self.talker)),
             multimodal_mask=None,
@@ -878,6 +898,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             tts_bos_thinker=tts_bos_thinker,
             tts_eos_thinker=tts_eos_thinker,
             tts_pad_thinker=tts_pad_thinker,
+            conditioning_payload=payload,
         )
 
         # Queue trailing_text_hidden for decode (drop first for next steps),
@@ -908,7 +929,18 @@ class Qwen3OmniMoeForConditionalGeneration(
                 update_dict.setdefault("embed", {})["tts_pad_projected"] = pad_proj.detach()
         except Exception:
             pass
-        update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
+        # The assistant bootstrap embedding is in the final prompt span.
+        # Chunked prefill can run earlier spans without consuming it.
+        if end_index >= req_input_ids.shape[0]:
+            update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
+            if stage_study.enabled():
+                first_text_real = (first_text_detail is not None
+                                   and first_text_detail["first_text_source"] == "real_prefill")
+                stage_study.text_consumed(
+                    payload, start_index=0, count=1 if first_text_real else 0,
+                    kind="output_embedding" if first_text_real else "zero_fallback",
+                    phase="prefill", **(first_text_detail or {"first_text_source": "unknown"}),
+                )
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
@@ -949,7 +981,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         tts_bos_thinker: torch.Tensor | None = None,
         tts_eos_thinker: torch.Tensor | None = None,
         tts_pad_thinker: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        conditioning_payload: OmniPayload | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any] | None]:
         """
         Project thinker outputs to talker inputs during prefill stage.
 
@@ -977,6 +1010,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         talker_input_embeds = []  # [1 t d]
         talker_input_ids = []
         trailing_text_hidden_all: torch.Tensor | None = None
+        first_text_detail: dict[str, Any] | None = None
         # For every chatml parts
         for i in range(len(im_start_indexes) - 1):
             im_start_index = im_start_indexes[i].item()
@@ -994,7 +1028,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 talker_input_ids.append(thinker_result_ids[im_start_index:segment_end_index])
             # Take assistant output (for now)
             elif (role_token == self.config.assistant_token_id).item() and i == len(im_start_indexes) - 2:
-                talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden = self._get_talker_assistant_parts(
+                talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden, first_text_detail = self._get_talker_assistant_parts(
                     im_start_index,
                     segment_end_index,
                     speaker_id,
@@ -1002,6 +1036,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     tts_pad_embed,
                     tts_bos_embed,
                     tts_eos_embed,
+                    conditioning_payload=conditioning_payload,
                 )
                 talker_input_embeds.append(talker_assistant_embeds)
                 talker_input_ids.append(talker_assistant_ids)
@@ -1019,7 +1054,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
         talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
 
-        return talker_input_id, talker_input_embed, trailing_text_hidden_all
+        return talker_input_id, talker_input_embed, trailing_text_hidden_all, first_text_detail
 
     def _thinker_decode_to_talker_decode(
         self,
@@ -1041,14 +1076,24 @@ class Qwen3OmniMoeForConditionalGeneration(
         start_index = meta.get("num_processed_tokens", 0)
         thinker_output_token_ids = ids.get("output", [])
         if start_index >= len(thinker_output_token_ids) - 1:
-            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
-            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
+            if not bool(meta.get("finished", False)):
+                raise TalkerConditioningUnavailable(
+                    f"Talker text embedding {start_index} is not ready; "
+                    "wait for another Thinker chunk before decoding."
+                )
+            # Only a terminal Thinker permits EOS after all text embeddings.
             if meta.get("eos_emitted", False):
+                stage_study.text_consumed(payload, start_index=start_index, count=0, kind="pad", phase="decode",
+                                          selected_embedding_source="pad", selected_embedding_rows=0)
                 return self.tts_pad_embed.to(device)
             update_dict.setdefault("meta", {})["eos_emitted"] = True
+            stage_study.text_consumed(payload, start_index=start_index, count=0, kind="eos", phase="decode",
+                                      selected_embedding_source="eos", selected_embedding_rows=0)
             return self.tts_eos_embed.to(device)
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
+            selected_source = "cached_decode"
+            selected_index = int(start_index)
             cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
             thinker_embed = cached_thinker_decode_embeds[start_index]
             if thinker_decode_embed is not None:
@@ -1056,11 +1101,25 @@ class Qwen3OmniMoeForConditionalGeneration(
                 cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
                 update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
         else:
+            if (not isinstance(thinker_decode_embed, torch.Tensor)
+                    or thinker_decode_embed.ndim != 2
+                    or thinker_decode_embed.shape[0] != 1):
+                raise TalkerConditioningUnavailable(
+                    f"Talker text embedding {start_index} has no single fresh forward row."
+                )
+            selected_source = "fresh_decode"
+            selected_index = 0
             thinker_embed = thinker_decode_embed
             if thinker_embed.device != device:
                 thinker_embed = thinker_embed.to(device)
         update_dict.setdefault("embed", {})["decode"] = None
-        return self.talker.text_projection(thinker_embed).to(device)
+        projected = self.talker.text_projection(thinker_embed).to(device)
+        stage_study.text_consumed(
+            payload, start_index=start_index, count=1, kind="output_embedding",
+            phase="decode", selected_embedding_source=selected_source,
+            selected_embedding_tensor_index=selected_index, selected_embedding_rows=1,
+        )
+        return projected
 
     def talker_preprocess_decode(
         self, input_ids: torch.Tensor, input_embeds: torch.Tensor, update_dict: OmniPayload, payload: OmniPayload
@@ -1096,6 +1155,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                     device=input_embeds.device,
                     dtype=input_embeds.dtype,
                 )
+        except TalkerConditioningUnavailable:
+            raise
         except Exception as e:
             logger.error(f"Error in decode: {e}")
 
@@ -1147,12 +1208,27 @@ class Qwen3OmniMoeForConditionalGeneration(
         return user_talker_part
 
     def _get_talker_assistant_parts(
-        self, im_start_index, segment_end_index, speaker_id, thinker_embed, tts_pad_embed, tts_bos_embed, tts_eos_embed
+        self, im_start_index, segment_end_index, speaker_id, thinker_embed, tts_pad_embed, tts_bos_embed, tts_eos_embed,
+        conditioning_payload: OmniPayload | None = None,
     ):
         assistant_hidden = self.talker.text_projection(thinker_embed[im_start_index:segment_end_index]).to(
             tts_pad_embed.device
         )  # [t, d]
 
+        first_text_real = assistant_hidden.shape[0] > 3
+        if not first_text_real and conditioning_payload is not None:
+            meta = conditioning_payload.get("meta", {})
+            if (self.vllm_config.model_config.async_chunk
+                    and not bool(meta.get("finished", False))):
+                raise TalkerConditioningUnavailable(
+                    "Talker first text embedding is absent from prefill; "
+                    "wait for a Thinker forward row before scheduling."
+                )
+        first_text_detail = {
+            "first_text_source": "real_prefill" if first_text_real else "zero_fallback",
+            "assistant_hidden_rows": int(assistant_hidden.shape[0]),
+            "first_text_prefill_index": int(im_start_index) + 3,
+        }
         # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens
         assistant_text_hidden = torch.cat(
             (
@@ -1211,7 +1287,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             dtype=torch.long,
             device=assistant_text_hidden.device,
         )
-        return input_embeds, input_ids, trailing_text_hidden
+        return input_embeds, input_ids, trailing_text_hidden, first_text_detail
 
     def _talker_to_code_predictor(
         self,

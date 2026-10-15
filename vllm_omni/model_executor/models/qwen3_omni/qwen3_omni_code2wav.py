@@ -10,6 +10,7 @@ from collections.abc import Iterable
 import numpy as np
 import torch
 import torch.nn as nn
+from vllm import envs
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeCode2WavConfig,
 )
@@ -194,7 +195,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         # Stage 1: Code Embedding
         # Add offset to separate layer vocabularies, then embed and average
         with nvtx_range(f"code2wav:code_embedding:{shape_suffix}", color="magenta"):
-            hidden = self.code_embedding(codes + self.code_offset).mean(1)
+            hidden = self.code_embedding(codes + self.code_offset)
+            # Batch-invariant mean accumulates and returns FP32. Restore the
+            # embedding dtype expected by the pre-transformer's linear layers,
+            # matching native mean's output dtype without changing accumulation.
+            hidden = hidden.mean(1).to(dtype=hidden.dtype)
         # Shape: [batch, seq_len, hidden_size]
 
         # Stage 2: Pre-Transformer (add temporal context)
@@ -335,6 +340,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 "defaulting to left_context_size=zeros(len=codes.shape[0])."
             )
             left_context_size = [0] * codes.shape[0]
+        if envs.VLLM_BATCH_INVARIANT and seq_token_counts is not None:
+            return self._chunked_decode_exact_lengths(codes, left_context_size, seq_token_counts)
         # Decode chunk
         wavs = []
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
@@ -356,6 +363,39 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 ]
                 wavs.append(wav_chunk)
         return wavs
+
+    def _chunked_decode_exact_lengths(
+        self, codes: torch.Tensor, left_context_size: list[int], seq_token_counts: list[int]
+    ) -> list[torch.Tensor]:
+        """Keep temporal padding out of the batch-invariant streaming path.
+
+        Decoding padded RVQ frames changes both the native waveform length and
+        its valid prefix. Cropping the padded waveform afterwards cannot undo
+        that change. Even equal-length batches can change BF16 waveforms for
+        some code values, so this opt-in diagnostic path also fixes batch=1.
+        """
+        if len(seq_token_counts) != codes.shape[0] or len(left_context_size) != codes.shape[0]:
+            raise ValueError("Streaming metadata must contain one entry per request")
+        lengths = []
+        for index, count in enumerate(seq_token_counts):
+            length, remainder = divmod(count, self.config.num_quantizers)
+            if remainder or not 0 < length <= codes.shape[-1]:
+                raise ValueError("Invalid per-request streaming codec count")
+            if not 0 <= left_context_size[index] <= length:
+                raise ValueError("Invalid per-request streaming left context")
+            lengths.append(length)
+        outputs = []
+        for index, length in enumerate(lengths):
+            batch = codes[index : index + 1, :, :length].contiguous()
+            wrapper = self._cudagraph_wrapper
+            # The graph wrapper otherwise pads to its next capture bucket.
+            # Exact captures are safe; unmatched lengths use native forward.
+            if self._cudagraph_enabled and wrapper is not None and length in wrapper.graphs:
+                waveforms = wrapper.decode(batch)
+            else:
+                waveforms = self(batch)
+            outputs.append(waveforms[0, :, left_context_size[index] * self.total_upsample :])
+        return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""

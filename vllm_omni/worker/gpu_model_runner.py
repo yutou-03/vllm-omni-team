@@ -26,6 +26,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.profiling.nvtx import nvtx_range
+from vllm_omni.profiling import conditioning_audit, stage_study
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1235,6 +1236,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ):
         """Align with v0.14.0 preprocess and omni's additional information handling."""
+        stage_study.gpu_memory(self, torch, point="before_preprocess")
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -1249,7 +1251,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
+                study_encoder_ids = (
+                    list(scheduler_output.scheduled_encoder_inputs)
+                    if stage_study.enabled() else []
+                )
+                if study_encoder_ids:
+                    stage_study.gpu_memory(self, torch, point="before_encoder", force=True,
+                                           encoder_request_ids=study_encoder_ids)
                 self._execute_mm_encoder(scheduler_output)
+                if study_encoder_ids:
+                    stage_study.gpu_memory(self, torch, point="after_encoder", force=True,
+                                           encoder_request_ids=study_encoder_ids)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -1374,6 +1386,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 phase = "decode" if span_len == 1 else "prefill"
                 stage_id = getattr(self.model_config, "stage_id", "?")
+                audit_index = conditioning_audit.before_preprocess(
+                    stage_id, req_id, req_infos, input_ids[s:e], span_len
+                )
                 with nvtx_range(
                     f"s{stage_id}_talker_preprocess_{phase}:"
                     f"req={str(req_id)[-8:]}:tokens={span_len}"
@@ -1381,6 +1396,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     req_input_ids, req_embeds, update_dict = self.model.preprocess(
                         input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
                     )
+                conditioning_audit.after_preprocess(req_id, audit_index, req_input_ids, req_embeds, update_dict)
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (input_ids.shape[0], req_embeds.shape[-1]),
@@ -1490,6 +1506,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                 text_step,
                 **talker_kwargs,
             )
+        conditioning_audit.after_mtp(
+            decode_req_ids, req_input_ids, code_predictor_codes, req_embeds, talker_kwargs,
+            num_tokens_padded, isinstance(self.talker_mtp, CUDAGraphWrapper),
+        )
         # update the inputs_embeds and code_predictor_codes
         out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
         if not isinstance(out_key, tuple) or len(out_key) != 2:

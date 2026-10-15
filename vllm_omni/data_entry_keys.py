@@ -105,6 +105,16 @@ class OmniPayloadMeta(TypedDict, total=False):
     omni_recovery_target_num_computed_tokens: int
     omni_recovery_preemption_cause: str
     omni_controlled_rule_id: str
+    # Observations only; populated by the opt-in single-hold pilot.
+    small_hold_chunk_id: int
+    small_hold_connector_request_id: str
+    small_hold_logical_request_id: str
+    small_hold_codec_total_frames: int
+    small_hold_codec_payload_frames: int
+    small_hold_left_context_frames: int
+    small_hold_new_frames: int
+    small_hold_raw_codec_shape: list[int]
+    small_hold_stream_finished: bool
 
 
 class OmniPayload(TypedDict, total=False):
