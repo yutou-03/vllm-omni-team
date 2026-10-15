@@ -1,4 +1,4 @@
-"""Opt-in Stage 1 experiment: one bounded, KV-preserving hold per request.
+"""Opt-in synchronous, KV-preserving hold for a stage-local experiment.
 
 Set ``VLLM_OMNI_SMALL_HOLD_PROBE=1`` on a synchronous OmniARScheduler.
 Call ``scheduler.request_hold(request_id, duration_s, reason, evidence)`` from
@@ -15,9 +15,10 @@ a JSON file read at scheduler initialization::
 
 ``*`` selects the first eligible request, once for the entire scheduler;
 otherwise request_id must match the physical scheduler ID exactly. The
-minimum output count is checked only at a confirmed decode boundary. A hold
-expires by its monotonic deadline; the first subsequent scheduling time can
-be later because an executing batch is not interrupted. Events named
+minimum output count is checked only at a confirmed decode boundary. A hold is checked against its monotonic deadline at the next scheduling
+boundary; synchronous execution cannot be interrupted at the deadline.
+The buffer-policy mode limits the next slice to resident decode work and
+stops further holds after a large deadline overrun. Events named
 ``small_hold_requested``, ``small_hold_released`` and
 ``small_hold_first_rescheduled`` expose these separate times.
 
@@ -43,16 +44,20 @@ from typing import Any
 HOLD_ENV = "VLLM_OMNI_SMALL_HOLD_PROBE"
 CONTROL_FILE_ENV = "VLLM_OMNI_SMALL_HOLD_CONTROL_FILE"
 CONTROLLER_ENV = "VLLM_OMNI_SMALL_HOLD_CONTROLLER"
-MAX_HOLD_S = 0.05
+MAX_HOLD_S = 0.10
 MAX_RESIDENT_REQUESTS = 64
+# Keep held scheduling slices to resident decode work. A large multimodal
+# prefill previously delayed a 50 ms hold check by almost four seconds.
+MAX_HELD_STEP_TOKENS = 64
+MAX_DEADLINE_LATENESS_S = 0.05
 
 
 def _duration(value: Any) -> float:
     if isinstance(value, bool):
-        raise ValueError("hold duration_s must be in (0, 0.05]")
+        raise ValueError("hold duration_s must be in (0, 0.10]")
     duration = float(value)
     if not math.isfinite(duration) or not 0 < duration <= MAX_HOLD_S:
-        raise ValueError("hold duration_s must be in (0, 0.05]")
+        raise ValueError("hold duration_s must be in (0, 0.10]")
     return duration
 
 
@@ -88,6 +93,7 @@ class SmallHoldProbe:
         environment = os.environ if environ is None else environ
         self.stage_id = int(scheduler._omni_stage_id_for_trace())
         self.buffer_policy_mode = environment.get("VLLM_OMNI_STAGE_BUFFER_POLICY", "0") == "1"
+        self.buffer_policy_suspended = False
         self.enabled = (
             environment.get(HOLD_ENV, "0") == "1"
             and self.stage_id in ({0, 1} if self.buffer_policy_mode else {1})
@@ -148,7 +154,7 @@ class SmallHoldProbe:
         if type(scheduler).__name__ != "OmniARScheduler" or getattr(
             scheduler.scheduler_config, "async_scheduling", False
         ):
-            raise ValueError("small hold requires synchronous OmniARScheduler on Stage 1")
+            raise ValueError("small hold requires synchronous OmniARScheduler")
         if getattr(scheduler, "num_spec_tokens", 0) or getattr(scheduler, "use_pp", False):
             raise ValueError("small hold requires no speculative decoding or pipeline parallelism")
         if not 1 <= scheduler.max_num_running_reqs <= MAX_RESIDENT_REQUESTS:
@@ -217,8 +223,14 @@ class SmallHoldProbe:
         duration = _duration(duration_s)
         evidence_copy = self._validate_evidence(reason, evidence)
         request = self.scheduler.requests.get(request_id)
+        peers = [item for item in self.scheduler.running
+                 if item is not request and item.request_id not in self.holds]
         if (
             request is None
+            or (self.buffer_policy_mode and self.buffer_policy_suspended)
+            or (self.buffer_policy_mode and (
+                not peers or any(not self._at_decode_boundary(item) for item in peers)
+            ))
             or request_id in self.holds
             or (not self.buffer_policy_mode and request_id in self.accepted_request_ids)
             or not any(item is request for item in self.scheduler.running)
@@ -270,6 +282,16 @@ class SmallHoldProbe:
             return
         scheduler = self.scheduler
         now = self.clock()
+        if self.buffer_policy_mode:
+            # A resident peer can receive another input chunk after a hold was
+            # accepted. Do not keep the victim held while that peer prefills.
+            peers = [request for request in scheduler.running
+                     if request.request_id not in self.holds]
+            if not peers or any(not self._at_decode_boundary(request) for request in peers):
+                for request_id, hold in list(self.holds.items()):
+                    if hold.released_monotonic_s is None:
+                        self.release_hold(request_id, "resident_left_decode")
+                now = self.clock()
         held_ids: set[str] = set()
         for request_id, hold in list(self.holds.items()):
             if scheduler.requests.get(request_id) is not hold.request or not _running(hold.request):
@@ -281,7 +303,17 @@ class SmallHoldProbe:
                 continue
             if now >= hold.deadline_monotonic_s:
                 hold.released_monotonic_s = now
-                self._event("small_hold_released", request_id, hold)
+                lateness = max(0.0, now - hold.deadline_monotonic_s)
+                self._event("small_hold_released", request_id, hold,
+                            deadline_lateness_s=lateness)
+                if (self.buffer_policy_mode and lateness > MAX_DEADLINE_LATENESS_S
+                        and not self.buffer_policy_suspended):
+                    # Synchronous execution cannot interrupt an in-flight GPU
+                    # batch. Stop issuing new holds after a large miss.
+                    self.buffer_policy_suspended = True
+                    self.emit("stage_buffer_policy_suspended", stage_id=self.stage_id,
+                              request_id=request_id, deadline_lateness_s=lateness,
+                              reason="hold_deadline_overrun")
             else:
                 held_ids.add(request_id)
         original_running = list(scheduler.running)
@@ -290,6 +322,7 @@ class SmallHoldProbe:
             yield
             return
         original_cap = scheduler.max_num_running_reqs
+        original_token_budget = scheduler.max_num_scheduled_tokens
         resident = self._resident_fields()
         if resident["resident_count"] > min(original_cap, MAX_RESIDENT_REQUESTS):
             raise RuntimeError("small hold resident count exceeds configured cap")
@@ -299,12 +332,19 @@ class SmallHoldProbe:
             original_cap - len(held) - resident["input_blocked_resident_count"]
         )
         scheduler.running[:] = [request for request in original_running if request.request_id not in held_ids]
+        if self.buffer_policy_mode:
+            # Waiting prefills cannot turn a hold into a long model step.
+            scheduler.max_num_running_reqs = min(
+                scheduler.max_num_running_reqs, len(scheduler.running))
+            scheduler.max_num_scheduled_tokens = min(
+                original_token_budget, MAX_HELD_STEP_TOKENS)
         for request in held:
             self.holds[request.request_id].held_schedule_steps += 1
         try:
             yield
         finally:
             scheduler.max_num_running_reqs = original_cap
+            scheduler.max_num_scheduled_tokens = original_token_budget
             current = {request.request_id: request for request in scheduler.running}
             for request in held:
                 if scheduler.requests.get(request.request_id) is request and _running(request):

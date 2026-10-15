@@ -232,7 +232,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def request_hold(
         self, request_id: str, duration_s: float, reason: str, evidence: dict[str, Any]
     ) -> bool:
-        """Request one bounded Stage 1 hold from the scheduler thread."""
+        """Request one bounded stage-local hold from the scheduler thread."""
         return self._small_hold_probe.request_hold(request_id, duration_s, reason, evidence)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:

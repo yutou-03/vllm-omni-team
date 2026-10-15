@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "policy": "receiver-ready Q/c hold budget; decode-only held slices; stop after deadline overrun",
+  "stages": {
+    "0": {
+      "calibration_rate_units_s": 28.85168365507421,
+      "minimum_resume_guard_s": 0.05,
+      "resume_below_s": 0.15,
+      "pause_above_s": 0.17
+    },
+    "1": {
+      "calibration_rate_units_s": 1760.787028188967,
+      "minimum_resume_guard_s": 0.02,
+      "resume_below_s": 0.03,
+      "pause_above_s": 0.05
+    }
+  },
+  "max_hold_s": 0.1,
+  "cooldown_s": 0.05,
+  "margin_s": 0.01,
+  "no_action_log_interval_s": 0.25,
+  "calibration": "1.1 times maximum per-request reference consumer rate in frozen 20261011 baseline; runtime max with per-request online p95",
+  "runtime_guard": "max(minimum, p95 of last 64 consecutive busy scheduling tick intervals); hold budget = min(max_hold, ready_Q/c - low - margin)",
+  "scope": "separate Stage0/Stage1; receiver-ready inventory capped by published inventory; no client playback credit",
+  "performance_claim": false,
+  "min_hold_s": 0.01,
+  "deadline_limit": "100 ms requested hold cap; synchronous GPU work is non-interruptible; held slices admit resident decode only and suspend policy after more than 50 ms of deadline lateness"
+}
