@@ -578,7 +578,10 @@ class SmallHoldProbe:
             if urgent_id in scheduled_ids and victim_id in self._last_held_ids:
                 self.emit("urgent_keep_admitted", stage_id=self.stage_id,
                           urgent_request_id=urgent_id, victim_request_id=victim_id,
-                          num_scheduled_tokens=scheduler_output.num_scheduled_tokens[urgent_id])
+                          victim_kv_block_ids=self.scheduler.kv_cache_manager.get_block_ids(victim_id),
+                          urgent_kv_block_ids=self.scheduler.kv_cache_manager.get_block_ids(urgent_id),
+                          num_scheduled_tokens=scheduler_output.num_scheduled_tokens[urgent_id],
+                          **self._resident_fields())
                 self._urgent_pending.pop(victim_id, None)
                 self._urgent_pending_logged.discard(victim_id)
             elif victim_id not in self.holds or victim_id in scheduled_ids:

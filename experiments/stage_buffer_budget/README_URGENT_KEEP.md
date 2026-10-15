@@ -26,4 +26,6 @@ python3 experiments/stage_buffer_budget/make_urgent_keep_smoke.py \
   --output /tmp/urgent_keep_stage0_smoke.jsonl
 ```
 
-该测试使用 Stage 0 的 K=1 配置、背景请求 120 s SLO、10 s 后到达的请求 9 s SLO；紧急请求较紧的 SLO 是预先声明的正确性触发条件。正式 Stage 1 实验需至少填满其 K=2 个执行名额，并使用另行冻结的外生工作负载。
+该测试使用 Stage 0 的 K=1 配置、背景请求 120 s SLO、3 s 后到达的请求 9 s SLO；紧急请求较紧的 SLO 是预先声明的正确性触发条件。正式 Stage 1 实验需至少填满其 K=2 个执行名额，并使用另行冻结的外生工作负载。
+
+首轮 GPU 标定显示原先第 10 秒到达太晚：背景 Thinker 约第 6 秒结束；现将默认到达改为第 3 秒，以检查同阶段重叠。也可用 `--lead-index 4 --background-delay-s 6 --urgent-delay-s 9` 生成三请求序列以检查下游积压是否自然出现。两种设置在 2026-10-15 烟测中均未满足接收端安全库存门槛，详见 [VALIDATION_20261015.md](VALIDATION_20261015.md)。

@@ -259,7 +259,10 @@ class UrgentKeepTests(unittest.TestCase):
             scheduler.running.append(urgent)
             blocks['urgent'] = [51]
         probe.record_scheduled(SimpleNamespace(num_scheduled_tokens={'urgent': 1}))
-        self.assertEqual([e['event'] for e in events].count('urgent_keep_admitted'), 1)
+        admitted = [e for e in events if e['event'] == 'urgent_keep_admitted']
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(admitted[0]['victim_kv_block_ids'], [[31, 32]])
+        self.assertEqual(admitted[0]['urgent_kv_block_ids'], [[51]])
         self.assertIn('victim', probe.holds)
         clock.now = 100.06
         with probe.scheduling_context():
@@ -307,6 +310,20 @@ class UrgentKeepTests(unittest.TestCase):
         c._try_urgent_keep(scheduler, clock.now, .05)
         self.assertEqual(c.reasons['no_eligible_victim'], 1)
         self.assertFalse(probe.holds)
+
+    def test_no_eligible_victim_reports_guard_reason(self):
+        scheduler, _probe, c, clock, _events, _blocks, _victim, _urgent = urgent_setup()
+        records = []
+        c.record = lambda rid, now, reason, fields, **extra: records.append((reason, extra))
+        c.fields = lambda rid, now, guard: dict(
+            coverage_s=0., high_s=.17, requested_hold_s=0., low_s=.15,
+            inventory_units=12, receiver_ready_inventory_units=0)
+        c._try_urgent_keep(scheduler, clock.now, .05)
+        reason, detail = records[-1]
+        self.assertEqual(reason, 'no_eligible_victim')
+        self.assertEqual(detail['rejection_counts'],
+                         {'insufficient_downstream_coverage': 1})
+        self.assertEqual(detail['rejection_example']['receiver_ready_inventory_units'], 0)
 
     def test_large_deadline_miss_stops_further_urgent_holds(self):
         scheduler, probe, c, clock, events, _blocks, _victim, _urgent = urgent_setup()

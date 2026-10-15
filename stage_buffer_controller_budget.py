@@ -232,20 +232,45 @@ class Controller:
                         urgent_request_id=urgent.request_id, resident_count=resident)
             return
         eligible = []
+        rejection_counts = defaultdict(int)
+        rejection_example = None
         for request in active:
             rid = request.request_id
-            if rid in probe.accepted_request_ids or not probe._at_decode_boundary(request):
-                continue
+            decode_boundary = probe._at_decode_boundary(request)
             fields = self.fields(rid, now, guard)
-            if (fields['coverage_s'] is None or fields['coverage_s'] < fields['high_s']
-                    or fields['requested_hold_s'] < self.config['min_hold_s']
-                    or now - self.last_end.get(rid, 0.) < self.config['cooldown_s']):
+            if rid in probe.accepted_request_ids:
+                rejection = 'already_held_once'
+            elif not decode_boundary:
+                rejection = 'not_decode_boundary'
+            elif fields['coverage_s'] is None:
+                rejection = 'inventory_unavailable'
+            elif fields['coverage_s'] < fields['high_s']:
+                rejection = 'insufficient_downstream_coverage'
+            elif fields['requested_hold_s'] < self.config['min_hold_s']:
+                rejection = 'insufficient_hold_budget'
+            elif now - self.last_end.get(rid, 0.) < self.config['cooldown_s']:
+                rejection = 'cooldown'
+            else:
+                rejection = None
+            if rejection is not None:
+                rejection_counts[rejection] += 1
+                if rejection_example is None:
+                    rejection_example = dict(victim_request_id=str(rid),
+                        rejection_reason=rejection, decode_boundary=decode_boundary,
+                        inventory_units=fields.get('inventory_units'),
+                        receiver_ready_inventory_units=fields.get('receiver_ready_inventory_units'),
+                        coverage_s=fields['coverage_s'], high_s=fields['high_s'],
+                        requested_hold_s=fields['requested_hold_s'],
+                        num_output_tokens=request.num_output_tokens)
                 continue
             deadline, _ = scheduler._slo_stage_fields(request)
             eligible.append((deadline, str(rid), request, fields))
         if not eligible:
             self.record(urgent.request_id, now, 'no_eligible_victim', {},
-                        urgent_request_id=urgent.request_id)
+                        urgent_request_id=urgent.request_id,
+                        active_victims_considered=len(active),
+                        rejection_counts=dict(rejection_counts),
+                        rejection_example=rejection_example)
             return
         victim_deadline, _, victim, fields = max(eligible)
         if urgent_deadline >= victim_deadline:
