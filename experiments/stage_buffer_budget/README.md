@@ -23,3 +23,7 @@ CPU 检查：`python3 experiments/stage_buffer_budget/verify_budget_policy_cpu.p
 ## 2026-10-15 申请上限试验
 
 根据用户要求，新策略将每次申请上限从原 50 ms 放宽至 100 ms；库存预算仍可申请更短时间，预算不足 10 ms 不暂停。原语硬上限同步改为 100 ms。上一次误将上限收紧至 20 ms 的中间改动已撤回；超期停用阈值恢复为晚到 50 ms。申请上限与检查是否晚到是两个独立参数。放宽上限不能中断正在运行的 GPU 批次，无法单独解决曾出现的约 4 秒调度空窗。旧 `mixed_high` 的 Stage 0 申请中位数 50 ms，实际释放中位数约 58.3 ms、P95 约 82.1 ms、最大约 4 秒；100 ms 是对照实验起点，尚无新策略 GPU 实测。
+
+## 版本管理
+
+代码、实验分支及提交对应关系见 [VERSIONING.md](VERSIONING.md)。新运行以固定工作树的完整 Git commit 和配置 hash 记录版本。
