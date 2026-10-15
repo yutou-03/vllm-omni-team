@@ -16,6 +16,8 @@ import regex as re
 #  alternatives like msgpack or pydantic that are already in use in vLLM. Only
 #  add to this list if absolutely necessary and after careful security review.
 ALLOWED_FILES = {
+    # IPC storage regression: only loads bytes generated in-process from test tensors.
+    "tests/utils/test_tensor_storage.py",
     "tests/helpers/process.py",
     "vllm_omni/diffusion/distributed/group_coordinator.py",
     "tests/diffusion/attention/test_attention_sp.py",

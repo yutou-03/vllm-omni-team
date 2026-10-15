@@ -45,6 +45,7 @@ from vllm_omni.profiling import conditioning_audit
 from vllm_omni.profiling.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.profiling.stage_queue_trace import emit_stage_event, stage_trace_span
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.tensor_storage import compact_cpu_tensor_storage
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -1065,7 +1066,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # _total = len(_pkl.dumps(flatten_payload(payload)))                                                                                                                                                                   
                 # logger.warning("[Rank-%s] req=%s pooler_payload: %s | total_pickle=%sKB",                                                                                                                                            
                 #                 getattr(self, 'rank', '?'), rid, _payload_info, _total // 1024)
-                pooler_output.append(flatten_payload(payload))
+                # CPU slices may still reference the full batch storage.
+                pooler_output.append(compact_cpu_tensor_storage(flatten_payload(payload)))
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
