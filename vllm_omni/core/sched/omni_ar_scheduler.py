@@ -692,6 +692,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         nvtx_mark("omni_ar:schedule_start")
         iteration_id = self._omni_next_iteration_id()
         stage_id = self._omni_stage_id_for_trace()
+        schedule_start_monotonic = monotonic()
         schedule_start = time()
         num_running_before = len(self.running)
         num_waiting_before = len(self.waiting)
@@ -768,6 +769,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 iteration_id=iteration_id,
                 timestamp_start=schedule_start,
                 timestamp_end=time(),
+                monotonic_start=schedule_start_monotonic,
+                monotonic_end=monotonic(),
                 num_running_before=num_running_before,
                 num_waiting_before=num_waiting_before,
             )

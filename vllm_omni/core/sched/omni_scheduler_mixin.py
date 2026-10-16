@@ -1661,6 +1661,8 @@ class OmniSchedulerMixin:
         timestamp_end: float,
         num_running_before: int,
         num_waiting_before: int,
+        monotonic_start: float | None = None,
+        monotonic_end: float | None = None,
     ) -> None:
         stage_id = self._omni_stage_id_for_trace()
         schedule_duration_ms = (timestamp_end - timestamp_start) * 1000.0
@@ -1848,6 +1850,11 @@ class OmniSchedulerMixin:
             iteration_id=iteration_id,
             timestamp_start=timestamp_start,
             timestamp_end=timestamp_end,
+            **({
+                "schedule_monotonic_start_s": monotonic_start,
+                "schedule_monotonic_end_s": monotonic_end,
+                "schedule_duration_monotonic_ms": (monotonic_end - monotonic_start) * 1000.0,
+            } if monotonic_start is not None and monotonic_end is not None else {}),
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_running_reqs_before=num_running_before,

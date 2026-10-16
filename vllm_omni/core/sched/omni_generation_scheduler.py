@@ -203,6 +203,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self._pause_state == PauseState.PAUSED_ALL:
             token_budget = 0
         iteration_id = self._omni_next_iteration_id()
+        schedule_start_monotonic = time.monotonic()
         schedule_start = time.time()
         num_running_before = len(self.running)
         num_waiting_before = len(self.waiting)
@@ -396,6 +397,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     iteration_id=iteration_id,
                     timestamp_start=schedule_start,
                     timestamp_end=time.time(),
+                    monotonic_start=schedule_start_monotonic,
+                    monotonic_end=time.monotonic(),
                     num_running_before=num_running_before,
                     num_waiting_before=num_waiting_before,
                 )
@@ -485,6 +488,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             iteration_id=iteration_id,
             timestamp_start=schedule_start,
             timestamp_end=time.time(),
+            monotonic_start=schedule_start_monotonic,
+            monotonic_end=time.monotonic(),
             num_running_before=num_running_before,
             num_waiting_before=num_waiting_before,
         )
