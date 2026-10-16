@@ -2,7 +2,7 @@
 """Measure consecutive schedule() start gaps from a real mixed_pressure replay.
 
 The interval includes scheduling, model execution, output handling and waiting;
-it is not GPU kernel time. The separate schedule_ms measures schedule() itself.
+it is not GPU kernel time. The separate prefix field ends before trace emission and schedule() return.
 """
 from __future__ import annotations
 
@@ -36,7 +36,8 @@ def read_iterations(path: Path) -> dict[str, list[dict]]:
             'start': float(event['schedule_monotonic_start_s']),
             'end': float(event['schedule_monotonic_end_s']),
             'iteration_id': event.get('iteration_id'),
-            'schedule_ms': float(event['schedule_duration_monotonic_ms']),
+            'schedule_prefix_ms': float(event.get('schedule_prefix_monotonic_ms',
+                                                   event.get('schedule_duration_monotonic_ms'))),
             'batch_tokens': int(event.get('batch_num_tokens') or 0),
             'batch_seqs': int(event.get('batch_num_seqs') or 0),
             'running_before': int(event.get('num_running_reqs_before') or 0),
@@ -162,8 +163,8 @@ def main() -> None:
                 'interval_ms': interval_ms,
                 'phase': 'injection' if start < injection_end else 'drain',
                 'iteration_id': current['iteration_id'],
-                'schedule_ms': current['schedule_ms'],
-                'post_schedule_to_next_start_ms': max(0.0, (following['start'] - current['end']) * 1000),
+                'schedule_prefix_ms': current['schedule_prefix_ms'],
+                'after_probe_to_next_start_ms': max(0.0, (following['start'] - current['end']) * 1000),
                 'batch_tokens': current['batch_tokens'],
                 'batch_seqs': current['batch_seqs'],
                 'running_before': current['running_before'],
@@ -190,8 +191,8 @@ def main() -> None:
                 summary_rows.append({'stage_id': stage, 'phase': phase,
                                      'population': population,
                                      **summarize([row['interval_ms'] for row in subset]),
-                                     'schedule_p50_ms': quantile([row['schedule_ms'] for row in subset], .5),
-                                     'schedule_p99_ms': quantile([row['schedule_ms'] for row in subset], .99)})
+                                     'schedule_prefix_p50_ms': quantile([row['schedule_prefix_ms'] for row in subset], .5),
+                                     'schedule_prefix_p99_ms': quantile([row['schedule_prefix_ms'] for row in subset], .99)})
     write_csv(output_dir / 'iteration_summary.csv', summary_rows, list(summary_rows[0]))
     tail = []
     for stage in sorted({row['stage_id'] for row in rows}, key=int):
@@ -212,6 +213,7 @@ def main() -> None:
         'trace_audit': audit,
         'metric_definition': 'monotonic difference between consecutive schedule() starts on the same stage; includes execution, output handling and waiting',
         'quantile_method': 'linear interpolation of sorted per-iteration values',
+        'prefix_definition': 'start of schedule() to the trace call inside schedule(); excludes trace emission, remaining scheduler work and model execution',
     }
     (output_dir / 'analysis_manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps({'output_dir': str(output_dir), 'trace_audit': audit,

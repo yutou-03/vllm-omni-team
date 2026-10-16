@@ -1853,7 +1853,7 @@ class OmniSchedulerMixin:
             **({
                 "schedule_monotonic_start_s": monotonic_start,
                 "schedule_monotonic_end_s": monotonic_end,
-                "schedule_duration_monotonic_ms": (monotonic_end - monotonic_start) * 1000.0,
+                "schedule_prefix_monotonic_ms": (monotonic_end - monotonic_start) * 1000.0,
             } if monotonic_start is not None and monotonic_end is not None else {}),
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
