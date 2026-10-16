@@ -14,7 +14,7 @@ python3 /home/zhongyu/research_reports/servegen_active_buffer_20261012/launch_se
   --extra-env-file /home/zhongyu/project/vllm-omni-buffer/experiments/stage_buffer_budget/env_urgent_keep_stage1.json
 ```
 
-须在新 run manifest 中保存完整 Git commit、配置 hash、负载 hash 和实际调度事件。`small_hold_requested` 是申请；只有 `urgent_keep_admitted` 且 victim 未在同轮执行，才证明新请求利用了空位。`small_hold_first_rescheduled` 才是 victim 真正恢复。`urgent_keep_admission_pending` 表示未实际入批，不能算成功。超时的 hold 只在下次同步调度边界检查，100 ms 是申请上限，不保证实际暂停墙钟时间。
+须在新 run manifest 中保存完整 Git commit、配置 hash、负载 hash 和实际调度事件。`small_hold_requested` 是申请；只有 `urgent_keep_admitted` 且 victim 未在同轮执行，才证明新请求利用了空位。`small_hold_first_rescheduled` 才是 victim 真正恢复。`urgent_keep_admission_pending` 表示未实际入批，不能算成功。超时的 hold 只在下次同步调度边界检查，100 ms 是申请上限，不保证实际暂停墙钟时间。 暂停期间不再覆盖单轮 token 预算；Stage 0/1 保持原配置 32,768，紧急请求 prefill 可能延后下次检查。
 
 启动前 CPU 检查：`python3 experiments/stage_buffer_budget/verify_budget_policy_cpu.py`。正式评价必须另做实际两请求/多请求运行、KV 块归属对账及 FCFS 成对对照。此文档不是性能结论。
 

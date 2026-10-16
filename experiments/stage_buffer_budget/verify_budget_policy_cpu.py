@@ -36,7 +36,7 @@ class OmniARScheduler:
         self._omni_stage_id_for_trace = lambda: stage
         self.scheduler_config = SimpleNamespace(async_scheduling=False)
         self.max_num_running_reqs = 64
-        self.max_num_scheduled_tokens = 128
+        self.max_num_scheduled_tokens = 32768
         self.num_spec_tokens = 0
         self.use_pp = False
         self.running = list(requests)
@@ -89,17 +89,17 @@ def controller(stage=0):
 
 
 class BudgetPolicyTests(unittest.TestCase):
-    def test_held_slice_blocks_new_prefill_and_caps_work(self):
+    def test_held_slice_blocks_new_prefill_and_preserves_token_budget(self):
         scheduler, p, clock, events = probe([request('victim'), request('peer')])
         scheduler.waiting.append(request('large_prefill', decode=False))
         self.assertTrue(p.request_hold('victim', .05, 'budget', {}))
         with p.scheduling_context():
             self.assertEqual([r.request_id for r in scheduler.running], ['peer'])
             self.assertEqual(scheduler.max_num_running_reqs, 1)
-            self.assertEqual(scheduler.max_num_scheduled_tokens, 64)
+            self.assertEqual(scheduler.max_num_scheduled_tokens, 32768)
             self.assertEqual(len(scheduler.waiting), 1)
         self.assertEqual(scheduler.max_num_running_reqs, 64)
-        self.assertEqual(scheduler.max_num_scheduled_tokens, 128)
+        self.assertEqual(scheduler.max_num_scheduled_tokens, 32768)
         self.assertEqual([r.request_id for r in scheduler.running], ['victim', 'peer'])
         clock.now = 100.05
         with p.scheduling_context():
@@ -119,7 +119,7 @@ class BudgetPolicyTests(unittest.TestCase):
         with p.scheduling_context():
             self.assertEqual([r.request_id for r in scheduler.running],
                              ['victim', 'peer'])
-            self.assertEqual(scheduler.max_num_scheduled_tokens, 128)
+            self.assertEqual(scheduler.max_num_scheduled_tokens, 32768)
         self.assertEqual([e['event'] for e in events], [
             'small_hold_requested', 'small_hold_resume_requested',
             'small_hold_released'])
@@ -253,7 +253,7 @@ class UrgentKeepTests(unittest.TestCase):
         with probe.scheduling_context():
             self.assertEqual(scheduler.running, [])
             self.assertEqual(scheduler.max_num_running_reqs, 1)
-            self.assertEqual(scheduler.max_num_scheduled_tokens, 64)
+            self.assertEqual(scheduler.max_num_scheduled_tokens, 32768)
             scheduler.waiting.remove(urgent)
             urgent.status = SimpleNamespace(name='RUNNING')
             scheduler.running.append(urgent)
@@ -342,7 +342,7 @@ class UrgentKeepTests(unittest.TestCase):
         scheduler.kv_cache_manager.coordinator.single_type_managers[0].req_to_blocks.clear()
         with probe.scheduling_context():
             self.assertEqual(scheduler.max_num_running_reqs, 1)
-            self.assertEqual(scheduler.max_num_scheduled_tokens, 128)
+            self.assertEqual(scheduler.max_num_scheduled_tokens, 32768)
 
     def test_cancelled_urgent_request_releases_victim_and_clears_link(self):
         scheduler, probe, c, clock, _events, _blocks, _victim, urgent = urgent_setup()

@@ -17,8 +17,10 @@ a JSON file read at scheduler initialization::
 otherwise request_id must match the physical scheduler ID exactly. The
 minimum output count is checked only at a confirmed decode boundary. A hold is checked against its monotonic deadline at the next scheduling
 boundary; synchronous execution cannot be interrupted at the deadline.
-The buffer-policy mode limits the next slice to resident decode work and
-stops further holds after a large deadline overrun. Events named
+The buffer-policy mode blocks new prefills in its legacy hold path; urgent
+keep admission intentionally allows the urgent request to enter. It leaves
+the configured batch token budget unchanged and stops further holds after a
+large deadline overrun. Events named
 ``small_hold_requested``, ``small_hold_released`` and
 ``small_hold_first_rescheduled`` expose these separate times.
 
@@ -59,9 +61,7 @@ STAGES_ENV = "VLLM_OMNI_SMALL_HOLD_STAGES"
 URGENT_KEEP_ENV = "VLLM_OMNI_URGENT_KEEP_ADMISSION"
 MAX_HOLD_S = 0.10
 MAX_RESIDENT_REQUESTS = 64
-# Keep held scheduling slices to resident decode work. A large multimodal
-# prefill previously delayed a 50 ms hold check by almost four seconds.
-MAX_HELD_STEP_TOKENS = 64
+# A late synchronous step disables subsequent holds; it cannot interrupt that step.
 MAX_DEADLINE_LATENESS_S = 0.05
 
 
@@ -414,7 +414,6 @@ class SmallHoldProbe:
             yield
             return
         original_cap = scheduler.max_num_running_reqs
-        original_token_budget = scheduler.max_num_scheduled_tokens
         resident = self._resident_fields()
         if resident["resident_count"] > min(original_cap, MAX_RESIDENT_REQUESTS):
             raise RuntimeError("small hold resident count exceeds configured cap")
@@ -425,18 +424,15 @@ class SmallHoldProbe:
         )
         scheduler.running[:] = [request for request in original_running if request.request_id not in held_ids]
         if self.buffer_policy_mode:
-            # Waiting prefills cannot turn a hold into a long model step.
+            # Legacy buffer holds still block new waiting prefills.
             scheduler.max_num_running_reqs = min(
                 scheduler.max_num_running_reqs, len(scheduler.running))
-            scheduler.max_num_scheduled_tokens = min(
-                original_token_budget, MAX_HELD_STEP_TOKENS)
         for request in held:
             self.holds[request.request_id].held_schedule_steps += 1
         try:
             yield
         finally:
             scheduler.max_num_running_reqs = original_cap
-            scheduler.max_num_scheduled_tokens = original_token_budget
             current = {request.request_id: request for request in scheduler.running}
             for request in held:
                 if scheduler.requests.get(request.request_id) is request and _running(request):
@@ -487,7 +483,6 @@ class SmallHoldProbe:
         """
         scheduler = self.scheduler
         original_cap = scheduler.max_num_running_reqs
-        original_token_budget = scheduler.max_num_scheduled_tokens
         if original_cap != self.resident_cap:
             raise RuntimeError("split execution/resident caps require a fixed resident cap")
         self._refresh_split_holds(self.clock())
@@ -537,13 +532,9 @@ class SmallHoldProbe:
             request.request_id for request in original_running
             if request.request_id in self.holds and request.request_id not in selected_ids
         }
-        if self.buffer_policy_mode and self.holds:
-            scheduler.max_num_scheduled_tokens = min(
-                original_token_budget, MAX_HELD_STEP_TOKENS)
         try:
             yield
         finally:
-            scheduler.max_num_scheduled_tokens = original_token_budget
             visible = list(scheduler.running)
             self._execution_active_ids = {
                 request.request_id for request in visible
