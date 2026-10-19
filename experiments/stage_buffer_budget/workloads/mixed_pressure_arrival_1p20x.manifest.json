@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "kind": "arrival_scaled_from_existing_multimodal_trace",
+  "source": "/home/zhongyu/research_reports/servegen_active_buffer_20261012/mixed_pressure.jsonl",
+  "source_sha256": "b92e11900eec4ad6f93829a4b459a03adbadf105e096c674a397f22fce785984",
+  "output": "/home/zhongyu/project/vllm-omni-buffer/experiments/stage_buffer_budget/workloads/mixed_pressure_arrival_1p20x.jsonl",
+  "output_sha256": "f296032686593d21a5c5d183d24315b1896b38adc9b511be7d5a9c813087b782",
+  "transformation": "arrival_offset_s = source_arrival_offset_s / factor",
+  "factor": "1.2",
+  "request_count": 70,
+  "source_window_s": 120.0,
+  "derived_window_s": 100.0,
+  "source_rate_rps": 0.5833333333333334,
+  "derived_rate_rps": 0.7,
+  "source_last_arrival_s": 113.58210287408285,
+  "derived_last_arrival_s": 94.65175239506904,
+  "modality_counts": {
+    "video": 23,
+    "audio": 23,
+    "image": 24
+  },
+  "request_ids_and_all_nonarrival_fields_unchanged": true
+}
