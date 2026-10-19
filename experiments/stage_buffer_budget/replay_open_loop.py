@@ -29,6 +29,26 @@ def get_json(endpoint: str, path: str) -> dict:
         return json.load(response)
 
 
+def audio_padding_entries(workload: Path) -> dict[str, dict]:
+    """Reuse the archived CPU/server audio-padding audit for an arrival-only trace."""
+    workload_sha256 = hashlib.sha256(workload.read_bytes()).hexdigest()
+    source_sha256 = workload_sha256
+    manifest_path = workload.with_suffix(".manifest.json")
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest["output_sha256"] != workload_sha256:
+            raise ValueError("workload bytes differ from its frozen manifest")
+        if manifest.get("request_ids_and_all_nonarrival_fields_unchanged") is not True:
+            raise ValueError("audio audit requires an arrival-only workload derivation")
+        source_sha256 = manifest["source_sha256"]
+    audit_path = ARCHIVED_CLIENT / "audio_padding_validation.json"
+    if not audit_path.exists():
+        return {}
+    entries = json.loads(audit_path.read_text())["entries"]
+    return {entry["request_id"]: entry for entry in entries
+            if entry["workload_sha256"] == source_sha256}
+
+
 def trace_offsets(directory: Path) -> dict[str, int]:
     if not directory.is_dir():
         return {}
@@ -93,9 +113,20 @@ def main() -> None:
         raise ValueError("endpoint port differs from the recorded session")
     model = get_json(args.endpoint, "/v1/models")["data"][0]["id"]
     drained_before = wait_drained(args.endpoint, 30)
+    audio_expected = audio_padding_entries(args.workload)
     prepared = []
     for row in rows:
         record = copy.deepcopy(row)
+        cpu = audio_expected.get(record["source_request_id"])
+        if cpu is not None:
+            if record["actual_processor_input_tokens"] != cpu["original_expected_tokens"]:
+                raise ValueError("audio prompt count differs from archived audit")
+            record["initial_hf_unpadded_expected_tokens"] = record["actual_processor_input_tokens"]
+            record["actual_processor_input_tokens"] = cpu["cpu_padded_expected_tokens"]
+            record["server_aligned_prompt_ids_json_sha256"] = cpu["cpu_prompt_ids_json_sha256"]
+            record["offline_audio_preprocessing"] = (
+                "right-zero-pad to feature extractor hop length, matching server"
+            )
         record["payload"] = materialize(record["payload"])
         record["payload"]["model"] = model
         prepared.append(record)
@@ -114,6 +145,8 @@ def main() -> None:
         "service": service,
         "drained_before": drained_before,
         "client_source": str(ARCHIVED_CLIENT),
+        "audio_padding_audit": str(ARCHIVED_CLIENT / "audio_padding_validation.json"),
+        "audio_padding_adjusted_requests": sorted(audio_expected),
     })
     traces = args.session_dir / "traces"
     before = trace_offsets(traces)
