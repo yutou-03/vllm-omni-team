@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Plot measured native KV-pool occupancy and a passive preemption detail.
+"""Plot measured native KV-pool occupancy and every passive preemption detail.
 
-These plots are allocator pool observations, not physical-block B_live ownership.
+These plots use allocator pool observations, not physical-block B_live ownership.
 No smoothing, interpolation, or cross-GPU capacity pooling is applied.
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 
 import matplotlib
@@ -42,11 +43,6 @@ def load(run_dir: Path) -> tuple[float, dict[int, list[tuple[float, float, int]]
                 last_free[stage] = row
                 if stage == 1 and row.get("free_blocks_after", 0) > row.get("free_blocks_before", 0):
                     releases.append(row)
-    failure = min(failures, key=lambda row: row["monotonic"]) if failures else None
-    released = (min((row for row in releases
-                     if failure is not None and
-                     0 <= row["monotonic"] - failure["monotonic"] < 1),
-                    key=lambda row: row["monotonic"], default=None))
     for stage in snapshots:
         snapshots[stage].sort(key=lambda sample: sample[0])
         if not snapshots[stage]:
@@ -57,7 +53,14 @@ def load(run_dir: Path) -> tuple[float, dict[int, list[tuple[float, float, int]]
             snapshots[stage].append((tail["monotonic"] - origin,
                                      100 * (total - tail["free_blocks_after"]) / total,
                                      tail["free_blocks_after"]))
-    return origin, snapshots, {"failure": failure, "release": released, "results": result}
+    failures.sort(key=lambda row: row["monotonic"])
+    releases.sort(key=lambda row: row["monotonic"])
+    matched = []
+    for failure in failures:
+        release = next((row for row in releases
+                        if 0 <= row["monotonic"] - failure["monotonic"] < 1), None)
+        matched.append((failure, release))
+    return origin, snapshots, {"failure_releases": matched, "results": result}
 
 
 def save(fig, prefix: Path) -> None:
@@ -67,7 +70,7 @@ def save(fig, prefix: Path) -> None:
     plt.close(fig)
 
 
-def plot_full(snapshots: dict, events: dict, prefix: Path) -> None:
+def plot_full(snapshots: dict, events: dict, prefix: Path, factor: int) -> None:
     results = events["results"]
     last_completion = max(row["client_completion_monotonic_s"] for row in results["results"])
     xmax = math.ceil((last_completion - results["origin_monotonic_s"]) / 5) * 5
@@ -80,31 +83,28 @@ def plot_full(snapshots: dict, events: dict, prefix: Path) -> None:
     injection = results["arrival_window_s"]
     ax.axvline(injection, color="0.45", linewidth=1, linestyle=":")
     ax.text(injection + 1, 6, "Injection ends", fontsize=9, color="0.35")
-    failure = events["failure"]
-    if failure is not None:
+    for index, (failure, _) in enumerate(events["failure_releases"], 1):
         ft = failure["monotonic"] - results["origin_monotonic_s"]
         ax.axvline(ft, color="C3", linewidth=1.2, linestyle=":")
-        ax.text(ft + 1, 91, "KV allocation fails; passive preemption", fontsize=9,
-                color="C3", va="top")
+        ax.text(ft + 0.8, 102 - (index - 1) * 8,
+                f"Passive preemption {index}", fontsize=8, color="C3", va="top")
     ax.set(xlim=(0, xmax), ylim=(0, 105), xlabel="Time since replay start (s)",
            ylabel="Native KV pool occupancy (% of each stage's pool)",
-           title="Measured stage KV-pool pressure | 3× original arrivals")
+           title=f"Measured stage KV-pool pressure | {factor}× original arrivals")
     ax.grid(axis="y", alpha=0.22)
     ax.legend(loc="upper left", frameon=False)
     fig.text(0.10, -0.025,
-             "Before-schedule snapshots plus the final KV-free event; stage 0 trace ends when idle. "
+             "Before-schedule snapshots plus final KV-free event; stage 0 trace ends when idle. "
              "Pool usage is not request-held KV.", fontsize=8, color="0.35")
     save(fig, prefix)
 
 
-def plot_detail(origin: float, snapshots: dict, events: dict, prefix: Path) -> bool:
-    failure, release = events["failure"], events["release"]
-    if failure is None or release is None:
+def plot_detail(origin: float, snapshots: dict, failure: dict,
+                release: dict | None, prefix: Path, index: int) -> bool:
+    if release is None:
         return False
     ft = failure["monotonic"] - origin
     rt = release["monotonic"] - origin
-    if not 0 <= rt - ft < 1:
-        raise ValueError("nearest KV release does not match the actual allocation failure")
     xs = [sample[0] for sample in snapshots[1]]
     free = [sample[2] for sample in snapshots[1]]
     lo, hi = ft - 0.35, ft + 0.35
@@ -117,9 +117,9 @@ def plot_detail(origin: float, snapshots: dict, events: dict, prefix: Path) -> b
             label=f"Actual KV release: {before} → {after} blocks")
     ax.axvline(ft, color="C3", linestyle=":", linewidth=1.3,
                label="Actual allocation failure / passive preemption")
-    ax.set(xlim=(lo, hi), ylim=(-4, max(100, after + 10)),
+    ax.set(xlim=(lo, hi), ylim=(-max(4, after * 0.03), max(100, after * 1.13)),
            xlabel="Time since replay start (s)", ylabel="Talker free KV blocks",
-           title="Talker pool around the first measured passive preemption")
+           title=f"Talker pool around measured passive preemption {index}")
     ax.grid(axis="y", alpha=0.22)
     ax.legend(loc="upper left", frameon=False, fontsize=9)
     save(fig, prefix)
@@ -129,10 +129,20 @@ def plot_detail(origin: float, snapshots: dict, events: dict, prefix: Path) -> b
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--factor", type=int,
+                        help="arrival-rate factor; inferred from run directory name if omitted")
     args = parser.parse_args()
+    match = re.search(r"(?:^|_)(\d+)x(?:_|$)", args.run_dir.name)
+    factor = args.factor or (int(match.group(1)) if match else None)
+    if factor is None or factor <= 1:
+        parser.error("provide --factor greater than 1")
     origin, snapshots, events = load(args.run_dir)
-    plot_full(snapshots, events, args.run_dir / "pool_occupancy_full_3x")
-    plot_detail(origin, snapshots, events, args.run_dir / "talker_free_blocks_preemption_detail_3x")
+    plot_full(snapshots, events, args.run_dir / f"pool_occupancy_full_{factor}x", factor)
+    failures = events["failure_releases"]
+    for index, (failure, release) in enumerate(failures, 1):
+        stem = (f"talker_free_blocks_preemption_detail_{factor}x" if len(failures) == 1
+                else f"talker_free_blocks_preemption_{index}_{factor}x")
+        plot_detail(origin, snapshots, failure, release, args.run_dir / stem, index)
 
 
 if __name__ == "__main__":
