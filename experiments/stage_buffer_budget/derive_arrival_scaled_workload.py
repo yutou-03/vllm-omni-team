@@ -23,8 +23,8 @@ def main() -> None:
     parser.add_argument("--source-window-s", type=Decimal, default=Decimal("120"))
     args = parser.parse_args()
 
-    if not Decimal("1") < args.factor <= Decimal("3"):
-        parser.error("factor must be greater than 1 and at most 3")
+    if not Decimal("1") < args.factor <= Decimal("4"):
+        parser.error("factor must be greater than 1 and at most 4")
     if args.source_window_s <= 0:
         parser.error("source-window-s must be positive")
     if args.source.resolve() == args.output.resolve():
