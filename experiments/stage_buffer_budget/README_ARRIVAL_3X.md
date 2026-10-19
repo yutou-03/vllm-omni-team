@@ -38,3 +38,12 @@ docker exec vllm_omni_privileged python3 \
 ```
 
 客户端的 240 秒超时和服务排空的 90 秒等待是安全终止条件，不是 SLO。发送端复用原实验的音频右补齐审计，并校验源轨迹 SHA；这只修正客户端预期的 prompt token 数，不改请求内容。运行保留服务端内存安全队列和被动抢占。本轨迹没有 urgent 请求的 `omni_scheduling` 元数据，因此仅用于检查阶段池压力及其后果，不能称为主动抢占或阶段缓冲收益实验。
+
+2026-10-19 的首次实测已经完成：70/70 条请求成功，Talker 原生 KV 池在排空期达到 100%，记录了一次真实分配失败、一次被动抢占和一次完整多阶段重启。证据、口径与结论边界见 [实测报告](/home/zhongyu/research_reports/kv_residency_trace_20261013/stage_pool_evidence/mixed_pressure_3x_20261019/results.md)。该实测仍是单次压力观察，没有 FCFS/阶段缓冲成对对照，也没有预注册 SLO。
+
+```bash
+RUN=/home/zhongyu/research_reports/kv_residency_trace_20261013/stage_pool_evidence/mixed_pressure_3x_20261019
+python3 experiments/stage_buffer_budget/analyze_pressure_trace.py "$RUN" --window-s 40 --output "$RUN/pressure_injection.json"
+python3 experiments/stage_buffer_budget/analyze_pressure_trace.py "$RUN" --output "$RUN/pressure_full.json"
+python3 experiments/stage_buffer_budget/plot_stage_pool_pressure.py "$RUN"
+```

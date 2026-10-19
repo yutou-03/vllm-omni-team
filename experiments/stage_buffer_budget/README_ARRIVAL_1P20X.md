@@ -15,8 +15,9 @@ python3 experiments/stage_buffer_budget/derive_arrival_scaled_workload.py \
 派生文件及旁边的 `.manifest.json` 固定了两个 SHA-256、变换公式和负载统计。发送前需确认目标 GPU 空闲并启动**当前固定分支**的服务，例如：
 
 ```bash
-python3 /home/zhongyu/research_reports/servegen_active_buffer_20261012/launch_server.py \
-  --session mixed_pressure_1p20x_20261019 \
+docker exec vllm_omni_privileged python3 \
+  /home/zhongyu/research_reports/servegen_active_buffer_20261012/launch_server.py \
+  --session mixed_pressure_1p20x_20261019_gpu \
   --framework /home/zhongyu/project/vllm-omni-buffer \
   --deploy /home/zhongyu/project/vllm-omni-buffer/experiments/stage_buffer_budget/deploy_urgent_keep.yaml \
   --extra-env-file /home/zhongyu/project/vllm-omni-buffer/experiments/stage_buffer_budget/env.json
@@ -28,8 +29,8 @@ python3 /home/zhongyu/research_reports/servegen_active_buffer_20261012/launch_se
 python3 experiments/stage_buffer_budget/replay_open_loop.py \
   --workload experiments/stage_buffer_budget/workloads/mixed_pressure_arrival_1p20x.jsonl \
   --output-dir /home/zhongyu/research_reports/kv_residency_trace_20261013/stage_pool_evidence/mixed_pressure_1p20x_20261019 \
-  --session-dir /home/zhongyu/research_reports/servegen_active_buffer_20261012/sessions/mixed_pressure_1p20x_20261019 \
+  --session-dir /home/zhongyu/research_reports/servegen_active_buffer_20261012/sessions/mixed_pressure_1p20x_20261019_gpu \
   --duration-s 100
 ```
 
-结束时使用原研究的 `stop_server.py --session mixed_pressure_1p20x_20261019`。`results.json` 保留每个请求的实际发送偏差、完成状态和超时；240 秒是客户端安全终止上限，不是预设 SLO。该轨迹没有当前 urgent-keep 策略需要的逐请求 `omni_scheduling`，因此此运行只用于 Talker 容量压力观察，不可称为紧急 keep 收益实验。
+结束时在容器内使用原研究的 `stop_server.py --session mixed_pressure_1p20x_20261019_gpu`。`results.json` 保留每个请求的实际发送偏差、完成状态和超时；240 秒是客户端安全终止上限，不是预设 SLO。该轨迹没有当前 urgent-keep 策略需要的逐请求 `omni_scheduling`，因此此运行只用于 Talker 容量压力观察，不可称为紧急 keep 收益实验。
