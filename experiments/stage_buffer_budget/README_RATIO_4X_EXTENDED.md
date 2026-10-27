@@ -6,6 +6,8 @@
 
 三组依次运行；Thinker TP4 固定 GPU 0–3，Code2Wav 固定 GPU 5，Talker TP1 独立副本使用 GPU 4／4+6／4+6+7。每次独占所需 GPU，服务预热和图捕获结束、`/v1/models` 返回后才开始回放。服务端代码、KV 池容量、block size、调度策略、请求内容与采样参数均不变；仅客户端安全上限从 240 扩至 900 秒。两次实验结果目录必须分开。
 
+设备映射注意：部署 YAML 的 `stages[].devices` 是 `CUDA_VISIBLE_DEVICES` 列表中的逻辑序号。例如物理 GPU 6 被其他作业占用时，可将 4:2 的 `--devices` 改为 `0,1,2,3,4,5,7`，**部署 YAML 仍用原文件的 `devices: "4,6"`**；此时逻辑 6 映射到物理 GPU 7。须在会话 manifest 中保留实际可见设备列表和 GPU PID 映射。不能直接在 YAML 写 `4,7`，因为七张可见 GPU 的逻辑序号只到 6。
+
 ```bash
 cd /home/zhongyu/project/vllm-omni-buffer
 SRC=/home/zhongyu/.cache/kv_replay_worktrees/ratio_4x_2a90b2
