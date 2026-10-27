@@ -113,6 +113,54 @@ def main() -> None:
     fig3.savefig(a.output_prefix.with_name('useful_output_ratio_4x').with_suffix('.pdf'))
     plt.close(fig3)
 
+    # Latency percentiles and event counts use different units, so give each
+    # its own axis instead of implying that a preemption is a time duration.
+    latency = {
+        'TTFT': [throughput[r]['successful_request_ttft_p95_s'] for r in labels],
+        'TTFP': [throughput[r]['successful_request_ttfp_p95_s'] for r in labels],
+        'E2E': [throughput[r]['successful_request_e2e_p95_s'] for r in labels],
+    }
+    preemptions = []
+    for ratio in labels:
+        summary = json.loads((runs[ratio] / 'ratio_summary.json').read_text())
+        preemptions.append(sum(
+            counts.get('passive_preemption', 0)
+            for pool, counts in summary['events_by_pool'].items()
+            if pool.startswith('1:')
+        ))
+    fig4, (lat_ax, count_ax) = plt.subplots(
+        1, 2, figsize=(11.5, 4.5), layout='constrained',
+        gridspec_kw={'width_ratios': [2.1, 1]},
+    )
+    centers = list(range(len(labels)))
+    width = 0.24
+    for index, (metric, values) in enumerate(latency.items()):
+        bars = lat_ax.bar(
+            [center + (index - 1) * width for center in centers],
+            values, width=width, label=metric,
+        )
+        lat_ax.bar_label(bars, fmt='%.1f', padding=3, fontsize=8)
+    lat_ax.set_xticks(centers, labels)
+    lat_ax.set_ylim(0, max(max(values) for values in latency.values()) * 1.20)
+    lat_ax.set(xlabel='Thinker:Talker GPU ratio', ylabel='P95 latency (s)',
+               title='Request latency P95')
+    lat_ax.legend(frameon=False, ncol=3, loc='upper right')
+    lat_ax.grid(axis='y', alpha=0.2)
+    lat_ax.set_axisbelow(True)
+
+    bars = count_ax.bar(labels, preemptions, width=0.56, color='C3')
+    count_ax.bar_label(bars, fmt='%d', padding=3)
+    count_ax.set_ylim(0, max(preemptions) * 1.25)
+    count_ax.set(xlabel='Thinker:Talker GPU ratio',
+                 ylabel='Preemption events (count)',
+                 title='Talker memory-triggered preemptions')
+    count_ax.grid(axis='y', alpha=0.2)
+    count_ax.set_axisbelow(True)
+    fig4.suptitle('Measured P95 latency and passive preemption | 280 completed requests per run')
+    fig4.savefig(a.output_prefix.with_name('latency_p95_and_preemptions').with_suffix('.png'), dpi=320)
+    fig4.savefig(a.output_prefix.with_name('latency_p95_and_preemptions').with_suffix('.pdf'))
+    plt.close(fig4)
+
 
 if __name__ == '__main__':
     main()
