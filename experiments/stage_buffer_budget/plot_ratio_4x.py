@@ -151,55 +151,67 @@ def main() -> None:
             raise ValueError(f'{ratio}: restart/preemption event count mismatch')
         preempted_ratio_pct.append(len(preempted_ids) / denominator * 100)
 
-    fig4, lat_ax = plt.subplots(figsize=(11.5, 5), layout='constrained')
+    # Compact, publication-oriented dual-axis figure.  Keep the data labels
+    # and denominator in the figure so a standalone PDF remains interpretable.
+    fig4, lat_ax = plt.subplots(figsize=(7.4, 4.9))
+    fig4.subplots_adjust(left=0.115, right=0.875, bottom=0.20, top=0.85)
     ratio_ax = lat_ax.twinx()
     centers = list(range(len(labels)))
-    width = 0.24
+    width = 0.15
+    colors = {'TTFT': '#7894AC', 'TTFP': '#D2A16A', 'E2E': '#6D968B'}
+    red = '#B63D3D'
     for index, (metric, values) in enumerate(latency.items()):
         bars = lat_ax.bar(
             [center + (index - 1) * width for center in centers],
             values, width=width, label=metric,
+            color=colors[metric], edgecolor='white', linewidth=0.6,
+            zorder=3,
         )
-        bar_labels = [f'{value:.1f}' for value in values]
-        if metric == 'TTFP':
-            # The 4:2 red point falls near the top of this orange bar.
-            bar_labels[1] = ''
-        lat_ax.bar_label(bars, labels=bar_labels, padding=3, fontsize=9)
-        if metric == 'TTFP':
-            bar = bars[1]
-            lat_ax.annotate(
-                f'{values[1]:.1f}',
-                (bar.get_x() + bar.get_width() / 2, values[1]),
-                xytext=(0, -5), textcoords='offset points',
-                ha='center', va='top', fontsize=9,
-            )
     lat_ax.set_xticks(centers, labels)
-    lat_ax.set_ylim(0, max(max(values) for values in latency.values()) * 1.19)
-    lat_ax.set(xlabel='Thinker:Talker GPU ratio', ylabel='P95 latency (s)')
-    lat_ax.grid(axis='y', alpha=0.2)
+    lat_ax.set_xlim(-0.42, len(labels) - 0.58)
+    lat_ax.set_ylim(0, 455)
+    lat_ax.set_yticks([0, 100, 200, 300, 400])
+    lat_ax.set_xlabel('Thinker : Talker GPUs', fontsize=13, labelpad=9)
+    lat_ax.set_ylabel('P95 latency (s)', fontsize=13, labelpad=10)
+    lat_ax.tick_params(axis='both', labelsize=11, direction='out', length=4)
+    lat_ax.grid(axis='y', color='#D9DEE3', linewidth=0.7, zorder=0)
     lat_ax.set_axisbelow(True)
+    lat_ax.spines['top'].set_visible(False)
+    lat_ax.spines['right'].set_visible(False)
 
     ratio_ax.plot(
-        centers, preempted_ratio_pct, color='tab:red', marker='o',
-        markersize=8, linewidth=2, label='Preempted', zorder=5,
+        centers, preempted_ratio_pct, color=red, marker='o',
+        markerfacecolor='white', markeredgewidth=1.8,
+        markersize=6.5, linewidth=2.0, label='Preempted', zorder=5,
     )
-    ratio_ax.set_ylim(0, max(10.0, max(preempted_ratio_pct) * 1.25))
-    ratio_ax.set_ylabel('Preempted Ratio (%)', color='tab:red')
-    ratio_ax.tick_params(axis='y', colors='tab:red')
-    ratio_ax.spines['right'].set_color('tab:red')
-    for x, value in zip(centers, preempted_ratio_pct):
+    ratio_ax.set_ylim(0, 10)
+    ratio_ax.set_yticks([0, 2, 4, 6, 8, 10])
+    ratio_ax.set_ylabel('Preempted Ratio (%)', color=red,
+                        fontsize=13, labelpad=10)
+    ratio_ax.tick_params(axis='y', colors=red, labelsize=11,
+                         direction='out', length=4)
+    ratio_ax.spines['top'].set_visible(False)
+    ratio_ax.spines['left'].set_visible(False)
+    ratio_ax.spines['right'].set_color(red)
+    for index, (x, value) in enumerate(zip(centers, preempted_ratio_pct)):
+        # Raise the middle annotation clear of the descending segment.
+        offset_y = 28 if index == 1 else 9
         ratio_ax.annotate(
-            f'{value:.2f}%', (x, value), xytext=(0, 10),
-            textcoords='offset points', ha='center',
-            color='tab:red', fontsize=9, fontweight='bold',
+            f'{value:.2f}%', (x, value), xytext=(-8, offset_y),
+            textcoords='offset points', ha='right',
+            color=red, fontsize=10, fontweight='semibold',
+            bbox={'facecolor': 'white', 'edgecolor': 'none', 'pad': 0.1},
         )
     handles, names = lat_ax.get_legend_handles_labels()
     ratio_handles, ratio_names = ratio_ax.get_legend_handles_labels()
-    lat_ax.legend(handles + ratio_handles, names + ratio_names,
-                  frameon=False, ncol=4, loc='upper right')
-    fig4.suptitle(
-        'Measured P95 latency and preempted request ratio | 280 completed requests per run\n'
-        'Preempted = distinct Talker requests restarted after KV allocation failure / 280'
+    fig4.legend(handles + ratio_handles, names + ratio_names,
+                frameon=False, ncol=4, loc='upper center',
+                bbox_to_anchor=(0.5, 0.98), fontsize=11,
+                handlelength=2.1, columnspacing=1.4)
+    fig4.text(
+        0.5, 0.035,
+        'Preempted: distinct Talker requests restarted after KV allocation failure / 280 requests',
+        ha='center', fontsize=8.8, color='#4A4A4A',
     )
     fig4.savefig(a.output_prefix.with_name('latency_p95_and_preemptions').with_suffix('.png'), dpi=320)
     fig4.savefig(a.output_prefix.with_name('latency_p95_and_preemptions').with_suffix('.pdf'))
