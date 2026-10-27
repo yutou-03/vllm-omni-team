@@ -30,6 +30,27 @@ def main() -> None:
         event_sum = lambda stage, name: sum(v.get(name, 0) for k, v in events.items()
                                             if k.startswith(f'{stage}:'))
         c = summary['client']
+        updates = []
+        with (run / 'kv_pools_by_engine.csv').open(newline='') as stream:
+            for sample in csv.DictReader(stream):
+                if sample['stage_id'] == '1':
+                    updates.append((float(sample['relative_time_s']),
+                                    int(sample['engine_pid']),
+                                    int(sample['used_bytes_per_rank'])))
+        updates.sort()
+        latest = {}
+        last_t = 0.0
+        area = 0.0
+        peak = 0
+        for t, pid, used in updates:
+            if not 0 <= t <= c['fixed_horizon_s']:
+                continue
+            area += sum(latest.values()) * (t - last_t)
+            latest[pid] = used
+            peak = max(peak, sum(latest.values()))
+            last_t = t
+        if summary['drained_after']:
+            area += sum(latest.values()) * (c['fixed_horizon_s'] - last_t)
         result.append({
             'ratio': ratio,
             'run_dir': str(run.resolve()),
@@ -59,6 +80,12 @@ def main() -> None:
             'thinker_passive_preemptions': event_sum(0, 'passive_preemption'),
             'talker_replicas': len(talker),
             'talker_pool_gb_per_replica': talker[0]['pool_bytes_per_rank'] / 1e9,
+            'talker_total_pool_gb_across_gpus': sum(v['pool_bytes_per_rank'] for v in talker) / 1e9,
+            'talker_aggregate_peak_used_gb': peak / 1e9,
+            'talker_aggregate_mean_used_gb_fixed_horizon': (
+                area / c['fixed_horizon_s'] / 1e9 if summary['drained_after'] else ''),
+            'talker_mean_native_pct_each': json.dumps([
+                round(v['mean_native_usage_pct_observed'], 3) for v in talker]),
             'talker_peak_native_pct_each': json.dumps([round(v['peak_native_usage_pct'], 3)
                                                        for v in talker]),
             'talker_gt90_s_each': json.dumps([round(v['gt90_time_s_observed'], 3)
