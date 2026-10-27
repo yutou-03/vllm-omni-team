@@ -16,7 +16,7 @@ python3 experiments/stage_buffer_budget/derive_replicated_workload.py \
 
 ```bash
 cd /home/zhongyu/project/vllm-omni-buffer
-COMMIT=<冻结的实验提交SHA>
+COMMIT=df900a6a0852b28d95e98571f2e4e2124c09ae44
 CLEAN_SRC=/home/zhongyu/.cache/kv_replay_worktrees/mixed_pressure_280_in_30s
 RUN_TAG=mixed_pressure_280_in_30s_$(date +%Y%m%d_%H%M%S)
 SESSION_DIR=/home/zhongyu/research_reports/servegen_active_buffer_20261012/sessions/$RUN_TAG
@@ -41,3 +41,5 @@ docker exec vllm_omni_privileged python3 \
 ```
 
 客户端每请求 240 秒是原有安全终止限制，不是 SLO；280 条可能在截止前无法全部完成，超时和错误必须保留在分母。不要仅分析成功请求。报告实际发送偏差、目标阶段真实输入就绪与排空、KV 池占用、真实 `allocate_slots` 失败和 victim 事件、丢弃进度及恢复、有效输出。原生池占用与不可重新分配的请求持有 KV `B_live` 不同。该压力运行不能估计自然流量的被动抢占发生率，也不能单独证明阶段缓冲收益。
+
+2026-10-27 的首次实测已完成，完整数据及边界见 [实测报告](/home/zhongyu/research_reports/kv_residency_trace_20261013/stage_pool_evidence/mixed_pressure_280_in_30s_20261027/results.md)。实测成功 170、240 秒安全超时 110，18 次真实被动抢占；该运行已过载，不适合直接估算完整恢复时间。

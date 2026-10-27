@@ -25,6 +25,7 @@ def load(run_dir: Path) -> tuple[float, dict[int, list[tuple[float, float, int]]
     pool_blocks = {}
     failures = []
     releases = []
+    victims = []
     last_free = {0: None, 1: None}
     with (run_dir / "traces" / "stage_events.jsonl").open() as stream:
         for line in stream:
@@ -39,6 +40,8 @@ def load(run_dir: Path) -> tuple[float, dict[int, list[tuple[float, float, int]]
             elif stage == 1 and event == "stage_study_profile_allocation_result":
                 if row.get("allocation_succeeded") is False:
                     failures.append(row)
+            elif stage == 1 and event == "stage_study_profile_victim_selected":
+                victims.append(row)
             elif stage in last_free and event == "stage_study_profile_kv_free":
                 last_free[stage] = row
                 if stage == 1 and row.get("free_blocks_after", 0) > row.get("free_blocks_before", 0):
@@ -55,10 +58,16 @@ def load(run_dir: Path) -> tuple[float, dict[int, list[tuple[float, float, int]]
                                      tail["free_blocks_after"]))
     failures.sort(key=lambda row: row["monotonic"])
     releases.sort(key=lambda row: row["monotonic"])
+    victims.sort(key=lambda row: row["monotonic"])
     matched = []
     for failure in failures:
-        release = next((row for row in releases
-                        if 0 <= row["monotonic"] - failure["monotonic"] < 1), None)
+        victim = next((row for row in victims
+                       if 0 <= row["monotonic"] - failure["monotonic"] < 1 and
+                       row.get("triggering_allocation", {}).get("allocation_id") == failure.get("allocation_id")), None)
+        release = (next((row for row in releases
+                         if 0 <= row["monotonic"] - victim["monotonic"] < 1 and
+                         row.get("request_id") == victim.get("victim_request_id")), None)
+                   if victim is not None else None)
         matched.append((failure, release))
     return origin, snapshots, {"failure_releases": matched, "results": result}
 
@@ -70,7 +79,8 @@ def save(fig, prefix: Path) -> None:
     plt.close(fig)
 
 
-def plot_full(snapshots: dict, events: dict, prefix: Path, factor: int) -> None:
+def plot_full(snapshots: dict, events: dict, prefix: Path, factor: int,
+              title_label: str | None = None) -> None:
     results = events["results"]
     last_completion = max(row["client_completion_monotonic_s"] for row in results["results"])
     xmax = math.ceil((last_completion - results["origin_monotonic_s"]) / 5) * 5
@@ -83,14 +93,20 @@ def plot_full(snapshots: dict, events: dict, prefix: Path, factor: int) -> None:
     injection = results["arrival_window_s"]
     ax.axvline(injection, color="0.45", linewidth=1, linestyle=":")
     ax.text(injection + 1, 6, "Injection ends", fontsize=9, color="0.35")
-    for index, (failure, _) in enumerate(events["failure_releases"], 1):
-        ft = failure["monotonic"] - results["origin_monotonic_s"]
-        ax.axvline(ft, color="C3", linewidth=1.2, linestyle=":")
-        ax.text(ft + 0.8, 102 - (index - 1) * 8,
-                f"Passive preemption {index}", fontsize=8, color="C3", va="top")
+    failure_times = [row["monotonic"] - results["origin_monotonic_s"]
+                     for row, _ in events["failure_releases"]]
+    if len(failure_times) <= 4:
+        for index, ft in enumerate(failure_times, 1):
+            ax.axvline(ft, color="C3", linewidth=1.2, linestyle=":")
+            ax.text(ft + 0.8, 102 - (index - 1) * 8,
+                    f"Passive preemption {index}", fontsize=8, color="C3", va="top")
+    elif failure_times:
+        ax.scatter(failure_times, [102] * len(failure_times), marker="v", s=31,
+                   color="C3", label=f"Actual passive preemptions ({len(failure_times)})",
+                   zorder=5)
     ax.set(xlim=(0, xmax), ylim=(0, 105), xlabel="Time since replay start (s)",
            ylabel="Native KV pool occupancy (% of each stage's pool)",
-           title=f"Measured stage KV-pool pressure | {factor}× original arrivals")
+           title=f"Measured stage KV-pool pressure | {title_label or f'{factor}× original rate'}")
     ax.grid(axis="y", alpha=0.22)
     ax.legend(loc="upper left", frameon=False)
     fig.text(0.10, -0.025,
@@ -131,15 +147,22 @@ def main() -> None:
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--factor", type=int,
                         help="arrival-rate factor; inferred from run directory name if omitted")
+    parser.add_argument("--title-label", help="explicit run label for the full-window figure")
+    parser.add_argument("--detail-limit", type=int, help="number of per-event free-block details to draw")
     args = parser.parse_args()
     match = re.search(r"(?:^|_)(\d+)x(?:_|$)", args.run_dir.name)
     factor = args.factor or (int(match.group(1)) if match else None)
     if factor is None or factor <= 1:
         parser.error("provide --factor greater than 1")
     origin, snapshots, events = load(args.run_dir)
-    plot_full(snapshots, events, args.run_dir / f"pool_occupancy_full_{factor}x", factor)
+    if args.detail_limit is not None and args.detail_limit < 0:
+        parser.error("--detail-limit must be nonnegative")
+    plot_full(snapshots, events, args.run_dir / f"pool_occupancy_full_{factor}x",
+              factor, args.title_label)
     failures = events["failure_releases"]
     for index, (failure, release) in enumerate(failures, 1):
+        if args.detail_limit is not None and index > args.detail_limit:
+            break
         stem = (f"talker_free_blocks_preemption_detail_{factor}x" if len(failures) == 1
                 else f"talker_free_blocks_preemption_{index}_{factor}x")
         plot_detail(origin, snapshots, failure, release, args.run_dir / stem, index)
