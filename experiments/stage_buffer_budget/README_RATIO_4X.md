@@ -36,3 +36,35 @@ docker exec vllm_omni_privileged python3 \
 回放结束后，在宿主机使用 [`analyze_ratio_replay.py`](analyze_ratio_replay.py) 对每个 `$OUT` 生成 `kv_pools_by_engine.csv`、`request_summary.csv`、`ratio_summary.json` 和 PNG/PDF；Thinker TP4 每块 393,216 bytes，Talker TP1 每块 327,680 bytes。用运行时 GPU 进程映射传入 `--pid-gpu-map`。全部三组完成后用 [`plot_ratio_4x.py`](plot_ratio_4x.py) 生成共同时间轴的对照图。`run_manifest.json` 用 [`finalize_ratio_run.py`](finalize_ratio_run.py) 固化源码提交、配置、轨迹及原始文件哈希。
 
 这是一轮单次压力回放，用于观察容量与有效产出随资源配比变化；无配对重复时不能给出统计显著性或自然流量发生率。该轨迹没有 urgent 元数据，原生 FCFS 无主动 keep，本轮也不能证明主动暂停或阶段缓冲的收益。
+
+运行期间记录 GPU 映射；`MAP` 放在结果目录的上一级，以便容器内由 root 创建的运行目录尚未移交权限时仍可写入：
+
+```bash
+ANALYSIS=/home/zhongyu/project/vllm-omni-buffer/experiments/stage_buffer_budget
+MAP=/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_280_in_30s/ratio_4_${X}_pid_gpu_observation.json
+python3 "$ANALYSIS/capture_gpu_pid_map.py" --devices "$DEVICES" --output "$MAP"
+```
+
+服务停止后，将容器创建的数据目录交回本机用户，再从原始 JSONL 和请求记录计算指标、冻结校验值：
+
+```bash
+docker exec vllm_omni_privileged chown -R "$(id -u):$(id -g)" "$OUT"
+python3 "$ANALYSIS/analyze_ratio_replay.py" "$OUT" \
+  --thinker-block-bytes 393216 --talker-block-bytes 327680 \
+  --pid-gpu-map "$MAP" > "$OUT/analysis_stdout.json"
+python3 "$ANALYSIS/finalize_ratio_run.py" "$OUT" \
+  --session-dir "$SESSION" --ratio "4:$X" \
+  --source-commit 9fb7ed5f5d7d89bc019d82b83e46d139b31d0174 \
+  --pid-gpu-map "$MAP"
+```
+
+三组都完成后：
+
+```bash
+BASE=/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_280_in_30s
+python3 "$ANALYSIS/plot_ratio_4x.py" \
+  --run "4:1=$BASE/ratio_4_1_run1" \
+  --run "4:2=$BASE/ratio_4_2_run1" \
+  --run "4:3=$BASE/ratio_4_3_run1" \
+  --output-prefix "$BASE/kv_pool_ratio_4x"
+```
