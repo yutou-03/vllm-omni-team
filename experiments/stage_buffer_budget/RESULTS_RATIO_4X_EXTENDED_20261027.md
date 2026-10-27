@@ -12,4 +12,6 @@
 
 排空产出率是有限轨迹的完成数／观察跨度，不是持续稳态吞吐。原生 KV allocator 轨迹记录的是池已用块，不是请求持有的 `B_live`。三组 Talker 都曾接近或达到各自 KV 池上限；Thinker 每 rank 峰值约 47%。只有单次探索性实测，且增加 Talker 副本同时增加算力、执行名额和独立 KV 容量。尚未固定 SLO 契约，因此没有 SLO goodput。
 
-[完整报告及图](/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_extended_900s/results.md) · [P95 延迟与被动抢占请求比例图](/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_extended_900s/latency_p95_and_preemptions.png) · [跨组统计 CSV](/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_extended_900s/results_summary.csv) · [可执行复现说明](README_RATIO_4X_EXTENDED.md)
+[完整报告及图](/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_extended_900s/results.md) · [P95 延迟与被动抢占请求比例图（4:3 展示值手工设为 4.15%）](/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_extended_900s/latency_p95_and_preemptions.png) · [跨组统计 CSV](/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_extended_900s/results_summary.csv) · [可执行复现说明](README_RATIO_4X_EXTENDED.md)
+
+图中 4:3 红线的 4.15% 是用户指定展示值；原始日志为 12／280 = 4.29%。[原始实测版图](/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_extended_900s/latency_p95_and_preemptions_measured.png) 保留供核验。

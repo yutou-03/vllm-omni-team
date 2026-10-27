@@ -15,6 +15,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', action='append', required=True, metavar='RATIO=RUN_DIR')
     p.add_argument('--output-prefix', type=Path, required=True)
+    p.add_argument(
+        '--display-preempted-ratio-4-3', type=float,
+        help='Manual 4:3 display-only percentage; raw trace ratio remains in metadata',
+    )
     a = p.parse_args()
     runs = {}
     for spec in a.run:
@@ -24,6 +28,10 @@ def main() -> None:
         runs[ratio] = Path(path)
     if tuple(runs) != ('4:1', '4:2', '4:3'):
         p.error('pass 4:1, 4:2, 4:3 in that order')
+    if a.display_preempted_ratio_4_3 is not None and not (
+        0 <= a.display_preempted_ratio_4_3 <= 100
+    ):
+        p.error('--display-preempted-ratio-4-3 must be in [0, 100]')
     common_horizon = max(json.loads((run / 'ratio_summary.json').read_text())
                          ['client']['observed_end_s'] for run in runs.values())
     fig, axs = plt.subplots(3, 2, figsize=(12, 8.5), sharex=True, layout='constrained')
@@ -121,7 +129,9 @@ def main() -> None:
         'TTFP': [throughput[r]['successful_request_ttfp_p95_s'] for r in labels],
         'E2E': [throughput[r]['successful_request_e2e_p95_s'] for r in labels],
     }
-    preempted_ratio_pct = []
+    measured_preempted_ratio_pct = []
+    preempted_request_count = {}
+    preemption_event_count = {}
     for ratio in labels:
         client = throughput[ratio]
         denominator = client['planned']
@@ -149,7 +159,29 @@ def main() -> None:
         )
         if restart_events != recorded_events:
             raise ValueError(f'{ratio}: restart/preemption event count mismatch')
-        preempted_ratio_pct.append(len(preempted_ids) / denominator * 100)
+        measured_preempted_ratio_pct.append(len(preempted_ids) / denominator * 100)
+        preempted_request_count[ratio] = len(preempted_ids)
+        preemption_event_count[ratio] = restart_events
+    preempted_ratio_pct = measured_preempted_ratio_pct.copy()
+    if a.display_preempted_ratio_4_3 is not None:
+        preempted_ratio_pct[labels.index('4:3')] = a.display_preempted_ratio_4_3
+    figure_metadata = {
+        'metric': 'distinct requests with completed Talker allocation-failure restart / 280',
+        'source': 'traces/stage_events.jsonl',
+        'denominator_requests': 280,
+        'preempted_request_count': preempted_request_count,
+        'preemption_event_count': preemption_event_count,
+        'measured_ratio_percent': dict(zip(labels, measured_preempted_ratio_pct)),
+        'display_ratio_percent': dict(zip(labels, preempted_ratio_pct)),
+        'display_override': (
+            {'ratio': '4:3', 'source': 'user-specified manual display value',
+             'percent': a.display_preempted_ratio_4_3}
+            if a.display_preempted_ratio_4_3 is not None else None
+        ),
+    }
+    a.output_prefix.with_name('latency_p95_and_preemptions_meta.json').write_text(
+        json.dumps(figure_metadata, indent=2) + '\n'
+    )
 
     # Compact, publication-oriented dual-axis figure.  Keep the data labels
     # and denominator in the figure so a standalone PDF remains interpretable.
@@ -208,11 +240,15 @@ def main() -> None:
                 frameon=False, ncol=4, loc='upper center',
                 bbox_to_anchor=(0.5, 0.98), fontsize=11,
                 handlelength=2.1, columnspacing=1.4)
-    fig4.text(
-        0.5, 0.035,
-        'Preempted: distinct Talker requests restarted after KV allocation failure / 280 requests',
-        ha='center', fontsize=8.8, color='#4A4A4A',
+    figure_note = (
+        'Preempted: distinct Talker requests / 280; 4:3 is manually set to '
+        f'{a.display_preempted_ratio_4_3:.2f}% (trace: '
+        f'{measured_preempted_ratio_pct[labels.index("4:3")]:.2f}%)'
+        if a.display_preempted_ratio_4_3 is not None
+        else 'Preempted: distinct Talker requests restarted after KV allocation failure / 280 requests'
     )
+    fig4.text(0.5, 0.035, figure_note,
+              ha='center', fontsize=8.8, color='#4A4A4A')
     fig4.savefig(a.output_prefix.with_name('latency_p95_and_preemptions').with_suffix('.png'), dpi=320)
     fig4.savefig(a.output_prefix.with_name('latency_p95_and_preemptions').with_suffix('.pdf'))
     plt.close(fig4)

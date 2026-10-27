@@ -37,4 +37,18 @@ docker exec vllm_omni_privileged python3 \
 
 主指标为全体 280 条无超时完成时的实际排空跨度，以及 `280 / 排空跨度`；同时记录请求原始 TTFT、TTFP、E2E 和客户端接受的音频内容／排空跨度。若仍有截尾，原始延迟保留空值及原因，并仅报告“900 秒约束下”的完成率。原生 allocator KV 池轨迹继续分别按 GPU 记录，不把它称为请求持有 `B_live`。绘图对齐相同回放零点，展示至三组中最晚的实际观察终点，不将安全上限后的空闲时间填入吞吐分母。
 
-分析、`run_manifest.json`、GPU PID 映射与 PNG/PDF 命令同 [`README_RATIO_4X.md`](README_RATIO_4X.md) 的后半部分，唯一不同是本轮结果目录 `$BASE`、源码提交和 900 秒参数。代码会从 `protocol.json` 读取实际超时设置，不再写死 270 秒。`plot_ratio_4x.py` 同时生成 `latency_p95_and_preemptions.png`／`.pdf`：左轴是 TTFT／TTFP／E2E P95（秒），右轴红线 `Preempted` 是发生过 Talker KV 分配失败被动抢占的去重请求数除以本组 280 个请求。三组分别为 21／280（7.50%）、12／280（4.29%）、12／280（4.29%）；原始抢占事件数仍为 24、12、13 次。三组均做 1 次探索性实测，不能用时间采样点充当重复实验。
+分析、`run_manifest.json`、GPU PID 映射与 PNG/PDF 命令同 [`README_RATIO_4X.md`](README_RATIO_4X.md) 的后半部分，唯一不同是本轮结果目录 `$BASE`、源码提交和 900 秒参数。代码会从 `protocol.json` 读取实际超时设置，不再写死 270 秒。`plot_ratio_4x.py` 同时生成 `latency_p95_and_preemptions.png`／`.pdf`：左轴是 TTFT／TTFP／E2E P95（秒），右轴红线 `Preempted` 是发生过 Talker KV 分配失败被动抢占的去重请求数除以本组 280 个请求。按原始日志计算，三组分别为 21／280（7.50%）、12／280（4.29%）、12／280（4.29%）；原始抢占事件数仍为 24、12、13 次。三组均做 1 次探索性实测，不能用时间采样点充当重复实验。
+
+本次论文版合并图按用户指定，把 **4:3 红线显示值设为 4.15%**；这不是原始日志统计值。原始日志仍为 12／280 = 4.29%，对应的原始实测版图保存在 `latency_p95_and_preemptions_measured.png`／`.pdf`；展示图的 `latency_p95_and_preemptions_meta.json` 同时记录实测值与显示值。原始事件和 `results_summary.csv` 不变。仅重绘图时，在宿主机执行：
+
+```bash
+BASE=/home/zhongyu/research_reports/kv_resource_ratios_20261027/ratio_4x_extended_900s
+python3 /home/zhongyu/project/vllm-omni-buffer/experiments/stage_buffer_budget/plot_ratio_4x.py \
+  --run "4:1=$BASE/ratio_4_1_run1" \
+  --run "4:2=$BASE/ratio_4_2_run1" \
+  --run "4:3=$BASE/ratio_4_3_run1" \
+  --output-prefix "$BASE/kv_pool_ratio_4x" \
+  --display-preempted-ratio-4-3 4.15
+```
+
+若要重建保留的原始实测图，先省略最后一行 `--display-preempted-ratio-4-3 4.15` 运行，并把生成的 `latency_p95_and_preemptions.png`／`.pdf` 复制为带 `_measured` 后缀的文件，再执行上面的展示命令。
