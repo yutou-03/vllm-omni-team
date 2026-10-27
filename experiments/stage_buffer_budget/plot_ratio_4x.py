@@ -113,25 +113,46 @@ def main() -> None:
     fig3.savefig(a.output_prefix.with_name('useful_output_ratio_4x').with_suffix('.pdf'))
     plt.close(fig3)
 
-    # Latency percentiles and event counts use different units, so give each
-    # its own axis instead of implying that a preemption is a time duration.
+    # A request can be preempted more than once.  Count distinct logical
+    # requests with a completed memory-triggered restart, not victim picks or
+    # the number of preemption events, for the right-hand percentage axis.
     latency = {
         'TTFT': [throughput[r]['successful_request_ttft_p95_s'] for r in labels],
         'TTFP': [throughput[r]['successful_request_ttfp_p95_s'] for r in labels],
         'E2E': [throughput[r]['successful_request_e2e_p95_s'] for r in labels],
     }
-    preemptions = []
+    preempted_ratio_pct = []
     for ratio in labels:
+        client = throughput[ratio]
+        denominator = client['planned']
+        if denominator != 280 or client['attempted'] != denominator or (
+            client['statuses'].get('success') != denominator
+        ):
+            raise ValueError(f'{ratio}: figure requires all 280 requests completed')
+        preempted_ids = set()
+        restart_events = 0
+        with (runs[ratio] / 'traces' / 'stage_events.jsonl').open() as stream:
+            for line in stream:
+                if 'full_pipeline_restarted' not in line:
+                    continue
+                event = json.loads(line)
+                if (event.get('event') == 'full_pipeline_restarted'
+                        and event.get('stage_id') == 1
+                        and event.get('preemption_cause') == 'allocation_failure'):
+                    preempted_ids.add(event['logical_request_id'])
+                    restart_events += 1
         summary = json.loads((runs[ratio] / 'ratio_summary.json').read_text())
-        preemptions.append(sum(
+        recorded_events = sum(
             counts.get('passive_preemption', 0)
             for pool, counts in summary['events_by_pool'].items()
             if pool.startswith('1:')
-        ))
-    fig4, (lat_ax, count_ax) = plt.subplots(
-        1, 2, figsize=(11.5, 4.5), layout='constrained',
-        gridspec_kw={'width_ratios': [2.1, 1]},
-    )
+        )
+        if restart_events != recorded_events:
+            raise ValueError(f'{ratio}: restart/preemption event count mismatch')
+        preempted_ratio_pct.append(len(preempted_ids) / denominator * 100)
+
+    fig4, lat_ax = plt.subplots(figsize=(11.5, 5), layout='constrained')
+    ratio_ax = lat_ax.twinx()
     centers = list(range(len(labels)))
     width = 0.24
     for index, (metric, values) in enumerate(latency.items()):
@@ -139,24 +160,47 @@ def main() -> None:
             [center + (index - 1) * width for center in centers],
             values, width=width, label=metric,
         )
-        lat_ax.bar_label(bars, fmt='%.1f', padding=3, fontsize=8)
+        bar_labels = [f'{value:.1f}' for value in values]
+        if metric == 'TTFP':
+            # The 4:2 red point falls near the top of this orange bar.
+            bar_labels[1] = ''
+        lat_ax.bar_label(bars, labels=bar_labels, padding=3, fontsize=9)
+        if metric == 'TTFP':
+            bar = bars[1]
+            lat_ax.annotate(
+                f'{values[1]:.1f}',
+                (bar.get_x() + bar.get_width() / 2, values[1]),
+                xytext=(0, -5), textcoords='offset points',
+                ha='center', va='top', fontsize=9,
+            )
     lat_ax.set_xticks(centers, labels)
-    lat_ax.set_ylim(0, max(max(values) for values in latency.values()) * 1.20)
-    lat_ax.set(xlabel='Thinker:Talker GPU ratio', ylabel='P95 latency (s)',
-               title='Request latency P95')
-    lat_ax.legend(frameon=False, ncol=3, loc='upper right')
+    lat_ax.set_ylim(0, max(max(values) for values in latency.values()) * 1.19)
+    lat_ax.set(xlabel='Thinker:Talker GPU ratio', ylabel='P95 latency (s)')
     lat_ax.grid(axis='y', alpha=0.2)
     lat_ax.set_axisbelow(True)
 
-    bars = count_ax.bar(labels, preemptions, width=0.56, color='C3')
-    count_ax.bar_label(bars, fmt='%d', padding=3)
-    count_ax.set_ylim(0, max(preemptions) * 1.25)
-    count_ax.set(xlabel='Thinker:Talker GPU ratio',
-                 ylabel='Preemption events (count)',
-                 title='Talker memory-triggered preemptions')
-    count_ax.grid(axis='y', alpha=0.2)
-    count_ax.set_axisbelow(True)
-    fig4.suptitle('Measured P95 latency and passive preemption | 280 completed requests per run')
+    ratio_ax.plot(
+        centers, preempted_ratio_pct, color='tab:red', marker='o',
+        markersize=8, linewidth=2, label='Preempted', zorder=5,
+    )
+    ratio_ax.set_ylim(0, max(10.0, max(preempted_ratio_pct) * 1.25))
+    ratio_ax.set_ylabel('Preempted Ratio (%)', color='tab:red')
+    ratio_ax.tick_params(axis='y', colors='tab:red')
+    ratio_ax.spines['right'].set_color('tab:red')
+    for x, value in zip(centers, preempted_ratio_pct):
+        ratio_ax.annotate(
+            f'{value:.2f}%', (x, value), xytext=(0, 10),
+            textcoords='offset points', ha='center',
+            color='tab:red', fontsize=9, fontweight='bold',
+        )
+    handles, names = lat_ax.get_legend_handles_labels()
+    ratio_handles, ratio_names = ratio_ax.get_legend_handles_labels()
+    lat_ax.legend(handles + ratio_handles, names + ratio_names,
+                  frameon=False, ncol=4, loc='upper right')
+    fig4.suptitle(
+        'Measured P95 latency and preempted request ratio | 280 completed requests per run\n'
+        'Preempted = distinct Talker requests restarted after KV allocation failure / 280'
+    )
     fig4.savefig(a.output_prefix.with_name('latency_p95_and_preemptions').with_suffix('.png'), dpi=320)
     fig4.savefig(a.output_prefix.with_name('latency_p95_and_preemptions').with_suffix('.pdf'))
     plt.close(fig4)

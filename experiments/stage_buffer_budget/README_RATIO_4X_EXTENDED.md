@@ -37,4 +37,4 @@ docker exec vllm_omni_privileged python3 \
 
 主指标为全体 280 条无超时完成时的实际排空跨度，以及 `280 / 排空跨度`；同时记录请求原始 TTFT、TTFP、E2E 和客户端接受的音频内容／排空跨度。若仍有截尾，原始延迟保留空值及原因，并仅报告“900 秒约束下”的完成率。原生 allocator KV 池轨迹继续分别按 GPU 记录，不把它称为请求持有 `B_live`。绘图对齐相同回放零点，展示至三组中最晚的实际观察终点，不将安全上限后的空闲时间填入吞吐分母。
 
-分析、`run_manifest.json`、GPU PID 映射与 PNG/PDF 命令同 [`README_RATIO_4X.md`](README_RATIO_4X.md) 的后半部分，唯一不同是本轮结果目录 `$BASE`、源码提交和 900 秒参数。代码会从 `protocol.json` 读取实际超时设置，不再写死 270 秒。`plot_ratio_4x.py` 同时生成 `latency_p95_and_preemptions.png`／`.pdf`，把 TTFT／TTFP／E2E P95（秒）与 Talker 被动抢占事件数分轴展示。三组均做 1 次探索性实测，不能用时间采样点充当重复实验。
+分析、`run_manifest.json`、GPU PID 映射与 PNG/PDF 命令同 [`README_RATIO_4X.md`](README_RATIO_4X.md) 的后半部分，唯一不同是本轮结果目录 `$BASE`、源码提交和 900 秒参数。代码会从 `protocol.json` 读取实际超时设置，不再写死 270 秒。`plot_ratio_4x.py` 同时生成 `latency_p95_and_preemptions.png`／`.pdf`：左轴是 TTFT／TTFP／E2E P95（秒），右轴红线 `Preempted` 是发生过 Talker KV 分配失败被动抢占的去重请求数除以本组 280 个请求。三组分别为 21／280（7.50%）、12／280（4.29%）、12／280（4.29%）；原始抢占事件数仍为 24、12、13 次。三组均做 1 次探索性实测，不能用时间采样点充当重复实验。
