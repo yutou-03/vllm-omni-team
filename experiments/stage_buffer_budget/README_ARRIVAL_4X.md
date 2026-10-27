@@ -1,4 +1,6 @@
-# `mixed_pressure` 4× 到达密度压力复跑
+# 历史试验：`mixed_pressure` 70 条／30 秒到达时间压缩
+
+本文件记录的是旧版“只压缩时间”的实测；用户现在要求的“四倍请求数且四倍时间压缩”是 [280 条／30 秒新轨迹](README_280_IN_30S.md)。两者不能混称。
 
 冻结轨迹保留原始 70 条真实多模态请求及其内容、顺序和采样参数，只将 `arrival_offset_s` 除以 4：120 秒计划注入窗口缩为 30 秒，计划平均到达率从 0.5833 增至 2.3333 请求/秒。轨迹文件为 [`workloads/mixed_pressure_arrival_4x.jsonl`](workloads/mixed_pressure_arrival_4x.jsonl)，相邻 manifest 记录输入与派生 SHA-256。运行时所用源码是提交 `9106d309b7acccf6990da53b57080d726eef65ac` 的干净 Git 工作树；固定工作树中另一个对话正在改动的控制器文件没有进入该实测。
 

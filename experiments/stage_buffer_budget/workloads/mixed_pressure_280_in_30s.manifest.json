@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "kind": "request_replicated_and_arrival_scaled",
+  "source": "/home/zhongyu/research_reports/servegen_active_buffer_20261012/mixed_pressure.jsonl",
+  "source_sha256": "b92e11900eec4ad6f93829a4b459a03adbadf105e096c674a397f22fce785984",
+  "output": "/home/zhongyu/project/vllm-omni-buffer/experiments/stage_buffer_budget/workloads/mixed_pressure_280_in_30s.jsonl",
+  "output_sha256": "5c3b04742649a4bd694a46b7850fab6e8fd6e9d40cb50c4a1e6edca867197693",
+  "transformation": "for each source request create request_factor unique IDs at source arrival/time_factor",
+  "request_factor": 4,
+  "time_factor": "4",
+  "source_window_s": 120.0,
+  "derived_window_s": 30.0,
+  "source_request_count": 70,
+  "request_count": 280,
+  "source_rate_rps": 0.5833333333333334,
+  "derived_rate_rps": 9.333333333333334,
+  "relative_rate_factor": 16.0,
+  "source_last_arrival_s": 113.58210287408285,
+  "derived_last_arrival_s": 28.395525718520712,
+  "source_modality_counts": {
+    "video": 23,
+    "audio": 23,
+    "image": 24
+  },
+  "derived_modality_counts": {
+    "video": 92,
+    "audio": 92,
+    "image": 96
+  },
+  "distinct_source_payloads": 70,
+  "contents_are_repeated": true,
+  "replicas_share_planned_arrival": true,
+  "identity_fields_changed": [
+    "source_request_id",
+    "request_id"
+  ],
+  "all_other_nonarrival_fields_unchanged": true
+}

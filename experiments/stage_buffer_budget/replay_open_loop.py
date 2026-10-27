@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import Counter
+from decimal import Decimal
 import hashlib
 import json
 import statistics
@@ -38,8 +40,41 @@ def audio_padding_entries(workload: Path) -> dict[str, dict]:
         manifest = json.loads(manifest_path.read_text())
         if manifest["output_sha256"] != workload_sha256:
             raise ValueError("workload bytes differ from its frozen manifest")
-        if manifest.get("request_ids_and_all_nonarrival_fields_unchanged") is not True:
-            raise ValueError("audio audit requires an arrival-only workload derivation")
+        kind = manifest.get("kind")
+        if kind == "arrival_scaled_from_existing_multimodal_trace":
+            if manifest.get("request_ids_and_all_nonarrival_fields_unchanged") is not True:
+                raise ValueError("arrival-only workload differs from its source")
+        elif kind == "request_replicated_and_arrival_scaled":
+            source = Path(manifest["source"])
+            if hashlib.sha256(source.read_bytes()).hexdigest() != manifest["source_sha256"]:
+                raise ValueError("replicated workload source hash differs from manifest")
+            originals = {str(row["source_request_id"]): row for row in
+                         (json.loads(line) for line in source.read_text().splitlines() if line.strip())}
+            replicas = [json.loads(line) for line in workload.read_text().splitlines() if line.strip()]
+            factor = int(manifest["request_factor"])
+            if len(replicas) != len(originals) * factor or manifest.get("contents_are_repeated") is not True:
+                raise ValueError("replicated workload count or provenance invalid")
+            seen = Counter()
+            for row in replicas:
+                original_id = str(row["replica_of_source_request_id"])
+                original = originals.get(original_id)
+                replica_index = row["replica_index"]
+                if original is None or not isinstance(replica_index, int) or not 0 <= replica_index < factor:
+                    raise ValueError("invalid replica provenance")
+                seen[(original_id, replica_index)] += 1
+                suffix = f"__replica{replica_index}"
+                if (row["source_request_id"] != original_id + suffix or
+                        row["request_id"] != str(original["request_id"]) + suffix or
+                        row["arrival_offset_s"] != float(Decimal(str(original["arrival_offset_s"])) /
+                                                          Decimal(str(manifest["time_factor"])))):
+                    raise ValueError("replica ID or arrival differs from frozen rule")
+                for key, value in original.items():
+                    if key not in ("source_request_id", "request_id", "arrival_offset_s") and row.get(key) != value:
+                        raise ValueError(f"replica field {key} differs from source")
+            if len(seen) != len(replicas) or any(count != 1 for count in seen.values()):
+                raise ValueError("replica ID is missing or repeated")
+        else:
+            raise ValueError(f"unsupported workload manifest kind: {kind}")
         source_sha256 = manifest["source_sha256"]
     audit_path = ARCHIVED_CLIENT / "audio_padding_validation.json"
     if not audit_path.exists():
@@ -114,11 +149,14 @@ def main() -> None:
     model = get_json(args.endpoint, "/v1/models")["data"][0]["id"]
     drained_before = wait_drained(args.endpoint, 30)
     audio_expected = audio_padding_entries(args.workload)
+    adjusted_audio_request_ids = []
     prepared = []
     for row in rows:
         record = copy.deepcopy(row)
-        cpu = audio_expected.get(record["source_request_id"])
+        cpu = audio_expected.get(record.get("replica_of_source_request_id",
+                                        record["source_request_id"]))
         if cpu is not None:
+            adjusted_audio_request_ids.append(record["source_request_id"])
             if record["actual_processor_input_tokens"] != cpu["original_expected_tokens"]:
                 raise ValueError("audio prompt count differs from archived audit")
             record["initial_hf_unpadded_expected_tokens"] = record["actual_processor_input_tokens"]
@@ -146,7 +184,7 @@ def main() -> None:
         "drained_before": drained_before,
         "client_source": str(ARCHIVED_CLIENT),
         "audio_padding_audit": str(ARCHIVED_CLIENT / "audio_padding_validation.json"),
-        "audio_padding_adjusted_requests": sorted(audio_expected),
+        "audio_padding_adjusted_requests": sorted(adjusted_audio_request_ids),
     })
     traces = args.session_dir / "traces"
     before = trace_offsets(traces)
