@@ -25,6 +25,7 @@ def main() -> None:
     if tuple(runs) != ('4:1', '4:2', '4:3'):
         p.error('pass 4:1, 4:2, 4:3 in that order')
     fig, axs = plt.subplots(3, 2, figsize=(12, 8.5), sharex=True, layout='constrained')
+    aggregate = {}
     for row_index, (ratio, run) in enumerate(runs.items()):
         summary = json.loads((run / 'ratio_summary.json').read_text())
         series = defaultdict(list)
@@ -34,6 +35,18 @@ def main() -> None:
                 series[key].append((float(sample['relative_time_s']),
                                     int(sample['used_bytes_per_rank']) / 1e9,
                                     int(sample['pool_bytes_per_rank']) / 1e9))
+        talker_updates = sorted((t, pid, used) for (stage, pid), samples in series.items()
+                                if stage == 1 for t, used, _ in samples)
+        latest = {}
+        curve = [(0.0, 0.0)]
+        for t, pid, used in talker_updates:
+            if t < 0 or t > 270:
+                continue
+            latest[pid] = used
+            curve.append((t, sum(latest.values())))
+        if summary.get('drained_after') is True and curve:
+            curve.append((270.0, curve[-1][1]))
+        aggregate[ratio] = curve
         for (stage, pid), samples in sorted(series.items()):
             samples.sort()
             # A final allocator-free event records the pool state after its last schedule.
@@ -65,6 +78,19 @@ def main() -> None:
     fig.savefig(a.output_prefix.with_suffix('.png'), dpi=320)
     fig.savefig(a.output_prefix.with_suffix('.pdf'))
     plt.close(fig)
+    fig2, ax = plt.subplots(figsize=(10, 4), layout='constrained')
+    for ratio, curve in aggregate.items():
+        ax.step([t for t, _ in curve], [gb for _, gb in curve], where='post',
+                label=ratio, linewidth=1.5)
+    ax.set(xlim=(0, 270), ylim=(0, None), xlabel='Time since frozen replay start (s)',
+           ylabel='Talker native KV used across GPUs (GB)',
+           title='Measured Talker KV residency across independent replica pools')
+    ax.axvline(30, color='0.4', linestyle='--', linewidth=0.8)
+    ax.grid(axis='y', alpha=0.2)
+    ax.legend(frameon=False)
+    fig2.savefig(a.output_prefix.with_name('talker_aggregate_kv').with_suffix('.png'), dpi=320)
+    fig2.savefig(a.output_prefix.with_name('talker_aggregate_kv').with_suffix('.pdf'))
+    plt.close(fig2)
 
 
 if __name__ == '__main__':
