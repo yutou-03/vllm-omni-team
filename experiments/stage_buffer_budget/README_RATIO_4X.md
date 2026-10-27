@@ -69,4 +69,4 @@ python3 "$ANALYSIS/plot_ratio_4x.py" \
   --output-prefix "$BASE/kv_pool_ratio_4x"
 ```
 
-该命令输出各独立池的 `kv_pool_ratio_4x.png/pdf`，以及将不同 Talker 卡实际占用量相加的 `talker_aggregate_kv.png/pdf`。后者是跨卡总物理字节数对比，不代表这些容量在单个请求或单个副本之间可互借。
+该命令输出各独立池的 `kv_pool_ratio_4x.png/pdf`，以及将不同 Talker 卡实际占用量相加的 `talker_aggregate_kv.png/pdf`。后者是跨卡总物理字节数对比，不代表这些容量在单个请求或单个副本之间可互借。另输出 `useful_output_ratio_4x.png/pdf`，展示固定 270 秒窗口内的成功完成速率和客户端接受的音频内容速率。

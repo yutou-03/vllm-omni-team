@@ -26,8 +26,10 @@ def main() -> None:
         p.error('pass 4:1, 4:2, 4:3 in that order')
     fig, axs = plt.subplots(3, 2, figsize=(12, 8.5), sharex=True, layout='constrained')
     aggregate = {}
+    throughput = {}
     for row_index, (ratio, run) in enumerate(runs.items()):
         summary = json.loads((run / 'ratio_summary.json').read_text())
+        throughput[ratio] = summary['client']
         series = defaultdict(list)
         with (run / 'kv_pools_by_engine.csv').open(newline='') as f:
             for sample in csv.DictReader(f):
@@ -91,6 +93,23 @@ def main() -> None:
     fig2.savefig(a.output_prefix.with_name('talker_aggregate_kv').with_suffix('.png'), dpi=320)
     fig2.savefig(a.output_prefix.with_name('talker_aggregate_kv').with_suffix('.pdf'))
     plt.close(fig2)
+    fig3, out_axes = plt.subplots(1, 2, figsize=(9, 3.6), layout='constrained')
+    labels = list(throughput)
+    rates = [throughput[r]['successes_per_s_fixed_horizon'] for r in labels]
+    audio = [throughput[r]['accepted_audio_content_seconds_per_wall_s_fixed_horizon']
+             for r in labels]
+    for ax, values, ylabel in (
+        (out_axes[0], rates, 'Completed requests / wall s'),
+        (out_axes[1], audio, 'Accepted audio seconds / wall s')):
+        bars = ax.bar(labels, values, width=0.6)
+        ax.bar_label(bars, fmt='%.2f', padding=3, fontsize=9)
+        ax.set(ylabel=ylabel, ylim=(0, max(values) * 1.18 if values else 1))
+        ax.grid(axis='y', alpha=0.2)
+        ax.set_axisbelow(True)
+    fig3.suptitle('Measured finite-trace output within the common 270 s horizon')
+    fig3.savefig(a.output_prefix.with_name('useful_output_ratio_4x').with_suffix('.png'), dpi=320)
+    fig3.savefig(a.output_prefix.with_name('useful_output_ratio_4x').with_suffix('.pdf'))
+    plt.close(fig3)
 
 
 if __name__ == '__main__':
