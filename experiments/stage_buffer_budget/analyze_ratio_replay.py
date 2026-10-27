@@ -29,12 +29,12 @@ def percentile(values: list[float], quantile: float) -> float | None:
     return values[min(len(values) - 1, math.ceil(quantile * len(values)) - 1)]
 
 
-def client_metrics(results: dict) -> dict:
+def client_metrics(results: dict, timeout_s: float) -> dict:
     rows = results["results"]
     origin = results["origin_monotonic_s"]
     window = results["arrival_window_s"]
     observed_end = max(row["client_completion_monotonic_s"] for row in rows) - origin
-    fixed_horizon = window + 240.0
+    fixed_horizon = window + timeout_s
     completed = [row for row in rows if row["status"] == "success"]
     audio_chunks = [chunk for row in rows for chunk in row.get("audio_chunks", ())]
     in_window = [chunk for chunk in audio_chunks
@@ -51,6 +51,9 @@ def client_metrics(results: dict) -> dict:
             row["client_completion_monotonic_s"] - origin < window for row in completed
         ),
         "observed_successes_per_s": len(completed) / observed_end,
+        "accepted_audio_content_seconds_per_wall_s_observed_span": sum(
+            chunk["duration_s"] for chunk in audio_chunks) / observed_end,
+        "all_requests_completed_without_timeout": len(completed) == len(rows),
         "fixed_horizon_s": fixed_horizon,
         "successes_by_fixed_horizon": sum(row["client_completion_monotonic_s"] - origin <= fixed_horizon for row in completed),
         "successes_per_s_fixed_horizon": sum(row["client_completion_monotonic_s"] - origin <= fixed_horizon for row in completed) / fixed_horizon,
@@ -174,7 +177,8 @@ def main() -> None:
         process_rows = json.loads(args.pid_gpu_map.read_text())["processes"]
         gpu_by_pid = {row["container_pid"]: row["gpu_index"] for row in process_rows if row.get("container_pid") is not None}
     origin = results["origin_monotonic_s"]
-    metrics = client_metrics(results)
+    protocol = json.loads((args.run_dir / "protocol.json").read_text())
+    metrics = client_metrics(results, float(protocol["timeout_s"]))
     pools, events = load_pools(args.run_dir, origin)
     if not pools:
         raise ValueError("no measured KV-pool snapshots")

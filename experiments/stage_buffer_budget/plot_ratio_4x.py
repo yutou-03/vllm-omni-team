@@ -24,6 +24,8 @@ def main() -> None:
         runs[ratio] = Path(path)
     if tuple(runs) != ('4:1', '4:2', '4:3'):
         p.error('pass 4:1, 4:2, 4:3 in that order')
+    common_horizon = max(json.loads((run / 'ratio_summary.json').read_text())
+                         ['client']['observed_end_s'] for run in runs.values())
     fig, axs = plt.subplots(3, 2, figsize=(12, 8.5), sharex=True, layout='constrained')
     aggregate = {}
     throughput = {}
@@ -42,20 +44,20 @@ def main() -> None:
         latest = {}
         curve = [(0.0, 0.0)]
         for t, pid, used in talker_updates:
-            if t < 0 or t > 270:
+            if t < 0 or t > common_horizon:
                 continue
             latest[pid] = used
             curve.append((t, sum(latest.values())))
         if summary.get('drained_after') is True and curve:
-            curve.append((270.0, curve[-1][1]))
+            curve.append((common_horizon, curve[-1][1]))
         aggregate[ratio] = curve
         for (stage, pid), samples in sorted(series.items()):
             samples.sort()
             # A final allocator-free event records the pool state after its last schedule.
             # Once the service reports drained, carry that measured state to the
-            # common 270 s comparison horizon.
-            if summary['client']['fixed_horizon_s'] > samples[-1][0] and summary.get('drained_after') is True:
-                samples.append((summary['client']['fixed_horizon_s'], samples[-1][1], samples[-1][2]))
+            # common observed comparison horizon.
+            if common_horizon > samples[-1][0] and summary.get('drained_after') is True:
+                samples.append((common_horizon, samples[-1][1], samples[-1][2]))
             ax = axs[row_index, stage]
             gpu = summary['gpu_by_engine_pid'].get(str(pid))
             label = f'GPU {gpu}' if gpu is not None else f'engine {pid}'
@@ -70,7 +72,7 @@ def main() -> None:
             ax.set_title(f'{ratio}  |  {title}', fontsize=10)
             ax.set_ylabel('Native KV used (GB)')
             ax.axvline(30, color='0.4', linestyle='--', linewidth=0.8)
-            ax.set_xlim(0, 270)
+            ax.set_xlim(0, common_horizon)
             ax.grid(axis='y', alpha=0.2)
             ax.legend(frameon=False, fontsize=8, loc='upper right')
     for ax in axs[-1]:
@@ -84,7 +86,7 @@ def main() -> None:
     for ratio, curve in aggregate.items():
         ax.step([t for t, _ in curve], [gb for _, gb in curve], where='post',
                 label=ratio, linewidth=1.5)
-    ax.set(xlim=(0, 270), ylim=(0, None), xlabel='Time since frozen replay start (s)',
+    ax.set(xlim=(0, common_horizon), ylim=(0, None), xlabel='Time since frozen replay start (s)',
            ylabel='Talker native KV used across GPUs (GB)',
            title='Measured Talker KV residency across independent replica pools')
     ax.axvline(30, color='0.4', linestyle='--', linewidth=0.8)
@@ -95,8 +97,8 @@ def main() -> None:
     plt.close(fig2)
     fig3, out_axes = plt.subplots(1, 2, figsize=(9, 3.6), layout='constrained')
     labels = list(throughput)
-    rates = [throughput[r]['successes_per_s_fixed_horizon'] for r in labels]
-    audio = [throughput[r]['accepted_audio_content_seconds_per_wall_s_fixed_horizon']
+    rates = [throughput[r]['observed_successes_per_s'] for r in labels]
+    audio = [throughput[r]['accepted_audio_content_seconds_per_wall_s_observed_span']
              for r in labels]
     for ax, values, ylabel in (
         (out_axes[0], rates, 'Completed requests / wall s'),
@@ -106,7 +108,7 @@ def main() -> None:
         ax.set(ylabel=ylabel, ylim=(0, max(values) * 1.18 if values else 1))
         ax.grid(axis='y', alpha=0.2)
         ax.set_axisbelow(True)
-    fig3.suptitle('Measured finite-trace output within the common 270 s horizon')
+    fig3.suptitle('Measured finite-trace output / each run observed completion span')
     fig3.savefig(a.output_prefix.with_name('useful_output_ratio_4x').with_suffix('.png'), dpi=320)
     fig3.savefig(a.output_prefix.with_name('useful_output_ratio_4x').with_suffix('.pdf'))
     plt.close(fig3)

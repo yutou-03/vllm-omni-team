@@ -23,7 +23,7 @@ from pathlib import Path
 ARCHIVED_CLIENT = Path("/home/zhongyu/research_reports/servegen_active_buffer_20261012")
 sys.path.insert(0, str(ARCHIVED_CLIENT))
 from replay import materialize  # noqa: E402
-from sse_client import atomic_json, send_request  # noqa: E402
+from sse_client_extended import atomic_json, send_request  # noqa: E402
 
 
 def get_json(endpoint: str, path: str) -> dict:

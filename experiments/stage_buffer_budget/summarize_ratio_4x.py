@@ -43,14 +43,14 @@ def main() -> None:
         area = 0.0
         peak = 0
         for t, pid, used in updates:
-            if not 0 <= t <= c['fixed_horizon_s']:
+            if not 0 <= t <= c['observed_end_s']:
                 continue
             area += sum(latest.values()) * (t - last_t)
             latest[pid] = used
             peak = max(peak, sum(latest.values()))
             last_t = t
         if summary['drained_after']:
-            area += sum(latest.values()) * (c['fixed_horizon_s'] - last_t)
+            area += sum(latest.values()) * (c['observed_end_s'] - last_t)
         result.append({
             'ratio': ratio,
             'run_dir': str(run.resolve()),
@@ -63,6 +63,10 @@ def main() -> None:
             'run_error': raw['run_error'],
             'drained_after': summary['drained_after'],
             'fixed_horizon_s': c['fixed_horizon_s'],
+            'observed_completion_span_s': c['observed_end_s'],
+            'completed_req_per_s_observed_span': c['observed_successes_per_s'],
+            'audio_content_s_per_wall_s_observed_span': c['accepted_audio_content_seconds_per_wall_s_observed_span'],
+            'all_requests_completed_without_timeout': c['all_requests_completed_without_timeout'],
             'successes_by_fixed_horizon': c['successes_by_fixed_horizon'],
             'success_req_per_s_fixed_horizon': c['successes_per_s_fixed_horizon'],
             'audio_frames_per_s_fixed_horizon': c['accepted_audio_frames_per_s_fixed_horizon'],
@@ -82,8 +86,8 @@ def main() -> None:
             'talker_pool_gb_per_replica': talker[0]['pool_bytes_per_rank'] / 1e9,
             'talker_total_pool_gb_across_gpus': sum(v['pool_bytes_per_rank'] for v in talker) / 1e9,
             'talker_aggregate_peak_used_gb': peak / 1e9,
-            'talker_aggregate_mean_used_gb_fixed_horizon': (
-                area / c['fixed_horizon_s'] / 1e9 if summary['drained_after'] else ''),
+            'talker_aggregate_mean_used_gb_observed_span': (
+                area / c['observed_end_s'] / 1e9 if summary['drained_after'] else ''),
             'talker_mean_native_pct_each': json.dumps([
                 round(v['mean_native_usage_pct_observed'], 3) for v in talker]),
             'talker_peak_native_pct_each': json.dumps([round(v['peak_native_usage_pct'], 3)
