@@ -30,14 +30,17 @@ def main() -> None:
         series = defaultdict(list)
         with (run / 'kv_pools_by_engine.csv').open(newline='') as f:
             for sample in csv.DictReader(f):
-                if sample['measurement_source'] != 'snapshot':
-                    continue
                 key = int(sample['stage_id']), int(sample['engine_pid'])
                 series[key].append((float(sample['relative_time_s']),
                                     int(sample['used_bytes_per_rank']) / 1e9,
                                     int(sample['pool_bytes_per_rank']) / 1e9))
         for (stage, pid), samples in sorted(series.items()):
             samples.sort()
+            # A final allocator-free event records the pool state after its last schedule.
+            # Once the service reports drained, carry that measured state to the
+            # common 270 s comparison horizon.
+            if summary['client']['fixed_horizon_s'] > samples[-1][0] and summary.get('drained_after') is True:
+                samples.append((summary['client']['fixed_horizon_s'], samples[-1][1], samples[-1][2]))
             ax = axs[row_index, stage]
             gpu = summary['gpu_by_engine_pid'].get(str(pid))
             label = f'GPU {gpu}' if gpu is not None else f'engine {pid}'

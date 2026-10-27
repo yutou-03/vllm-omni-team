@@ -197,6 +197,8 @@ def main() -> None:
     summary = {
         "run_dir": str(args.run_dir.resolve()),
         "metric": "native allocator KV occupancy per independent engine pool, not B_live",
+        "drained_after": bool(results.get("drained_after") and results["drained_after"].get("drained")),
+        "run_error": results.get("run_error"),
         "thinker_tp_note": "one scheduler snapshot represents each synchronized TP rank; bytes are per rank",
         "client": metrics,
         "pools": {f"{stage}:{pid}": summarize_pool(rows, block_sizes[stage], origin,
