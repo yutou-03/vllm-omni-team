@@ -14,8 +14,13 @@ def stats(values):
 def trace_summary(path, response_ids):
     produced=collections.defaultdict(list);chains=[];current={};active=set();peak=0;errors=[]
     queues={};reasons=collections.Counter();caps={};final_delivery={}
+    sent=collections.defaultdict(set);received=collections.defaultdict(set);consumed=collections.defaultdict(set)
     for line in path.open():
         e=json.loads(line);name=e['event'];sid=e.get('stage_id');rid=e.get('physical_request_id') or e.get('request_id');t=e['monotonic'];key=(sid,rid)
+        transfer=(rid,e.get('pipeline_attempt_id',0),e.get('stage_attempt_id',0))
+        if name in ['stage_study_text_payload_sent','stage_study_chunk_sent']:sent[(sid,transfer)].add(e['chunk_id'])
+        if name in ['stage_study_text_payload_received','stage_study_chunk_received']:received[(sid-1,transfer)].add(e['chunk_id'])
+        if name=='stage_study_chunk_conversion_started':consumed[(1,transfer)].add(e['chunk_id'])
         if name=='small_hold_capacity_configured':caps[str(sid)]={k:e.get(k) for k in ['execution_cap','resident_cap','hold_enabled']}
         if name=='stage_study_thinker_output_produced' and rid in response_ids:produced[rid].append((t,e['generated_output_tokens_total']))
         if name=='stage_buffer_decision':
@@ -47,6 +52,10 @@ def trace_summary(path, response_ids):
         if q['enqueued']!=list(range(len(q['enqueued']))) or q['released']!=q['enqueued']:
             errors.append({'reason':'receiver_enqueue_release_sequence','stage':key[0],'request':key[1],
                 'enqueued':len(q['enqueued']),'released':len(q['released'])})
+    for key,ids in received.items():
+        if ids-sent[key]:errors.append({'reason':'received_without_published','stage':key[0],'request':key[1][0]})
+    for key,ids in consumed.items():
+        if ids-received[key]:errors.append({'reason':'consumed_without_received','stage':key[0],'request':key[1][0]})
     for c in chains:
         keys=['requested','admitted','released','rescheduled','new_output']
         c['complete']=all(k in c for k in keys) and all(c[x]<=c[y] for x,y in zip(keys,keys[1:]))
@@ -100,12 +109,20 @@ def analyze_arm(root,arm,tokenizer):
         e2e_ok=r['e2e_s']<=row['slo_ms']/1000
         full=complete and ttft_ok and first_ok and continuity and tpot_ok and e2e_ok
         nw=request_score(row,r,without_w,tokenizer)
+        pcm_hash=None
+        if row['request_path']=='audio':
+            import soundfile as sf
+            pcm=hashlib.sha256()
+            for chunk in r['audio_chunks']:
+                samples,sample_rate=sf.read(Path(r['artifact_directory'])/chunk['path'],dtype='float64',always_2d=True)
+                pcm.update(samples.astype('<f8').tobytes())
+            pcm_hash=pcm.hexdigest()
         per.append({'request_id':row['source_request_id'],'path':row['request_path'],'tier':row['slo_tier'],
             'complete':complete,'generated_tokens':n,'wire_tokens':len(r['text_token_ids']),'full_slo_met':full,
             'ttft_s':r['ttft_s'],'ttfp_s':r['ttfp_s'],'ttft_slo_met':ttft_ok,'first_slo_met':first_ok,
             'tpot_s':tpot,'production_tpot_s':production_tpot,'tpot_slo_met':tpot_ok,'continuity_met':continuity,
             'e2e_s':r['e2e_s'],'e2e_met':e2e_ok,'stall_s':s['rebuffer_s'],'max_stall_s':s['max_rebuffer_s'],
-            'audio_duration_s':r['audio_duration_s'],'G_contribution':s['contribution'],'G_without_w_contribution':nw['contribution'],
+            'audio_duration_s':r['audio_duration_s'],'audio_pcm_sha256':pcm_hash,'G_contribution':s['contribution'],'G_without_w_contribution':nw['contribution'],
             'utility':s['utility'],'first_penalty':s.get('first_penalty',0.),'stall_penalty':config['mu']*s['rebuffer_s'],
             'send_lateness_s':r['send_lateness_s'],'token_sha256':r['text_token_ids_sha256'],
             'audio_signature':[(x['frames'],x['sample_rate'],x['decoded_sha256']) for x in r['audio_chunks']]})
@@ -170,10 +187,21 @@ def report(root):
             result[trace]={'relative_changes_pct':{k:100*(o[k]/b[k]-1) if b[k] else None for k in ['Gstream','Gstream_without_buffer_weight','generated_tokens_per_s','SLO_generated_tokens_per_s']},
                 'identical_text_token_hashes':sum(bp[k]['token_sha256']==op[k]['token_sha256'] for k in bp),
                 'audio_same_chunk_samples_and_hashes':sum(bp[k]['audio_signature']==op[k]['audio_signature'] for k in bp if bp[k]['path']=='audio'),
+                'audio_same_concatenated_pcm':sum(bp[k]['audio_pcm_sha256']==op[k]['audio_pcm_sha256'] for k in bp if bp[k]['path']=='audio'),
                 'audio_pairs':80}
     fig.tight_layout();fig.savefig(root/'ttft_cdf.png',dpi=180);fig.savefig(root/'ttft_cdf.svg');plt.close(fig)
     with (root/'ttft_cdf.csv').open('w') as f:
         w=csv.DictWriter(f,fieldnames=['trace','policy','group','ttft_s','cdf_all_offered']);w.writeheader();w.writerows(cdf_rows)
+    fig,axes=plt.subplots(1,2,figsize=(11,4))
+    for axis,trace in zip(axes,['poisson','burstgpt']):
+        for policy in ['native','ours']:
+            a=arms.get(policy+'_'+trace)
+            if a is None:continue
+            values=sorted(x['ttfp_s'] for x in a['requests'] if x['path']=='audio' and x['ttfp_s'] is not None)
+            axis.step([0]+values,[0]+[(i+1)/80 for i in range(len(values))],where='post',label=policy)
+        axis.set_title(trace+' / audio');axis.set_xlabel('First playable audio (s)');axis.set_ylabel('Fraction of offered audio requests');axis.set_ylim(0,1.02);axis.grid(alpha=.25)
+        if axis.lines:axis.legend()
+    fig.tight_layout();fig.savefig(root/'ttfp_cdf.png',dpi=180);fig.savefig(root/'ttfp_cdf.svg');plt.close(fig)
     (root/'comparison.json').write_text(json.dumps(result,indent=2)+'\n')
     lines+=['','## Definitions and validity','',
         '- Gstream retains the frozen continuous TTFT violation penalty and client-buffer weight; Gstream without that weight is also reported.',
