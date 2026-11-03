@@ -165,14 +165,15 @@ def analyze_arm(root,arm,tokenizer):
     return out
 
 
-def report(root):
-    import matplotlib;matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+def report(root, plots=False):
+    if plots:
+        import matplotlib;matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
     arms={p.parent.name:json.loads(p.read_text()) for p in root.glob('*/benchmark.json')}
     result={};lines=['# Mixed 200-request paired comparison','','One frozen seed per arrival trace. Every arm: 120 text + 80 audio.','',
         '| Trace | Policy | Gstream | Generated tokens/s | SLO tokens/s | Mean TTFT (s) | TTFT P95 (s) | Full SLO | Pauses / chains |',
         '|---|---|---:|---:|---:|---:|---:|---:|---:|']
-    fig,axes=plt.subplots(2,3,figsize=(15,8),squeeze=False)
+    if plots:fig,axes=plt.subplots(2,3,figsize=(15,8),squeeze=False)
     cdf_rows=[]
     for i,trace in enumerate(['poisson','burstgpt']):
         for policy in ['native','ours']:
@@ -184,9 +185,9 @@ def report(root):
                 requests=[x for x in a['requests'] if group=='all' or x['path']==group]
                 values=sorted(x['ttft_s'] for x in requests if x['ttft_s'] is not None)
                 y=[(k+1)/len(requests) for k in range(len(values))]
-                axes[i,j].step([0]+values,[0]+y,where='post',label=policy)
+                if plots:axes[i,j].step([0]+values,[0]+y,where='post',label=policy)
                 cdf_rows.extend({'trace':trace,'policy':policy,'group':group,'ttft_s':t,'cdf_all_offered':v} for t,v in zip(values,y))
-                axes[i,j].set_title(trace+' / '+group);axes[i,j].set_xlabel('TTFT (s)');axes[i,j].set_ylabel('Fraction of offered requests');axes[i,j].set_ylim(0,1.02);axes[i,j].grid(alpha=.25);axes[i,j].legend()
+                if plots:axes[i,j].set_title(trace+' / '+group);axes[i,j].set_xlabel('TTFT (s)');axes[i,j].set_ylabel('Fraction of offered requests');axes[i,j].set_ylim(0,1.02);axes[i,j].grid(alpha=.25);axes[i,j].legend()
         if 'native_'+trace in arms and 'ours_'+trace in arms:
             b,o=arms['native_'+trace],arms['ours_'+trace]
             bp={x['request_id']:x for x in b['requests']};op={x['request_id']:x for x in o['requests']}
@@ -195,19 +196,20 @@ def report(root):
                 'audio_same_chunk_samples_and_hashes':sum(bp[k]['audio_signature']==op[k]['audio_signature'] for k in bp if bp[k]['path']=='audio'),
                 'audio_same_concatenated_pcm':sum(bp[k]['audio_pcm_sha256']==op[k]['audio_pcm_sha256'] for k in bp if bp[k]['path']=='audio'),
                 'audio_pairs':80}
-    fig.tight_layout();fig.savefig(root/'ttft_cdf.png',dpi=180);fig.savefig(root/'ttft_cdf.svg');plt.close(fig)
+    if plots:fig.tight_layout();fig.savefig(root/'ttft_cdf.png',dpi=180);fig.savefig(root/'ttft_cdf.svg');plt.close(fig)
     with (root/'ttft_cdf.csv').open('w') as f:
         w=csv.DictWriter(f,fieldnames=['trace','policy','group','ttft_s','cdf_all_offered']);w.writeheader();w.writerows(cdf_rows)
-    fig,axes=plt.subplots(1,2,figsize=(11,4))
-    for axis,trace in zip(axes,['poisson','burstgpt']):
-        for policy in ['native','ours']:
-            a=arms.get(policy+'_'+trace)
-            if a is None:continue
-            values=sorted(x['ttfp_s'] for x in a['requests'] if x['path']=='audio' and x['ttfp_s'] is not None)
-            axis.step([0]+values,[0]+[(i+1)/80 for i in range(len(values))],where='post',label=policy)
-        axis.set_title(trace+' / audio');axis.set_xlabel('First playable audio (s)');axis.set_ylabel('Fraction of offered audio requests');axis.set_ylim(0,1.02);axis.grid(alpha=.25)
-        if axis.lines:axis.legend()
-    fig.tight_layout();fig.savefig(root/'ttfp_cdf.png',dpi=180);fig.savefig(root/'ttfp_cdf.svg');plt.close(fig)
+    if plots:
+        fig,axes=plt.subplots(1,2,figsize=(11,4))
+        for axis,trace in zip(axes,['poisson','burstgpt']):
+            for policy in ['native','ours']:
+                a=arms.get(policy+'_'+trace)
+                if a is None:continue
+                values=sorted(x['ttfp_s'] for x in a['requests'] if x['path']=='audio' and x['ttfp_s'] is not None)
+                axis.step([0]+values,[0]+[(i+1)/80 for i in range(len(values))],where='post',label=policy)
+            axis.set_title(trace+' / audio');axis.set_xlabel('First playable audio (s)');axis.set_ylabel('Fraction of offered audio requests');axis.set_ylim(0,1.02);axis.grid(alpha=.25)
+            if axis.lines:axis.legend()
+        fig.tight_layout();fig.savefig(root/'ttfp_cdf.png',dpi=180);fig.savefig(root/'ttfp_cdf.svg');plt.close(fig)
     (root/'comparison.json').write_text(json.dumps(result,indent=2)+'\n')
     lines+=['','## Definitions and validity','',
         '- Gstream retains the frozen continuous TTFT violation penalty and client-buffer weight; Gstream without that weight is also reported.',
@@ -222,8 +224,8 @@ def report(root):
     print('\n'.join(lines[:10]))
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--arm');p.add_argument('--report',action='store_true');a=p.parse_args()
-    if a.report:report(a.root)
+    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--arm');p.add_argument('--report',action='store_true');p.add_argument('--plots',action='store_true',help='Render figures; default reports only data');a=p.parse_args()
+    if a.report:report(a.root,plots=a.plots)
     else:
         from transformers import AutoTokenizer
         tokenizer=AutoTokenizer.from_pretrained('/data/models/Qwen3-Omni-30B-A3B-Instruct',local_files_only=True)
