@@ -13,8 +13,8 @@
 ## 指标
 
 - Gstream：沿用 soft_ttft_v2，β=μ=3.3，以固定到达窗口 T 归一化。另报去掉库存权重后的敏感性和分项，不能把位置敏感的分数改善归因为模型吞吐。
-- Generated tokens/s：Thinker 实际生成的 model token IDs，含音频路径伴随文本，计一次；除以最早计划到达至最后 Thinker 生成事件的时长。不是三阶段所有内部 token 的总和。
-- SLO tokens/s：完整且满足该请求全部预设路径 SLO 的生成 token 数，使用同一生成时长。
+- Generated tokens/s：Thinker 实际生成的 model token IDs，含音频路径伴随文本，计一次；主分母为最早计划到达至最后客户端完成，包含放行与排空成本；另报仅到最后 Thinker 生成事件的 engine 速率。不是三阶段所有内部 token 的总和。
+- SLO tokens/s：完整且满足该请求全部预设路径 SLO 的生成 token 数，使用同一完整观测时长。
 - 另报交付 tokens/s 与可播放音频秒/s，分母为最早到达至最后客户端完成。这样能看见末端 pacing 的真实成本。
 - Mean TTFT、TTFT CDF：全体、文本、音频分别报告。CDF 的分母含全部到达请求，无首输出请求不能从分母删除；均值说明有效样本数。音频 TTFP 另报。
 - 生产 TPOT、交付 TPOT、播放断流、完整率、暂停次数/完整链、实际暂停及恢复首输出时间。
