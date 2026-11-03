@@ -301,6 +301,29 @@ def urgent_setup(*, protected_extra=False):
 
 
 class UrgentKeepTests(unittest.TestCase):
+    def test_repeat_pause_uses_new_cycle_after_restore(self):
+        scheduler,p,c,clock,events,blocks,victim,urgent=urgent_setup()
+        c.config['max_holds_per_request']=0
+        c._try_urgent_keep(scheduler,clock.now,.05)
+        self.assertEqual(c.hold_counts['victim'],1)
+        p.holds.clear();p._urgent_pending.clear()
+        clock.now=101.
+        scheduler._slo_stage_fields=lambda r:(101.1,200.) if r is urgent else (110.,200.)
+        c._try_urgent_keep(scheduler,clock.now,.05)
+        self.assertEqual(c.hold_counts['victim'],2)
+        self.assertEqual(p.holds['victim'].evidence['pause_cycle'],2)
+
+    def test_inventory_lease_keeps_nominal_overrun_visible_without_false_suspension(self):
+        scheduler,p,c,clock,events,blocks,victim,urgent=urgent_setup()
+        c.config.update(inventory_deadline_lease=True,guard_full_urgent_service=True)
+        c.fields=lambda *args:dict(coverage_s=2.,high_s=.17,requested_hold_s=.1,low_s=.15,budget_s=1.84)
+        c._try_urgent_keep(scheduler,clock.now,.05)
+        clock.now=100.2
+        with p.scheduling_context():pass
+        self.assertFalse(p.buffer_policy_suspended)
+        release=[e for e in events if e['event']=='small_hold_released'][0]
+        self.assertGreater(release['deadline_lateness_s'],.05)
+
     def test_pause_count_tracks_waiters_candidates_and_resident_headroom(self):
         # (execution slots, urgent waiters, safe candidates, resident spare, expected)
         for k,waiters,safe,spare,expected in [(4,3,4,4,3),(4,4,4,4,4),

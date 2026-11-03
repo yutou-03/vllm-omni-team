@@ -148,6 +148,7 @@ class Controller:
         self.offset = 0
         self.state = defaultdict(Inventory)
         self.text_delivery = {}
+        self.hold_counts = defaultdict(int)
         self.last_call = None
         self.last_had_running = False
         self.ticks = deque(maxlen=64)
@@ -248,7 +249,8 @@ class Controller:
             return self.fields(request.request_id, now, guard)
         e = self.text_delivery.get(metadata.get('sched_logical_request_id'))
         fields = self.fields(request.request_id, now, guard)
-        if e is None or e.get('closed') or not e.get('first_content_released'):
+        if (e is None or e.get('closed') or not e.get('first_content_released')
+                or now-e['monotonic'] > self.config.get('max_text_observation_age_s', 1.)):
             return fields
         age = max(0., now-e['monotonic'])
         rate = e['tokens_per_s']
@@ -280,6 +282,13 @@ class Controller:
 
     def _try_one_urgent_keep(self, scheduler, now, guard):
         probe = scheduler._small_hold_probe
+        if not hasattr(self, 'hold_counts'):
+            self.hold_counts = defaultdict(int)
+        if self.config.get('inventory_deadline_lease') and not self.config.get('guard_full_urgent_service'):
+            raise ValueError('inventory deadline lease requires full urgent service protection')
+        repeat_limit = int(self.config.get('max_holds_per_request', 1))
+        if repeat_limit < 0:
+            raise ValueError('max_holds_per_request must be nonnegative; zero means no count limit')
         pending = set(probe._urgent_pending.values())
         waiting = [r for r in scheduler.waiting if r.request_id not in pending]
         if not waiting:
@@ -316,8 +325,8 @@ class Controller:
             rid = request.request_id
             decode_boundary = probe._at_decode_boundary(request)
             fields = self.request_fields(request, now, guard)
-            if rid in probe.accepted_request_ids:
-                rejection = 'already_held_once'
+            if repeat_limit and self.hold_counts.get(rid, int(rid in probe.accepted_request_ids)) >= repeat_limit:
+                rejection = 'pause_count_limit'
             elif not decode_boundary:
                 rejection = 'not_decode_boundary'
             elif fields['coverage_s'] is None:
@@ -381,6 +390,9 @@ class Controller:
                         slack_ms=slack_ms, trigger_ms=trigger_ms)
             return
         evidence = dict(fields, urgent_request_id=str(urgent.request_id),
+                        pause_cycle=self.hold_counts[victim.request_id]+1,
+                        inventory_deadline_lease=bool(self.config.get('inventory_deadline_lease', False)),
+                        resume_by_monotonic_s=now+fields.get('budget_s', fields['coverage_s']-fields['low_s']),
                         urgent_stage_deadline_monotonic_s=urgent_deadline,
                         victim_stage_deadline_monotonic_s=victim_deadline,
                         urgent_predicted_stage_ms=predicted_ms,
@@ -394,6 +406,8 @@ class Controller:
                     fields, urgent_request_id=urgent.request_id,
                     victim_request_id=victim.request_id,
                     resident_count=resident, execution_cap=probe.execution_cap)
+        if accepted:
+            self.hold_counts[victim.request_id] += 1
         return accepted
 
     def __call__(self, scheduler, now):
@@ -415,6 +429,12 @@ class Controller:
             fields = self.request_fields(hold.request, now, guard)
             if hold.released_monotonic_s is not None:
                 self.last_end[rid] = now
+                if fields['coverage_s'] is None or fields['coverage_s'] <= fields['low_s']:
+                    # An occupied borrowed slot cannot be interrupted mid-step.
+                    # Stop taking new holds and surface the missed recovery
+                    # margin instead of silently treating release as execution.
+                    probe.buffer_policy_suspended = True
+                    self.record(rid, now, 'recovery_margin_exhausted', fields)
                 continue
             low_inventory = fields['coverage_s'] is None or fields['coverage_s'] <= fields['low_s']
             if low_inventory or now >= hold.deadline_monotonic_s:

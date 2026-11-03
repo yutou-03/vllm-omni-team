@@ -314,8 +314,7 @@ class SmallHoldProbe:
                 not peers or any(not self._at_decode_boundary(item) for item in peers)
             ))
             or request_id in self.holds
-            or ((not self.buffer_policy_mode or self.urgent_keep_mode)
-                and request_id in self.accepted_request_ids)
+            or (not self.buffer_policy_mode and request_id in self.accepted_request_ids)
             or not any(item is request for item in self.scheduler.running)
             or not self._at_decode_boundary(request)
             or self._resident_fields()["resident_count"] > self.scheduler.max_num_running_reqs
@@ -466,7 +465,9 @@ class SmallHoldProbe:
                 self._event("small_hold_released", request_id, hold,
                             deadline_lateness_s=lateness)
                 if (self.buffer_policy_mode and lateness > MAX_DEADLINE_LATENESS_S
-                        and not self.buffer_policy_suspended):
+                        and not self.buffer_policy_suspended
+                        and (not hold.evidence.get("inventory_deadline_lease", False)
+                             or now >= hold.evidence["resume_by_monotonic_s"])):
                     self.buffer_policy_suspended = True
                     self.emit("stage_buffer_policy_suspended", stage_id=self.stage_id,
                               request_id=request_id, deadline_lateness_s=lateness,
@@ -503,7 +504,9 @@ class SmallHoldProbe:
             (hold for hold in self.holds.values()
              if hold.released_monotonic_s is not None and _running(hold.request)
              and any(request is hold.request for request in original_running)),
-            key=lambda hold: (hold.released_monotonic_s, hold.requested_monotonic_s),
+            key=lambda hold: (
+                hold.evidence.get("resume_by_monotonic_s", hold.released_monotonic_s),
+                hold.released_monotonic_s, hold.requested_monotonic_s),
         )
         selected_ids = {request.request_id for request in selected}
         candidates = [hold.request for hold in ready_holds]

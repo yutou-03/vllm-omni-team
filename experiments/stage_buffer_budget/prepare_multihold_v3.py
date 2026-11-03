@@ -22,11 +22,11 @@ def main():
   rows.append(row)
  workload=r/'workload.jsonl';workload.write_text(''.join(json.dumps(x,ensure_ascii=False)+'\n' for x in rows))
  write(r/'contracts.json',{x['source_request_id']:{'ttft_slo_ms':x['ttft_slo_ms'],'first_output_service_ms':400.} for x in rows})
- write(r/'text_delivery.json',{'tokens_per_s':4.8,'max_chars':131072,'max_events':4096,'boundary_reserve_tokens':32})
+ write(r/'text_delivery.json',{'tokens_per_s':4.8,'max_chars':131072,'max_events':4096,'boundary_reserve_tokens':32,'delivery_lead_tokens':1.})
  metric={'metric_version':'soft_ttft_v2','beta':3.3,'mu':3.3,'text_tps':4.8,'audio_equivalent_tps':3.3,'audio_unit_s':.02,'lateness_decay_s':1.,'buffer_full_credit_s':10.,'buffer_decay_s':20.,'gate':'none','sensitivity_beta':[3.3,13.2,26.4]}
  write(r/'metric.json',metric)
- c=json.loads((E/'controller_budget_config.json').read_text());c.update(max_concurrent_holds=16,text_delivery_inventory=True,
-    guard_full_urgent_service=True,contracts_path=str(r/'contracts.json'),urgent_guard_ms=250.,performance_claim=False)
+ c=json.loads((E/'controller_budget_config.json').read_text());c.update(max_concurrent_holds=16,max_holds_per_request=0,text_delivery_inventory=True,max_text_observation_age_s=1.,
+    guard_full_urgent_service=True,inventory_deadline_lease=True,contracts_path=str(r/'contracts.json'),urgent_guard_ms=250.,performance_claim=False)
  write(r/'dynamic_controller.json',c);fixed=copy.deepcopy(c);fixed['fixed_urgent_budget_s']=6.;write(r/'fixed_controller.json',fixed)
  write(r/'plan.json',{'scope':'mechanism_and_single_seed_pilot_not_formal','K':16,'R':64,'window_s':30.,'timeout_s':180.,
     'workload_sha256':hashlib.sha256(workload.read_bytes()).hexdigest(),'offered':len(rows),'seed':1103,

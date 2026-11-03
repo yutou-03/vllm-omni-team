@@ -6,6 +6,10 @@ def audit(path):
     holds={};chains=[];active=set();peak=0;errors=[];final={};generated={};min_stock={}
     for line in path.open():
         e=json.loads(line);n=e['event'];t=e['monotonic'];rid=e.get('request_id')
+        if n=='stage_buffer_decision' and e.get('reason')=='recovery_margin_exhausted':
+            errors.append('recovery margin exhausted '+str(rid))
+        if n=='stage_buffer_policy_suspended':
+            errors.append('policy suspended '+str(e.get('reason')))
         if n=='small_hold_requested':
             c={'victim':rid,'requested':t,'urgent':e['evidence'].get('urgent_request_id'),'evidence':e['evidence'],'kv_before':e['kv_block_ids']}
             holds[rid]=c;chains.append(c);active.add(rid);peak=max(peak,len(active))
@@ -39,6 +43,23 @@ def audit(path):
         'kv_retained_chains':sum(c['kv_retained'] for c in chains),'peak_concurrent_holds':peak,
         'minimum_owned_text_tokens_by_victim':min_stock,'delivery_streams':len(final),'integrity_errors':errors,'chains':chains,
         'delivery':{k:{x:v[x] for x in ['received_chars','released_chars','received_tokens','released_tokens','received_text_sha256','released_text_sha256']} for k,v in final.items()}}
+def audit_client_delivery(result, client_results):
+    checked=0
+    for row in client_results:
+        rid=row.get('response_request_id')
+        if row.get('status')!='success' or not row.get('done_received'):
+            result['integrity_errors'].append('incomplete client '+str(row.get('source_request_id')))
+            continue
+        delivery=result['delivery'].get(rid)
+        if delivery is None:
+            result['integrity_errors'].append('missing delivery audit '+str(rid))
+        elif delivery['released_text_sha256']!=row['text_sha256']:
+            result['integrity_errors'].append('frontend/client text differs '+str(rid))
+        else:
+            checked+=1
+    result['client_text_hash_verified']=checked
+    return result
+
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('trace',type=Path);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
     d=audit(a.trace);a.output.write_text(json.dumps(d,indent=2));print(json.dumps({k:v for k,v in d.items() if k not in ['chains','delivery']}))

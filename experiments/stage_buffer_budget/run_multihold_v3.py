@@ -62,8 +62,10 @@ def main():
    out=r/arm
    subprocess.run([sys.executable,str(E/'run_frozen_stream.py'),'--workload',str(r/'workload.jsonl'),'--output',str(out),'--window-s',str(plan['window_s']),'--timeout-s',str(plan['timeout_s'])],check=True)
    subprocess.run(['docker','exec',name,'python',str(snap/'experiments/stage_buffer_budget/stream_goodput.py'),'--workload',str(r/'workload.jsonl'),'--run',str(out),'--config',str(r/'metric.json')],check=True)
-   from audit_multihold_v3 import audit
-   result=audit(service/'traces/stage_events.jsonl');(r/(arm+'_audit.json')).write_text(json.dumps(result,indent=2))
+   from audit_multihold_v3 import audit, audit_client_delivery
+   result=audit(service/'traces/stage_events.jsonl')
+   if arm!='nohold16':result=audit_client_delivery(result,json.loads((out/'results.json').read_text()))
+   (r/(arm+'_audit.json')).write_text(json.dumps(result,indent=2))
    progress(arm=arm,status='audited',holds=result['requested'],complete=result['complete_chains'],peak=result['peak_concurrent_holds'],errors=result['integrity_errors'])
    stop_service()
    if arm=='dynamic16_smoke':

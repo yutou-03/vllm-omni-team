@@ -31,6 +31,9 @@ def configuration():
         raise ValueError('text delivery FIFO must be bounded and nonempty')
     if int(c.get('boundary_reserve_tokens', 32)) < 1:
         raise ValueError('text inventory requires tokenizer boundary reserve')
+    lead = float(c.get('delivery_lead_tokens', 1.))
+    if not math.isfinite(lead) or not 0 <= lead <= 4:
+        raise ValueError('delivery lead must be within zero to four tokens')
     return c
 
 
@@ -49,6 +52,7 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
     rate = float(config.get('tokens_per_s', 4.8))
     max_chars = int(config.get('max_chars', 131072))
     reserve = int(config.get('boundary_reserve_tokens', 32))
+    lead = float(config.get('delivery_lead_tokens', 1.))
     received = ''
     released = ''
     received_events = released_events = 0
@@ -75,7 +79,7 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
             received_tokens=count(received), released_tokens=count(released),
             buffered_tokens=count(received[len(released):]),
             received_events=received_events, released_events=released_events,
-            tokens_per_s=rate, max_release_tokens=max_release,
+            tokens_per_s=rate, max_release_tokens=max_release+lead,
             boundary_reserve_tokens=reserve, first_content_released=first,
             producer_done=producer_done,
             received_text_sha256=hashlib.sha256(received.encode()).hexdigest() if closed else None,
@@ -85,12 +89,14 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
             inventory_owner='frontend_host_memory', client_receipt_claim=False)
 
     async def produce():
-        nonlocal received, received_events, producer_done
+        nonlocal received, received_events, producer_done, max_release
         try:
             async for packet in source:
                 content = content_of(packet)
                 if len(received)+len(content) > max_chars:
                     raise RuntimeError('text delivery character bound exceeded')
+                # Reserve the next whole SSE burst before publishing its stock.
+                max_release = max(max_release, count(content))
                 await queue.put((packet, content))
                 received += content
                 received_events += 1
@@ -122,7 +128,10 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
                 released_tokens = count(released)
                 mass = max(0, released_tokens-old_count)
                 max_release = max(max_release, mass)
-                next_release = max(time.monotonic(), next_release)+mass/rate
+                # Absolute pacing avoids accumulating event-loop jitter. Limit
+                # catch-up to the explicit lead; never drain a long-overdue FIFO
+                # in an unbounded burst after a stalled event loop.
+                next_release = max(time.monotonic()-lead/rate, next_release)+mass/rate
                 first = True
             released_events += 1
             released_wire.update(packet.encode())
