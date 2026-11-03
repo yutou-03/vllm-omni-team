@@ -27,3 +27,38 @@
 真实 4/4 暂停链及 20/20 客户端文本校验通过，但宽松文本累计断流均值 4.879s，不能作为性能收益。只读复核发现前端曾连续 1.574s 接收642条记录而无任何放行，库存充分，GPU仍继续输出。该轮前缀token数均单调，排除了token计数回退假说。修复主动协作yield、每条只计算一次canonical前缀token数，并使用不随迟到永久重锚的绝对交付时间；补发债务计入安全库存扣减。完整复跑前不报告新收益。
 
 第二轮修复版发现独立缺陷：输出计数与入口线程共用fast tokenizer，发生`Already borrowed`，20条中3条失败，多暂停门槛未通过，整轮排除收益比较。服务初始化阶段创建输出计数专用tokenizer副本，保持相同词表与编码规则，隔离入口的truncation/padding状态。新增多token包及迟到追赶/债务回归用可控时钟验证。
+
+## 2026-11-03：512 token 预测假设核对与待验证范围
+
+### 变量和本轮证据
+
+原始导图 [实验方案／实验二](/home/zhongyu/面向SLO感知的多模态流式推理调度优化.mm:151) 的原文为“**大于512token之后的预测相对准确，因为prefill还是近线性的**”，位于“暂停时间需要等到本次迭代完进行判断，因此实际暂停时长可能长于预期”节点下。其解释首先应围绕 prefill 输入规模，不能直接改写成“生成到第 512 个 token 之后预测更准”。必须分别记录：
+
+- `P`：实际模型输入 token 数；启用 prefix cache 时另记实际未缓存的 prefill token 数。
+- `G`：当前已经生成的模型输出 token 数，不是输出上限，也不是客户端已经交付的可见 token 数。
+- `C`：当前 attention/KV 上下文长度，使用实际已计算计数；不能把 `P + G` 的近似值与 `P` 或 `G` 混用。
+
+已核对第一轮 [nohold16/results.json](/home/zhongyu/research_reports/stage_buffer_v3_20261103_complete_code/nohold16/results.json) 和 [dynamic16_smoke/results.json](/home/zhongyu/research_reports/stage_buffer_v3_20261103_complete_code/dynamic16_smoke/results.json)：实际 `P` 为 **18–33**，实际输出最长 **512**。冻结生成脚本 [prepare_multihold_v3.py](prepare_multihold_v3.py) 将宽松请求 `max_tokens` 设为 512、紧急请求设为 32。因此本轮既没有 `P > 512` 样本，也没有 `G > 512` 样本。末尾总上下文可能超过 512，不构成前述假设的验证；本轮不增加 GPU 实验，也不报告该假设已成立。
+
+### 历史局部结果与可复核性
+
+旧结果见 [RESULTS_20261102.md 第 5 节](/home/zhongyu/research_reports/stage_buffer_experiment_20261102/two_hour_1758/RESULTS_20261102.md:91)，对应方法为 [verify_prefill_prediction.py](verify_prefill_prediction.py)：单一重复文本 prompt 家族、孤立 K1 请求；按实际 prompt token 数拟合线性模型，以 Stage0 首次 forward 至首输出为真值。该时间包含输出处理开销，不是纯 GPU kernel 时间。
+
+| 实际 prompt token 数 | 留出验证样本数 | MAPE | MAE | P95 APE |
+|---|---:|---:|---:|---:|
+| ≤512 | 20 | 5.59% | 3.095 ms | 18.37% |
+| >512 | 20 | 0.58% | 0.779 ms | 1.28% |
+
+上述数值引用旧报告，未在本轮重新测量。2026-11-03 核对时，原 `prefill_prediction/` 目录仍有 [压缩负载](/home/zhongyu/research_reports/stage_buffer_experiment_20261102/two_hour_1758/prefill_prediction/workload.jsonl.gz) 及 `client/` 原始事件，但原位置的 `summary.json`、`results.json`、`manifest.json` 不存在；独立重算前须恢复归档，或由客户端和服务端原始事件重建。不能仅引用报告表格就声称已完成原始证据重审。
+
+旧设计按重复轮次划分训练和验证，同一长度仍是相同的重复 `apple` 输入。需要核对当时 prefix cache 配置及缓存命中，不能假定重复输入的完整 prompt 均重新 prefill；该设计也不能证明跨输入家族泛化。旧脚本含固定绝对截止时间，若复用必须先改为显式可配置预算，不能直接调用过期脚本重新测量。
+
+### 最小可验证下一步
+
+1. **先单独验证 prefill 假设。**在相同模型、GPU、KV 和软件版本下，实际输入长度覆盖 256、384、448、512、576、640、768、1024，输出固定为少量 token；分开测 K1 和 K16，记录实际批大小及批内 prefill/decode 组成。关闭 prefix cache，或按实际未缓存 prefill 数分层；长度以模型实际输入为准，不以单词数替代。
+2. **冻结并独立切分。**按输入内容／家族划训练、校准、验证，暖机单列；同一请求的不同 decode 步或相同内容的重复样本不得随机跨集合泄漏。各长度、批大小顺序随机化，保留实际样本数；样本不足时只称试跑。
+3. **报告完整误差。**使用事前冻结的预测器，分别报告 MAE、MAPE、P95 正残差 `max(实际−预测, 0)`、安全上界覆盖率，并按请求／批次聚类给出区间。不能仅凭长请求分母变大导致 MAPE 变小，就认定 512 是通用拐点。
+4. **将 checkpoint 和恢复另作目标。**记录每次预测的生成时间、输入特征和预测值，再与实际“决策→安全暂停点”“释放暂停→重新入批”“恢复→首个新 chunk”配对。当前 `iteration_events.duration_ms` 与调度前缀计时对应，不能代替整批 GPU 执行时间；当前 guard 使用活跃期间控制器调用间隔的 P95，V3 的宽松 30 s／紧急 6 s 服务预算是未充分标定的试跑常数，不是已验证的长度预测器。
+5. **若要验证生成进度假设，另建数据。**将输出上限设为至少 1024，确保有实际跨过 512 的请求，并在 `G=128/256/384/512/640/768` 附近记录预测；固定或分层控制 `P`、`C`、批大小和混合 prefill 干扰。按独立请求划分数据，同请求前后作配对比较，不得从本轮 512 封顶结果外推。
+
+这项核对不改变本轮流式评分、暂停安全阈值或冻结负载；其结论是明确尚缺的验证数据，而非新增性能收益证明。
