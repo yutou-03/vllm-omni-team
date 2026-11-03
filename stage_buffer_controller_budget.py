@@ -147,6 +147,7 @@ class Controller:
                           if self.config.get('contracts_path') else {})
         self.offset = 0
         self.state = defaultdict(Inventory)
+        self.text_delivery = {}
         self.last_call = None
         self.last_had_running = False
         self.ticks = deque(maxlen=64)
@@ -179,6 +180,9 @@ class Controller:
                 self.offset = f.tell()
                 e = json.loads(line)
                 name = e['event']
+                if name == 'stage_buffer_text_inventory':
+                    self.text_delivery[str(e['logical_request_id'])] = e
+                    continue
                 if name not in {
                     'stage_study_text_payload_sent','stage_study_text_payload_received',
                     'stage_study_text_conditioning_selected',
@@ -235,12 +239,49 @@ class Controller:
         emit_stage_event('stage_buffer_decision', stage_id=self.stage, request_id=rid,
                         sequence=self.sequence, reason=reason, **fields, **extra)
 
+    def request_fields(self, request, now, guard):
+        if self.stage != 0 or not self.config.get('text_delivery_inventory', False):
+            return self.fields(request.request_id, now, guard)
+        from vllm_omni.scheduling.policy import request_scheduling_metadata
+        metadata = request_scheduling_metadata(request)
+        if metadata.get('sched_request_path') != 'text':
+            return self.fields(request.request_id, now, guard)
+        e = self.text_delivery.get(metadata.get('sched_logical_request_id'))
+        fields = self.fields(request.request_id, now, guard)
+        if e is None or e.get('closed') or not e.get('first_content_released'):
+            return fields
+        age = max(0., now-e['monotonic'])
+        rate = e['tokens_per_s']
+        reserve = e['boundary_reserve_tokens'] + e['max_release_tokens']
+        q = max(0., e['buffered_tokens']-reserve-rate*age)
+        coverage = q/rate
+        low = max(self.c['resume_below_s'], guard+self.config['margin_s'])
+        budget = max(0., coverage-low-self.config['margin_s'])
+        fields.update(inventory_units=q, receiver_ready_inventory_units=q,
+            published_inventory_units=None, coverage_s=coverage, budget_s=budget,
+            requested_hold_s=min(self.config['max_hold_s'], budget),
+            consumption_rate_units_s=rate, unit='canonical_visible_text_token',
+            consumed_boundary='frontend_released_to_transport',
+            inventory_observation_age_s=age, delivery_reserved_tokens=reserve,
+            delivery_logical_request_id=e['logical_request_id'])
+        return fields
+
     def _try_urgent_keep(self, scheduler, now, guard):
-        """Accept at most one deadline inversion using a KV-preserving hold."""
+        """Reserve a FIFO prefix of urgent waiters, with one safe victim each."""
         probe = scheduler._small_hold_probe
-        if probe.holds or probe._urgent_pending:
+        limit = int(self.config.get('max_concurrent_holds', 1))
+        if not 1 <= limit <= probe.execution_cap:
+            raise ValueError('max_concurrent_holds must be within execution capacity')
+        if any(h.released_monotonic_s is not None for h in probe.holds.values()):
             return
-        waiting = list(scheduler.waiting)
+        while len(probe.holds) < limit:
+            if not self._try_one_urgent_keep(scheduler, now, guard):
+                break
+
+    def _try_one_urgent_keep(self, scheduler, now, guard):
+        probe = scheduler._small_hold_probe
+        pending = set(probe._urgent_pending.values())
+        waiting = [r for r in scheduler.waiting if r.request_id not in pending]
         if not waiting:
             return
         if getattr(getattr(scheduler, '_baseline_policy', None), 'value', None) == 'native_fcfs':
@@ -259,12 +300,12 @@ class Controller:
                   if request.request_id not in probe.holds and
                   (probe._execution_active_ids is None or
                    request.request_id in probe._execution_active_ids)]
-        if len(active) < probe.execution_cap:
+        if len(active) + len(pending) < probe.execution_cap:
             self.record(urgent.request_id, now, 'execution_slot_available', {},
                         urgent_request_id=urgent.request_id)
             return
         resident = probe._resident_fields()['resident_count']
-        if resident >= probe.resident_cap:
+        if resident + len(pending) >= probe.resident_cap:
             self.record(urgent.request_id, now, 'resident_cap_full', {},
                         urgent_request_id=urgent.request_id, resident_count=resident)
             return
@@ -274,7 +315,7 @@ class Controller:
         for request in active:
             rid = request.request_id
             decode_boundary = probe._at_decode_boundary(request)
-            fields = self.fields(rid, now, guard)
+            fields = self.request_fields(request, now, guard)
             if rid in probe.accepted_request_ids:
                 rejection = 'already_held_once'
             elif not decode_boundary:
@@ -353,6 +394,7 @@ class Controller:
                     fields, urgent_request_id=urgent.request_id,
                     victim_request_id=victim.request_id,
                     resident_count=resident, execution_cap=probe.execution_cap)
+        return accepted
 
     def __call__(self, scheduler, now):
         start = time.monotonic()
@@ -370,7 +412,7 @@ class Controller:
                     probe.release_hold(rid, 'policy_suspended')
             return
         for rid, hold in list(probe.holds.items()):
-            fields = self.fields(rid, now, guard)
+            fields = self.request_fields(hold.request, now, guard)
             if hold.released_monotonic_s is not None:
                 self.last_end[rid] = now
                 continue

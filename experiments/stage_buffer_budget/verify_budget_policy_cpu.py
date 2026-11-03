@@ -301,6 +301,79 @@ def urgent_setup(*, protected_extra=False):
 
 
 class UrgentKeepTests(unittest.TestCase):
+    def test_pause_count_tracks_waiters_candidates_and_resident_headroom(self):
+        # (execution slots, urgent waiters, safe candidates, resident spare, expected)
+        for k,waiters,safe,spare,expected in [(4,3,4,4,3),(4,4,4,4,4),
+                (4,4,2,4,2),(4,4,4,1,1),(4,1,4,4,1)]:
+            with self.subTest(k=k,waiters=waiters,safe=safe,spare=spare):
+                scheduler,p,c,clock,events,blocks,victim,urgent=urgent_setup()
+                victims=[victim]+[request('v'+str(i)) for i in range(1,k)]
+                urgents=[urgent]+[request('u'+str(i),decode=False) for i in range(1,waiters)]
+                for r in urgents:r.status=SimpleNamespace(name='WAITING')
+                scheduler.running[:]=victims;scheduler.waiting[:]=urgents
+                scheduler.requests={r.request_id:r for r in victims+urgents}
+                blocks.clear();blocks.update({r.request_id:[30+i] for i,r in enumerate(victims)})
+                scheduler.max_num_running_reqs=p.resident_cap=k+spare;p.execution_cap=k
+                scheduler._baseline_policy=SimpleNamespace(value='native_fcfs')
+                scheduler._slo_stage_fields=lambda r:(100.1,200.) if r in urgents else (110.,200.)
+                eligible={r.request_id for r in victims[:safe]}
+                c.fields=lambda rid,*args:dict(coverage_s=.5 if rid in eligible else 0.,
+                    high_s=.17,requested_hold_s=.05,low_s=.15)
+                c.config['max_concurrent_holds']=k
+                c._try_urgent_keep(scheduler,clock.now,.05)
+                self.assertEqual(len(p.holds),expected)
+                self.assertEqual(set(p._urgent_pending.values()),{r.request_id for r in urgents[:expected]})
+                self.assertEqual(scheduler.waiting,urgents)
+                with p.scheduling_context():
+                    self.assertEqual(len(scheduler.running),k-expected)
+                    self.assertEqual(scheduler.max_num_running_reqs,k)
+
+    def test_multiple_victims_admit_fifo_waiters_and_resume_without_kv_loss(self):
+        scheduler, p, c, clock, events, blocks, victim, urgent = urgent_setup()
+        victim2=request('victim2'); urgent2=request('urgent2', decode=False)
+        urgent2.status=SimpleNamespace(name='WAITING')
+        scheduler.running.append(victim2); scheduler.waiting.append(urgent2)
+        scheduler.requests.update(victim2=victim2,urgent2=urgent2)
+        blocks['victim2']=[61,62]
+        scheduler.max_num_running_reqs=p.resident_cap=4; p.execution_cap=2
+        scheduler._baseline_policy=SimpleNamespace(value='native_fcfs')
+        scheduler._slo_stage_fields=lambda r: (100.1,200.) if r in (urgent,urgent2) else (110.,200.)
+        c.config['max_concurrent_holds']=2
+        c._try_urgent_keep(scheduler,clock.now,.05)
+        self.assertEqual(len(p.holds),2)
+        self.assertEqual(set(p._urgent_pending.values()),{'urgent','urgent2'})
+        self.assertEqual(scheduler.waiting,[urgent,urgent2])
+        with p.scheduling_context():
+            self.assertEqual(scheduler.max_num_running_reqs,2)
+            self.assertEqual(scheduler.running,[])
+            for r in (urgent,urgent2):
+                scheduler.waiting.remove(r);r.status=SimpleNamespace(name='RUNNING')
+                scheduler.running.append(r);blocks[r.request_id]=[71]
+        p.record_scheduled(SimpleNamespace(num_scheduled_tokens={'urgent':1,'urgent2':1}))
+        self.assertEqual(sum(e['event']=='urgent_keep_admitted' for e in events),2)
+        clock.now=100.06
+        for r in (urgent,urgent2):
+            scheduler.running.remove(r);scheduler.requests.pop(r.request_id);blocks.pop(r.request_id)
+        with p.scheduling_context():
+            self.assertEqual({r.request_id for r in scheduler.running},{'victim','victim2'})
+        p.record_scheduled(SimpleNamespace(num_scheduled_tokens={'victim':1,'victim2':1}))
+        self.assertFalse(p.holds)
+        self.assertEqual(blocks['victim'],[31,32]);self.assertEqual(blocks['victim2'],[61,62])
+
+    def test_multi_hold_reserves_resident_capacity_before_allocation(self):
+        scheduler,p,c,clock,events,blocks,victim,urgent=urgent_setup()
+        victim2=request('victim2');urgent2=request('urgent2',decode=False)
+        urgent2.status=SimpleNamespace(name='WAITING')
+        scheduler.running.append(victim2);scheduler.waiting.append(urgent2)
+        scheduler.requests.update(victim2=victim2,urgent2=urgent2);blocks['victim2']=[61]
+        scheduler.max_num_running_reqs=p.resident_cap=3;p.execution_cap=2
+        scheduler._baseline_policy=SimpleNamespace(value='native_fcfs')
+        scheduler._slo_stage_fields=lambda r:(100.1,200.) if r in (urgent,urgent2) else (110.,200.)
+        c.config['max_concurrent_holds']=2
+        c._try_urgent_keep(scheduler,clock.now,.05)
+        self.assertEqual(len(p.holds),1)
+        self.assertEqual(c.reasons['resident_cap_full'],1)
+
     def test_full_urgent_residency_is_part_of_coverage_budget(self):
         scheduler, probe, c, clock, events, blocks, victim, urgent = urgent_setup()
         c.config['guard_full_urgent_service'] = True

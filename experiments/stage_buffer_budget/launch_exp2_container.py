@@ -9,6 +9,7 @@ REPO=Path(__file__).resolve().parents[2]
 def main():
  p=argparse.ArgumentParser();p.add_argument('--run',type=Path,required=True);p.add_argument('--name',required=True)
  p.add_argument('--env',type=Path);p.add_argument('--native-cap',type=int);p.add_argument('--source',type=Path);p.add_argument('--gpus',default='0,1,2,3,4,5');p.add_argument('--entrypoint-script',type=Path,default=Path('/home/zhongyu/research_reports/servegen_active_buffer_20261012/server_entry.py'))
+ p.add_argument('--worker-only',action='store_true',help='one reusable container; services run via docker exec')
  a=p.parse_args(); selected=[int(x) for x in a.gpus.split(',')]
  if len(selected)!=6 or len(set(selected))!=6:raise ValueError('exactly six distinct GPUs required')
  a.run.mkdir(parents=True,exist_ok=False);(a.run/'traces').mkdir()
@@ -45,6 +46,8 @@ def main():
  # Persist stdout/stderr (including child processes) before Docker auto-removes the container.
  service_wrapper="import os,runpy,sys; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600); os.dup2(fd,1); os.dup2(fd,2); os.close(fd); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')"
  command+=['--entrypoint','python',IMAGE,'-u','-c',service_wrapper,str(a.run/'server.log'),str(a.entrypoint_script),'serve',MODEL,'--omni','--host','0.0.0.0','--port','8095','--deploy-config',str(deploy)]
+ if a.worker_only:
+  i=command.index('--entrypoint');command=command[:i]+['--entrypoint','sleep',IMAGE,'infinity']
  manifest={'command':command,'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
  'image_id':subprocess.check_output(['docker','image','inspect',IMAGE,'--format','{{.Id}}'],text=True).strip(),'environment':env,
  'source_sha256':{str(p.relative_to(snap)):hashlib.sha256(p.read_bytes()).hexdigest() for p in snap.rglob('*.py')},

@@ -522,8 +522,8 @@ class SmallHoldProbe:
         # A new request needs both an execution slot and a resident slot.
         free_resident = self.resident_cap - resident_count
         if self.urgent_keep_mode and self.holds:
-            # Exactly one eligible urgent waiter may use a newly opened slot.
-            free_resident = min(free_resident, 1 if self._urgent_pending else 0)
+            # One resident reservation per distinct urgent FIFO waiter.
+            free_resident = min(free_resident, len(set(self._urgent_pending.values())))
         scheduler.max_num_running_reqs = min(
             self.execution_cap, len(selected) + free_resident
         )

@@ -520,7 +520,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Streaming response
         if request.stream:
-            return self.chat_completion_stream_generator(
+            stream = self.chat_completion_stream_generator(
                 request,
                 result_generator,
                 request_id,
@@ -531,6 +531,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 reasoning_parser,
                 raw_request=raw_request,
             )
+
+            # Only pure text participates; audio keeps its stage receiver FIFO.
+            if request.modalities == ['text']:
+                from .text_delivery_buffer import configuration, pace_text_stream
+                delivery_config = configuration()
+                if delivery_config is not None:
+                    return pace_text_stream(stream, tokenizer=tokenizer,
+                        request_id=request_id, config=delivery_config)
+            return stream
 
         try:
             return await self.chat_completion_full_generator(
