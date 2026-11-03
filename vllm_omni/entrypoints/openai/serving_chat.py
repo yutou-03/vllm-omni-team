@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import time
 import uuid
@@ -154,6 +155,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     For diffusion mode, use the `for_diffusion` class method to create an instance.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .text_delivery_buffer import configuration
+        self._text_delivery_config = configuration()
+        self._text_delivery_tokenizer = None
+        if self._text_delivery_config is not None:
+            # Input encoding runs on executor threads and mutates the fast
+            # tokenizer's truncation/padding state. Clone before accepting any
+            # requests; output accounting must not borrow that same backend.
+            tokenizer = self.renderer.get_tokenizer()
+            if tokenizer is None:
+                raise ValueError('text delivery requires an initialized tokenizer')
+            self._text_delivery_tokenizer = copy.deepcopy(tokenizer)
 
     # Diffusion mode attributes
     _diffusion_mode: bool = False
@@ -534,11 +549,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Only pure text participates; audio keeps its stage receiver FIFO.
             if request.modalities == ['text']:
-                from .text_delivery_buffer import configuration, pace_text_stream
-                delivery_config = configuration()
-                if delivery_config is not None:
-                    return pace_text_stream(stream, tokenizer=tokenizer,
-                        request_id=request_id, config=delivery_config)
+                from .text_delivery_buffer import pace_text_stream
+                if self._text_delivery_config is not None:
+                    return pace_text_stream(stream, tokenizer=self._text_delivery_tokenizer,
+                        request_id=request_id, config=self._text_delivery_config)
             return stream
 
         try:
