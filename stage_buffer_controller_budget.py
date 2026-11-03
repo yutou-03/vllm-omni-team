@@ -254,7 +254,8 @@ class Controller:
             return fields
         age = max(0., now-e['monotonic'])
         rate = e['tokens_per_s']
-        reserve = e['boundary_reserve_tokens'] + e['max_release_tokens']
+        reserve = (e['boundary_reserve_tokens'] + e['max_release_tokens']
+                   + e.get('pacing_debt_tokens', 0.))
         q = max(0., e['buffered_tokens']-reserve-rate*age)
         coverage = q/rate
         low = max(self.c['resume_below_s'], guard+self.config['margin_s'])

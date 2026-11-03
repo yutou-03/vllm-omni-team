@@ -2,7 +2,7 @@
 
 A separate producer drains model output while the consumer paces SSE delivery.
 Original SSE records, token IDs, finish and usage records are preserved verbatim.
-Canonical tokenizer counts are recomputed from visible prefixes (not summed
+Canonical tokenizer counts are cached from visible prefixes (not summed
 per-fragment encodings); exact character counts and SHA256 audit conservation.
 """
 from __future__ import annotations
@@ -58,7 +58,8 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
     received_events = released_events = 0
     received_wire = hashlib.sha256()
     released_wire = hashlib.sha256()
-    released_tokens = 0
+    received_tokens = released_tokens = 0
+    origin = None
     max_release = 1
     producer_done = False
     first = False
@@ -76,8 +77,9 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
             action=action, sequence=sequence, closed=closed,
             received_chars=len(received), released_chars=len(released),
             buffered_chars=len(received)-len(released),
-            received_tokens=count(received), released_tokens=count(released),
-            buffered_tokens=count(received[len(released):]),
+            received_tokens=received_tokens, released_tokens=released_tokens,
+            buffered_tokens=max(0, received_tokens-released_tokens),
+            pacing_debt_tokens=(max(0., (time.monotonic()-origin)*rate+lead-released_tokens) if origin is not None else 0.),
             received_events=received_events, released_events=released_events,
             tokens_per_s=rate, max_release_tokens=max_release+lead,
             boundary_reserve_tokens=reserve, first_content_released=first,
@@ -89,19 +91,25 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
             inventory_owner='frontend_host_memory', client_receipt_claim=False)
 
     async def produce():
-        nonlocal received, received_events, producer_done, max_release
+        nonlocal received, received_tokens, received_events, producer_done, max_release
         try:
             async for packet in source:
                 content = content_of(packet)
                 if len(received)+len(content) > max_chars:
                     raise RuntimeError('text delivery character bound exceeded')
-                # Reserve the next whole SSE burst before publishing its stock.
-                max_release = max(max_release, count(content))
-                await queue.put((packet, content))
+                # Cache the canonical prefix count once. Summing fragment
+                # tokenizations would not preserve the visible token unit.
+                prefix_tokens = count(received+content) if content else received_tokens
+                max_release = max(max_release, abs(prefix_tokens-received_tokens))
+                await queue.put((packet, content, prefix_tokens))
                 received += content
+                received_tokens = prefix_tokens
                 received_events += 1
                 received_wire.update(packet.encode())
                 snapshot('received')
+                # A ready source and a non-full Queue.put need not suspend.
+                # Explicit fairness is required for the delivery coroutine.
+                await asyncio.sleep(0)
         except Exception as error:
             await queue.put(error)
         # Do not enqueue a sentinel from a cancellation finally block: a full
@@ -110,7 +118,6 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
         await queue.put(sentinel)
 
     task = asyncio.create_task(produce())
-    next_release = 0.
     completed = False
     try:
         while True:
@@ -120,18 +127,14 @@ async def pace_text_stream(source, *, tokenizer, request_id, config):
                 break
             if isinstance(item, Exception):
                 raise item
-            packet, content = item
+            packet, content, prefix_tokens = item
             if content:
-                await asyncio.sleep(max(0., next_release-time.monotonic()))
-                old_count = released_tokens
+                if origin is None:
+                    origin = time.monotonic()
+                due = origin + max(0., released_tokens-lead)/rate
+                await asyncio.sleep(max(0., due-time.monotonic()))
                 released += content
-                released_tokens = count(released)
-                mass = max(0, released_tokens-old_count)
-                max_release = max(max_release, mass)
-                # Absolute pacing avoids accumulating event-loop jitter. Limit
-                # catch-up to the explicit lead; never drain a long-overdue FIFO
-                # in an unbounded burst after a stalled event loop.
-                next_release = max(time.monotonic()-lead/rate, next_release)+mass/rate
+                released_tokens = prefix_tokens
                 first = True
             released_events += 1
             released_wire.update(packet.encode())

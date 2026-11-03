@@ -22,6 +22,17 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final['received_text_sha256'],final['released_text_sha256'])
         self.assertEqual(final['buffered_chars'],0)
         self.assertTrue(any(e['buffered_tokens']>=4 for e in events))
+    async def test_ready_producer_does_not_starve_delivery(self):
+        produced=[]
+        async def source():
+            for i in range(200):
+                produced.append(i)
+                yield packet('a')
+        stream=mod.pace_text_stream(source(),tokenizer=Tokenizer(),request_id='fair',config={'tokens_per_s':1000})
+        await anext(stream)
+        self.assertLess(len(produced),20)
+        await stream.aclose()
+
     async def test_disconnect_cancels_full_producer_queue(self):
         closed=[]
         async def source():
