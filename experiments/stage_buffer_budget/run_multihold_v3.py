@@ -4,7 +4,7 @@ from pathlib import Path
 E=Path(__file__).resolve().parent
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--root',type=Path,required=True);p.add_argument('--gpus',default='0,1,2,3,4,5');p.add_argument('--arms',default='dynamic16_smoke,nohold16,buffer16,dynamic16,fixed16');a=p.parse_args();r=a.root
+ p=argparse.ArgumentParser();p.add_argument('--gpu-stage-map',help='verified JSON stage to physical GPU map; enables hardware telemetry');p.add_argument('--root',type=Path,required=True);p.add_argument('--gpus',default='0,1,2,3,4,5');p.add_argument('--arms',default='dynamic16_smoke,nohold16,buffer16,dynamic16,fixed16');a=p.parse_args();r=a.root
  plan=json.loads((r/'plan.json').read_text());assert hashlib.sha256((r/'workload.jsonl').read_bytes()).hexdigest()==plan['workload_sha256']
  name='stage-buffer-exp2-v3-'+hashlib.sha256(str(r).encode()).hexdigest()[:8]
  (r/'runtime_cache').mkdir(exist_ok=True)
@@ -60,7 +60,9 @@ def main():
    if result['status']!='success':raise RuntimeError('warmup failed '+str(result.get('error')))
    drain('http://127.0.0.1:8095');progress(arm=arm,status='replaying')
    out=r/arm
-   subprocess.run([sys.executable,str(E/'run_frozen_stream.py'),'--workload',str(r/'workload.jsonl'),'--output',str(out),'--window-s',str(plan['window_s']),'--timeout-s',str(plan['timeout_s'])],check=True)
+   replay=[sys.executable,str(E/'run_frozen_stream.py'),'--workload',str(r/'workload.jsonl'),'--output',str(out),'--window-s',str(plan['window_s']),'--timeout-s',str(plan['timeout_s'])]
+   if a.gpu_stage_map:replay+=['--gpu-stage-map',a.gpu_stage_map]
+   subprocess.run(replay,check=True)
    subprocess.run(['docker','exec',name,'python',str(snap/'experiments/stage_buffer_budget/stream_goodput.py'),'--workload',str(r/'workload.jsonl'),'--run',str(out),'--config',str(r/'metric.json')],check=True)
    from audit_multihold_v3 import audit, audit_client_delivery
    result=audit(service/'traces/stage_events.jsonl')
