@@ -301,6 +301,25 @@ def urgent_setup(*, protected_extra=False):
 
 
 class UrgentKeepTests(unittest.TestCase):
+    def test_explicit_two_stage_probes_keep_independent_slot_state(self):
+        probes = []
+        for stage in (0, 1):
+            scheduler, _, _, clock, events, _, _, _ = urgent_setup()
+            scheduler._omni_stage_id_for_trace = lambda stage=stage: stage
+            p = hold_module.SmallHoldProbe(scheduler,
+                emit=lambda name, **kw: events.append(dict(event=name, **kw)),
+                clock=lambda: clock.now,
+                environ={hold_module.HOLD_ENV:'1', 'VLLM_OMNI_STAGE_BUFFER_POLICY':'1',
+                    hold_module.EXECUTION_CAP_ENV:'1', hold_module.STAGES_ENV:'0,1',
+                    hold_module.URGENT_KEEP_ENV:'1',
+                    hold_module.CONTROLLER_ENV:'stage_buffer_controller_budget:decide'})
+            probes.append(p)
+        self.assertEqual([p.stage_id for p in probes], [0, 1])
+        self.assertTrue(all(p.enabled and p.execution_cap == 1 for p in probes))
+        probes[0]._urgent_pending['victim'] = 'urgent'
+        self.assertEqual(probes[1]._urgent_pending, {})
+
+
     def test_repeat_pause_uses_new_cycle_after_restore(self):
         scheduler,p,c,clock,events,blocks,victim,urgent=urgent_setup()
         c.config['max_holds_per_request']=0

@@ -82,7 +82,9 @@ class FeedbackWriter:
     is a snapshot, not a continuously refreshed assertion of current inventory.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, min_interval_s=0.0):
+        self.min_interval_s = float(min_interval_s)
+        self.last_write = 0.0
         self.path = Path(path) if path else None
         self.lock = threading.Lock()
         self.requests = {}
@@ -95,6 +97,9 @@ class FeedbackWriter:
         with self.lock:
             self.requests.setdefault(request_id, {}).update(fields)
             now = time.monotonic()
+            if now - self.last_write < self.min_interval_s and "status" not in fields:
+                return
+            self.last_write = now
             atomic_json(self.path, {"schema_version": 1,
                                    "written_monotonic_s": now,
                                    "requests": self.requests})

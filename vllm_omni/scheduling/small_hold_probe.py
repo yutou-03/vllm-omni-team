@@ -118,8 +118,8 @@ class SmallHoldProbe:
             if not raw_stages or any(value.strip() not in {"0", "1"} for value in raw_stages):
                 raise ValueError(f"{STAGES_ENV} must contain only Stage 0 and/or 1")
             stages = {int(value.strip()) for value in raw_stages}
-        if self.urgent_keep_mode and (STAGES_ENV not in environment or len(stages) != 1):
-            raise ValueError("urgent keep requires exactly one target stage")
+        if self.urgent_keep_mode and STAGES_ENV not in environment:
+            raise ValueError("urgent keep requires explicit target stages")
         self.execution_cap: int | None = None
         if EXECUTION_CAP_ENV in environment:
             raw_cap = environment[EXECUTION_CAP_ENV]
