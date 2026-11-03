@@ -13,7 +13,7 @@ def stats(values):
 
 def trace_summary(path, response_ids):
     produced=collections.defaultdict(list);chains=[];current={};active=set();peak=0;errors=[]
-    queues={};reasons=collections.Counter();caps={};final_delivery={}
+    queues={};reasons=collections.Counter();caps={};final_delivery={};ingress={}
     sent=collections.defaultdict(set);received=collections.defaultdict(set);consumed=collections.defaultdict(set)
     for line in path.open():
         e=json.loads(line);name=e['event'];sid=e.get('stage_id');rid=e.get('physical_request_id') or e.get('request_id');t=e['monotonic'];key=(sid,rid)
@@ -21,6 +21,7 @@ def trace_summary(path, response_ids):
         if name in ['stage_study_text_payload_sent','stage_study_chunk_sent']:sent[(sid,transfer)].add(e['chunk_id'])
         if name in ['stage_study_text_payload_received','stage_study_chunk_received']:received[(sid-1,transfer)].add(e['chunk_id'])
         if name=='stage_study_chunk_conversion_started':consumed[(1,transfer)].add(e['chunk_id'])
+        if name=='request_ingress' and rid in response_ids:ingress[rid]=e['sched_ingress_monotonic_s']
         if name=='small_hold_capacity_configured':caps[str(sid)]={k:e.get(k) for k in ['execution_cap','resident_cap','hold_enabled']}
         if name=='stage_study_thinker_output_produced' and rid in response_ids:produced[rid].append((t,e['generated_output_tokens_total']))
         if name=='stage_buffer_decision':
@@ -68,7 +69,7 @@ def trace_summary(path, response_ids):
         'actual_pause_s':stats([c.get('actual_pause_s') for c in chains]),
         'nominal_100ms_overruns':sum(c.get('actual_pause_s',0)>.1 for c in chains),
         'resume_to_new_output_s':stats([c.get('resume_to_new_output_s') for c in chains]),
-        'capacity':caps,'errors':errors,'reasons':dict(reasons),'chains':chains,
+        'capacity':caps,'frontend_ingress':ingress,'errors':errors,'reasons':dict(reasons),'chains':chains,
         'receiver_streams':len(queues),'enqueued_chunks':sum(len(q['enqueued']) for q in queues.values()),
         'released_chunks':sum(len(q['released']) for q in queues.values())}
 
@@ -119,7 +120,10 @@ def analyze_arm(root,arm,tokenizer):
             pcm_hash=pcm.hexdigest()
         per.append({'request_id':row['source_request_id'],'path':row['request_path'],'tier':row['slo_tier'],
             'complete':complete,'generated_tokens':n,'wire_tokens':len(r['text_token_ids']),'full_slo_met':full,
-            'ttft_s':r['ttft_s'],'ttfp_s':r['ttfp_s'],'ttft_slo_met':ttft_ok,'first_slo_met':first_ok,
+            'ttft_s':r['ttft_s'],'ttfp_s':r['ttfp_s'],
+            'ingress_lateness_s':audit['frontend_ingress'][r['response_request_id']]-r['scheduled_arrival_monotonic_s'] if r['response_request_id'] in audit['frontend_ingress'] else None,
+            'ttft_from_ingress_s':r['first_text_monotonic_s']-audit['frontend_ingress'][r['response_request_id']] if r['first_text_monotonic_s'] is not None and r['response_request_id'] in audit['frontend_ingress'] else None,
+            'ttft_slo_met':ttft_ok,'first_slo_met':first_ok,
             'tpot_s':tpot,'production_tpot_s':production_tpot,'tpot_slo_met':tpot_ok,'continuity_met':continuity,
             'e2e_s':r['e2e_s'],'e2e_met':e2e_ok,'stall_s':s['rebuffer_s'],'max_stall_s':s['max_rebuffer_s'],
             'audio_duration_s':r['audio_duration_s'],'audio_pcm_sha256':pcm_hash,'G_contribution':s['contribution'],'G_without_w_contribution':nw['contribution'],
@@ -132,7 +136,9 @@ def analyze_arm(root,arm,tokenizer):
     for key,select in selectors.items():
         group=[x for x in per if select(x)]
         groups[key]={'offered':len(group),'completed':sum(x['complete'] for x in group),'full_slo_met':sum(x['full_slo_met'] for x in group),
-            'ttft_s':stats([x['ttft_s'] for x in group]),'ttfp_s':stats([x['ttfp_s'] for x in group]),
+            'ttft_s':stats([x['ttft_s'] for x in group]),
+            'ttft_from_ingress_s':stats([x['ttft_from_ingress_s'] for x in group]),
+            'ingress_lateness_s':stats([x['ingress_lateness_s'] for x in group]),'ttfp_s':stats([x['ttfp_s'] for x in group]),
             'ttft_slo_met':sum(x['ttft_slo_met'] for x in group),'first_slo_met':sum(x['first_slo_met'] for x in group),
             'tpot_s':stats([x['tpot_s'] for x in group]),'production_tpot_s':stats([x['production_tpot_s'] for x in group]),
             'e2e_s':stats([x['e2e_s'] for x in group]),'stall_s':stats([x['stall_s'] for x in group]),
