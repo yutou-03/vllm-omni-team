@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -89,6 +90,35 @@ def controller(stage=0):
 
 
 class BudgetPolicyTests(unittest.TestCase):
+    def test_paced_receiver_reserves_one_inflight_chunk(self):
+        c = controller(stage=1)
+        inv = c.state['r']
+        inv.codec_sent = {0:25,1:25,2:25,3:25}
+        inv.codec_received = dict(inv.codec_sent)
+        inv.receiver_release_rate = 16.
+        inv.receiver_burst_units = 25
+        before = c.fields('r',100.,.02)
+        self.assertLess(before['coverage_s'],.06)
+        c.config['allow_paced_receiver_budget'] = True
+        after = c.fields('r',100.,.02)
+        self.assertAlmostEqual(after['coverage_s'],75/16)
+        self.assertEqual(after['receiver_pacing_burst_reserved_units'],25)
+        self.assertEqual(after['raw_consumption_rate_upper_units_s'],before['consumption_rate_units_s'])
+
+    def test_variable_deadline_pacer_cannot_fund_stage1_hold(self):
+        c = controller(stage=1)
+        c.config['allow_paced_receiver_budget'] = True
+        inv = c.state['r']
+        inv.codec_sent = {0:25,1:25,2:25,3:25}
+        inv.codec_received = dict(inv.codec_sent)
+        inv.receiver_release_rate = 16.
+        inv.receiver_burst_units = 25
+        self.assertGreater(c.fields('r',100.,.02)['coverage_s'],4.)
+        inv.update(dict(event='stage_study_receiver_buffer_released',stage_id=2,
+            monotonic=100.,fixed_release_bound=False,release_units_per_s=16.))
+        self.assertLess(c.fields('r',100.,.02)['coverage_s'],.06)
+        self.assertFalse(inv.invalid) # Does not invalidate Stage0 conditioning inventory.
+
     def test_held_slice_blocks_new_prefill_and_preserves_token_budget(self):
         scheduler, p, clock, events = probe([request('victim'), request('peer')])
         scheduler.waiting.append(request('large_prefill', decode=False))
@@ -159,6 +189,32 @@ class BudgetPolicyTests(unittest.TestCase):
         }):
             c = policy_module.Controller(fake_scheduler)
         self.assertEqual(c.config['max_hold_s'], .10)
+
+    def test_restart_inventory_uses_physical_execution_and_attempt(self):
+        # The old execution may publish more chunks than its receiver loads.
+        # A new execution starts chunk IDs at zero and must not inherit them.
+        c = controller()
+        c.refresh = policy_module.Controller.refresh.__get__(c)
+        with tempfile.TemporaryDirectory() as directory:
+            c.root = Path(directory)
+            trace_path = c.root / 'traces/stage_events.jsonl'
+            trace_path.parent.mkdir()
+            events = []
+            for physical, attempt, rows in (('job', 0, 220), ('job__execution1', 1, 230)):
+                for event in ('stage_study_text_payload_sent', 'stage_study_text_payload_received'):
+                    events.append(dict(event=event, logical_request_id='job',
+                        physical_request_id=physical, pipeline_attempt_id=attempt,
+                        stage_attempt_id=0, monotonic=100.+attempt,
+                        chunk_id=0, raw_entity_embedding_layout_valid=True,
+                        raw_entity_embedding_rows_total=rows, raw_ids_prompt_count=215))
+            trace_path.write_text(''.join(json.dumps(event)+'\n' for event in events))
+            c.refresh()
+        self.assertEqual(c.fields('job', 102., .05)['receiver_ready_inventory_units'], 5)
+        self.assertEqual(c.fields('job__execution1', 102., .05)['receiver_ready_inventory_units'], 15)
+        conflict = dict(events[-1], pipeline_attempt_id=2, chunk_id=1)
+        c.state['job__execution1'].update(conflict)
+        self.assertTrue(c.fields('job__execution1', 102., .05)['invalid_inventory'])
+        self.assertIsNone(c.fields('job__execution1', 102., .05)['inventory_units'])
 
     def test_receiver_ready_inventory_and_variable_duration(self):
         c = controller()
@@ -245,6 +301,23 @@ def urgent_setup(*, protected_extra=False):
 
 
 class UrgentKeepTests(unittest.TestCase):
+    def test_full_urgent_residency_is_part_of_coverage_budget(self):
+        scheduler, probe, c, clock, events, blocks, victim, urgent = urgent_setup()
+        c.config['guard_full_urgent_service'] = True
+        c._try_urgent_keep(scheduler, clock.now, .05)
+        self.assertFalse(probe.holds)  # .3 s stock cannot cover .2 + .15 + margin.
+        c.fields = lambda *args: dict(coverage_s=.5, high_s=.17,
+                                     requested_hold_s=.1, low_s=.15)
+        c._try_urgent_keep(scheduler, clock.now, .05)
+        self.assertIn('victim', probe.holds)
+
+    def test_native_order_remains_native_with_urgent_hold(self):
+        scheduler, probe, c, clock, events, blocks, victim, urgent = urgent_setup()
+        scheduler._baseline_policy = SimpleNamespace(value='native_fcfs')
+        c._try_urgent_keep(scheduler, clock.now, .05)
+        self.assertIn('victim', probe.holds)
+        self.assertEqual(scheduler._baseline_policy.value, 'native_fcfs')
+
     def test_urgent_newcomer_enters_freed_execution_slot_and_victim_resumes(self):
         scheduler, probe, c, clock, events, blocks, victim, urgent = urgent_setup()
         c._try_urgent_keep(scheduler, clock.now, .05)
@@ -355,8 +428,8 @@ class UrgentKeepTests(unittest.TestCase):
 
     def test_wrong_queue_policy_fails_at_initialization(self):
         scheduler, _probe, _c, _clock, _events, _blocks, _victim, _urgent = urgent_setup()
-        scheduler._baseline_policy = SimpleNamespace(value='native_fcfs')
-        with self.assertRaisesRegex(ValueError, 'stage_deadline_edf_np'):
+        scheduler._baseline_policy = SimpleNamespace(value='srpf_local_np')
+        with self.assertRaisesRegex(ValueError, 'explicit native or stage EDF'):
             hold_module.SmallHoldProbe(scheduler, emit=lambda *a, **k: None,
                 environ={hold_module.HOLD_ENV: '1',
                          'VLLM_OMNI_STAGE_BUFFER_POLICY': '1',

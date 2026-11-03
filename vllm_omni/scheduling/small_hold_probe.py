@@ -157,8 +157,8 @@ class SmallHoldProbe:
                 raise ValueError("urgent keep requires enabled stage buffer holds")
             if self.execution_cap is None or self.execution_cap >= self.resident_cap:
                 raise ValueError("urgent keep requires execution K < resident R")
-            if getattr(getattr(scheduler, "_baseline_policy", None), "value", None) != "stage_deadline_edf_np":
-                raise ValueError("urgent keep requires stage_deadline_edf_np waiting order")
+            if getattr(getattr(scheduler, "_baseline_policy", None), "value", None) not in {"native_fcfs", "stage_deadline_edf_np"}:
+                raise ValueError("urgent keep requires an explicit native or stage EDF waiting order")
             if environment.get(CONTROLLER_ENV) != "stage_buffer_controller_budget:decide":
                 raise ValueError("urgent keep requires the budget controller")
         if not self.enabled:

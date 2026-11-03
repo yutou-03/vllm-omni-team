@@ -67,9 +67,17 @@ class OmniTransferAdapterBase:
         shm_open syscalls (which can burn a full CPU core).
         """
         while not self.stop_event.is_set():
+            prefetch_active, prefetch_progress = False, False
+            prefetch = getattr(self, "_receiver_prefetch_tick", None)
+            if prefetch is not None:
+                try:
+                    prefetch_active, prefetch_progress = prefetch()
+                except Exception as exc:
+                    self._record_background_fault("prefetch", exc)
+                    return
             with self._drain_state_lock:
                 n = len(self._pending_load_reqs)
-            any_success = False
+            any_success = prefetch_progress
             for _ in range(n):
                 with self._drain_state_lock:
                     if not self._pending_load_reqs:
@@ -121,7 +129,7 @@ class OmniTransferAdapterBase:
                 with self._drain_state_lock:
                     pending_loads = len(self._pending_load_reqs)
                 if not pending_loads and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.1)
+                    self._recv_cond.wait(timeout=0.001 if prefetch_active else 0.1)
                 elif not any_success and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.001)
 
@@ -190,6 +198,10 @@ class OmniTransferAdapterBase:
                 "recv_inflight": self._recv_inflight,
                 "save_inflight": self._save_inflight,
             }
+            buffer = getattr(self, "_receiver_buffer", None)
+            if buffer is not None:
+                counters["receiver_buffer_chunks"] = sum(len(s.chunks) for s in buffer.streams.values())
+                counters["receiver_buffer_bytes"] = buffer.total_bytes
             background_fault = self._background_fault
         workers_alive = {
             "recv": bool(

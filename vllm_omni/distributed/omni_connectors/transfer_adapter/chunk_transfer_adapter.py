@@ -54,6 +54,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.connector = self.create_connector(model_config)
+        self._receiver_buffer = None
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         self._qwen3_talker_conditioning_gate = is_qwen3_omni_async_talker(model_config)
@@ -99,6 +100,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._qwen3_received_entity_rows: dict[str, int] = {}
         self._qwen3_prompt_rows: dict[str, int] = {}
         self._qwen3_entity_layout_invalid: set[str] = set()
+        from .receiver_buffer import ReceiverBuffer
+        self._receiver_buffer = ReceiverBuffer.configured(self)
+
+    def _receiver_prefetch_tick(self):
+        if self._receiver_buffer is None:
+            return False, False
+        return self._receiver_buffer.prefetch_tick()
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -136,6 +144,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not hasattr(request, "additional_information"):
             request.additional_information = None
         self._cancelled_load_reqs.discard(request.request_id)
+        if self._receiver_buffer is not None:
+            with self._drain_state_lock:
+                self._receiver_buffer.register(request)
         self._enqueue_load_request(request)
         with self._recv_cond:
             self._recv_cond.notify()
@@ -241,11 +252,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # Use timeout=0 for non-blocking poll
         try:
             with nvtx_range(f"s{stage_id}_connector_get:req={str(external_req_id)[-8:]}:chunk={chunk_id}"):
-                result = self.connector.get(
-                    str(target_stage_id),
-                    str(stage_id),
-                    connector_get_key,
-                )
+                if self._receiver_buffer is not None:
+                    with self._drain_state_lock:
+                        result = self._receiver_buffer.pop_for_release(request)
+                else:
+                    result = self.connector.get(
+                        str(target_stage_id), str(stage_id), connector_get_key,
+                    )
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
             return False
@@ -389,14 +402,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 )
                 self._finished_load_reqs.add(req_id)
                 if stage_id == 1 and stage_study.enabled():
-                    stage_study.emit("text_payload_received", stage_id=1, request_id=req_id,
+                    stage_study.emit("text_payload_released" if self._receiver_buffer else "text_payload_received", stage_id=1, request_id=req_id,
                                      info=payload_data, chunk_id=chunk_id,
                                      receiver_state="published_ready", size_bytes=size,
                                      **stage_study.text_ready_fields(payload_data),
                                      **raw_entity_fields)
                 if stage_id == 2 and small_inventory_enabled():
                     emit_inventory_event(
-                        "small_hold_chunk_received",
+                        "small_hold_chunk_released" if self._receiver_buffer else "small_hold_chunk_received",
                         stage_id=stage_id,
                         request_id=req_id,
                         fields=inventory_fields(payload_data),
@@ -687,6 +700,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # cancellation tombstone that makes the in-flight poll drop it.
         with self._drain_state_lock:
             external_req_id = self.request_ids_mapping.get(request_id, request_id)
+            if self._receiver_buffer is not None:
+                self._receiver_buffer.cleanup(request_id)
             self._pending_load_reqs = deque(
                 request
                 for request in self._pending_load_reqs

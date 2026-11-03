@@ -94,6 +94,7 @@ def _record_enabled(filename: str, payload: dict[str, Any]) -> bool:
                 event.startswith("stage_study_")
                 or event.startswith("stage_buffer_")
                 or event.startswith("small_hold_")
+                or event.startswith("urgent_keep_")
                 or event in {"request_ingress", "stage_data_ready", "stage_done_metrics", "stage_first_forward",
                              "stage_enqueue", "stage_route_to_next", "first_recomputed_progress",
                              "stage_output_version_rejected", "stage_output_commit_rejected",

@@ -24,6 +24,7 @@ def percentile(values, p):
 
 class Inventory:
     def __init__(self):
+        self.attempt = None
         self.rows = 0
         self.received_rows = 0
         self.prompt = None
@@ -38,6 +39,9 @@ class Inventory:
         self.last_selection = None
         self.invalid = False
         self.ended_text = False
+        self.receiver_release_rate = None
+        self.receiver_release_bound_valid = True
+        self.receiver_burst_units = 0
 
     def q(self, stage):
         if stage == 0:
@@ -52,6 +56,14 @@ class Inventory:
         return sum(self.codec_received.values())-sum(self.codec_started.values())
 
     def update(self, e):
+        attempt = (e.get('pipeline_attempt_id'), e.get('stage_attempt_id'))
+        if self.attempt is None:
+            self.attempt = attempt
+        elif self.attempt != attempt:
+            # A reused physical ID across attempts must fail closed: old
+            # published chunks cannot fund a hold in the new attempt.
+            self.invalid = True
+            return
         name = e['event']
         t = e['monotonic']
         if name == 'stage_study_text_payload_sent':
@@ -99,6 +111,16 @@ class Inventory:
                     if dt >= .005 and old_q is not None and old_q > 0:
                         self.rates[0].append(delta/dt)
                 self.last_selection = (t, self.q(0))
+        elif name == 'stage_study_receiver_buffer_released' and e.get('stage_id') == 2:
+            if not e.get('fixed_release_bound', True):
+                self.receiver_release_bound_valid = False
+                return
+            rate = e.get('release_units_per_s', 0)
+            if rate > 0:
+                if self.receiver_release_rate is not None and rate != self.receiver_release_rate:
+                    self.invalid = True
+                self.receiver_release_rate = rate
+                self.receiver_burst_units = max(self.receiver_burst_units, e.get('release_burst_units', 0))
         elif name == 'stage_study_chunk_sent':
             self.codec_sent.setdefault(e['chunk_id'], e['new_frames'])
         elif name == 'stage_study_chunk_received':
@@ -121,6 +143,8 @@ class Controller:
             Path(__file__).resolve().parent/'experiments/stage_buffer_budget/controller_budget_config.json')
         self.config = json.loads(config_path.read_text())
         self.c = self.config['stages'][str(self.stage)]
+        self.contracts = (json.loads(Path(self.config['contracts_path']).read_text())
+                          if self.config.get('contracts_path') else {})
         self.offset = 0
         self.state = defaultdict(Inventory)
         self.last_call = None
@@ -160,10 +184,13 @@ class Controller:
                     'stage_study_text_conditioning_selected',
                     'stage_study_chunk_sent','stage_study_chunk_received',
                     'stage_study_chunk_conversion_started',
-                    'stage_study_chunk_conversion_completed'}:
+                    'stage_study_chunk_conversion_completed',
+                    'stage_study_receiver_buffer_released'}:
                     continue
                 self.watermark = max(self.watermark, e['monotonic'])
-                rid = str(e.get('logical_request_id') or e.get('request_id'))
+                # Scheduler requests and KV ownership use physical execution
+                # IDs. A pipeline restart changes that ID but keeps the logical ID.
+                rid = str(e.get('physical_request_id') or e.get('request_id'))
                 self.state[rid].update(e)
 
     def fields(self, rid, now, guard):
@@ -174,14 +201,21 @@ class Controller:
              and ready_q is not None and min(published_q, ready_q) >= 0
              and not inv.invalid else None)
         rate = max(self.c['calibration_rate_units_s'], percentile(inv.rates[self.stage], .95))
-        coverage = q/rate if q is not None else None
+        raw_rate = rate
+        burst = 0
+        if (self.stage == 1 and self.config.get('allow_paced_receiver_budget', False)
+                and inv.receiver_release_rate is not None and inv.receiver_release_bound_valid):
+            rate = min(rate, inv.receiver_release_rate)
+            burst = inv.receiver_burst_units
+        coverage = max(0., q-burst)/rate if q is not None else None
         low = max(self.c['resume_below_s'], guard+self.config['margin_s'])
         high = max(self.c['pause_above_s'], low+self.config['margin_s']+self.config['min_hold_s'])
         budget = max(0., coverage-low-self.config['margin_s']) if coverage is not None else None
         duration = min(self.config['max_hold_s'], budget) if budget is not None else None
         return dict(inventory_units=q, published_inventory_units=published_q,
                     receiver_ready_inventory_units=ready_q,
-                    consumption_rate_units_s=rate, coverage_s=coverage,
+                    consumption_rate_units_s=rate, raw_consumption_rate_upper_units_s=raw_rate,
+                    receiver_pacing_burst_reserved_units=burst, coverage_s=coverage,
                     budget_s=budget, requested_hold_s=duration,
                     low_s=low, high_s=high, resume_guard_s=guard,
                     rate_samples=len(inv.rates[self.stage]), invalid_inventory=inv.invalid,
@@ -209,8 +243,11 @@ class Controller:
         waiting = list(scheduler.waiting)
         if not waiting:
             return
-        urgent = min(waiting, key=lambda request: (
-            scheduler._slo_stage_fields(request)[0], str(request.request_id)))
+        if getattr(getattr(scheduler, '_baseline_policy', None), 'value', None) == 'native_fcfs':
+            urgent = waiting[0]
+        else:
+            urgent = min(waiting, key=lambda request: (
+                scheduler._slo_stage_fields(request)[0], str(request.request_id)))
         urgent_deadline, predicted_ms = scheduler._slo_stage_fields(urgent)
         skipped = getattr(scheduler, "skipped_waiting", ())
         if skipped and min(scheduler._slo_stage_fields(request)[0]
@@ -248,6 +285,10 @@ class Controller:
                 rejection = 'insufficient_downstream_coverage'
             elif fields['requested_hold_s'] < self.config['min_hold_s']:
                 rejection = 'insufficient_hold_budget'
+            elif self.config.get('guard_full_urgent_service', False) and fields['coverage_s'] < (
+                    self.config.get('fixed_urgent_budget_s', predicted_ms / 1000.0)
+                    + fields['low_s'] + self.config['margin_s']):
+                rejection = 'insufficient_coverage_for_urgent_residency'
             elif now - self.last_end.get(rid, 0.) < self.config['cooldown_s']:
                 rejection = 'cooldown'
             else:
@@ -280,7 +321,19 @@ class Controller:
             return
         slack_ms = (urgent_deadline - now) * 1000.0
         trigger_ms = predicted_ms + self.config['urgent_guard_ms']
-        if slack_ms > trigger_ms:
+        first_slack_ms = None
+        first_service_ms = None
+        if getattr(self, 'contracts', None):
+            from vllm_omni.scheduling.policy import request_scheduling_metadata
+            metadata = request_scheduling_metadata(urgent)
+            contract = self.contracts.get(metadata.get('sched_source_request_id'))
+            first_field = ('ttft_slo_ms' if self.stage == 0 and metadata.get('sched_request_path') == 'text'
+                           else 'ttfp_slo_ms' if self.stage == 1 and metadata.get('sched_request_path') == 'audio' else None)
+            if contract and first_field and first_field in contract:
+                first_slack_ms = (metadata['sched_ingress_monotonic_s'] - now) * 1000. + contract[first_field]
+                first_service_ms = contract['first_output_service_ms']
+        first_is_urgent = first_slack_ms is not None and first_slack_ms <= first_service_ms + self.config['urgent_guard_ms']
+        if slack_ms > trigger_ms and not first_is_urgent:
             self.record(urgent.request_id, now, 'urgent_slack_sufficient', {},
                         urgent_request_id=urgent.request_id,
                         victim_request_id=victim.request_id,
@@ -290,7 +343,9 @@ class Controller:
                         urgent_stage_deadline_monotonic_s=urgent_deadline,
                         victim_stage_deadline_monotonic_s=victim_deadline,
                         urgent_predicted_stage_ms=predicted_ms,
-                        urgent_slack_ms=slack_ms, trigger_ms=trigger_ms)
+                        urgent_slack_ms=slack_ms, trigger_ms=trigger_ms,
+                        urgent_first_output_slack_ms=first_slack_ms,
+                        urgent_first_output_service_ms=first_service_ms)
         accepted = scheduler.request_hold(victim.request_id,
             fields['requested_hold_s'], 'urgent_inversion', evidence)
         self.record(victim.request_id, now,
