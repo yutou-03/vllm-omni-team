@@ -313,16 +313,53 @@ class UrgentKeepTests(unittest.TestCase):
         self.assertEqual(c.hold_counts['victim'],2)
         self.assertEqual(p.holds['victim'].evidence['pause_cycle'],2)
 
-    def test_inventory_lease_keeps_nominal_overrun_visible_without_false_suspension(self):
+    def test_inventory_lease_preserves_pending_urgent_slot_until_admission(self):
         scheduler,p,c,clock,events,blocks,victim,urgent=urgent_setup()
         c.config.update(inventory_deadline_lease=True,guard_full_urgent_service=True)
         c.fields=lambda *args:dict(coverage_s=2.,high_s=.17,requested_hold_s=.1,low_s=.15,budget_s=1.84)
         c._try_urgent_keep(scheduler,clock.now,.05)
         clock.now=100.2
-        with p.scheduling_context():pass
+        # The nominal 100 ms slice elapsed, but the FIFO urgent has not yet
+        # entered a synchronous batch; live stock still covers admission.
+        with p.scheduling_context():
+            self.assertEqual(scheduler.running, [])
+        with patch.object(policy_module.time,'monotonic',return_value=clock.now):
+            c(scheduler,clock.now)
+        self.assertIsNone(p.holds['victim'].released_monotonic_s)
         self.assertFalse(p.buffer_policy_suspended)
+        self.assertEqual([e['event'] for e in events].count('small_hold_released'),0)
+        with p.scheduling_context():
+            scheduler.waiting.remove(urgent)
+            urgent.status=SimpleNamespace(name='RUNNING')
+            scheduler.running.append(urgent)
+            blocks['urgent']=[51]
+        p.record_scheduled(SimpleNamespace(num_scheduled_tokens={'urgent':1}))
+        self.assertEqual([e['event'] for e in events].count('urgent_keep_admitted'),1)
+        clock.now=100.3
+        with patch.object(policy_module.time,'monotonic',return_value=clock.now):
+            c(scheduler,clock.now)
+        release=[e for e in events if e['event']=='small_hold_released']
+        self.assertFalse(release) # release is applied at the next scheduler boundary
+        with p.scheduling_context():
+            self.assertEqual(scheduler.running,[urgent])
         release=[e for e in events if e['event']=='small_hold_released'][0]
         self.assertGreater(release['deadline_lateness_s'],.05)
+        self.assertFalse(p.buffer_policy_suspended)
+
+    def test_pending_urgent_lease_ends_when_live_inventory_cannot_cover_service(self):
+        scheduler,p,c,clock,events,_blocks,_victim,_urgent=urgent_setup()
+        c.config.update(inventory_deadline_lease=True,guard_full_urgent_service=True)
+        c.fields=lambda *args:dict(coverage_s=2.,high_s=.17,requested_hold_s=.1,low_s=.15,budget_s=1.84)
+        c._try_urgent_keep(scheduler,clock.now,.05)
+        clock.now=100.04
+        c.fields=lambda *args:dict(coverage_s=.3,high_s=.17,requested_hold_s=.1,low_s=.15,budget_s=.14)
+        with patch.object(policy_module.time,'monotonic',return_value=clock.now):
+            c(scheduler,clock.now)
+        self.assertEqual(c.reasons['resume_requested'],1)
+        self.assertEqual([e['event'] for e in events].count('urgent_keep_admitted'),0)
+        with p.scheduling_context():
+            self.assertEqual(scheduler.running,[scheduler.requests['victim']])
+        self.assertFalse(p.buffer_policy_suspended)
 
     def test_pause_count_tracks_waiters_candidates_and_resident_headroom(self):
         # (execution slots, urgent waiters, safe candidates, resident spare, expected)

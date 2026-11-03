@@ -438,8 +438,20 @@ class Controller:
                     self.record(rid, now, 'recovery_margin_exhausted', fields)
                 continue
             low_inventory = fields['coverage_s'] is None or fields['coverage_s'] <= fields['low_s']
-            if low_inventory or now >= hold.deadline_monotonic_s:
-                cause = 'inventory_low_or_unknown' if low_inventory else 'slice_deadline'
+            urgent_pending = rid in probe._urgent_pending
+            urgent_budget_s = hold.evidence.get('urgent_predicted_stage_ms', 0.) / 1000.
+            # Admission may be delayed by an in-flight synchronous batch. A
+            # nominal 100 ms request does not reserve a real slot for only 100
+            # ms. Keep it until the linked urgent is scheduled, provided live
+            # receiver stock still covers its full service and the victim's
+            # recovery margin. Never extend a stale or exhausted inventory.
+            pending_lease_safe = (urgent_pending and hold.evidence.get('inventory_deadline_lease', False)
+                and not low_inventory
+                and fields['coverage_s'] >= urgent_budget_s + fields['low_s'] + self.config['margin_s']
+                and now < hold.evidence.get('resume_by_monotonic_s', 0.))
+            if low_inventory or (urgent_pending and not pending_lease_safe) or (now >= hold.deadline_monotonic_s and not pending_lease_safe):
+                cause = 'inventory_low_or_unknown' if low_inventory else ('urgent_residency_budget_exhausted'
+                    if urgent_pending and not pending_lease_safe else 'slice_deadline')
                 probe.release_hold(rid, cause)
                 self.last_end[rid] = now
                 self.record(rid, now, 'resume_requested', fields, resume_reason=cause)

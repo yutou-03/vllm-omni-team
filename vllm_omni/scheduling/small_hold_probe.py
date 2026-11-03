@@ -86,6 +86,7 @@ class _Hold:
     reason: str
     evidence: dict[str, Any]
     released_monotonic_s: float | None = None
+    release_requested: bool = False
     held_schedule_steps: int = 0
 
 
@@ -337,6 +338,7 @@ class SmallHoldProbe:
         if hold is None or hold.released_monotonic_s is not None:
             return False
         hold.deadline_monotonic_s = min(hold.deadline_monotonic_s, self.clock())
+        hold.release_requested = True
         self._event("small_hold_resume_requested", request_id, hold, resume_reason=reason)
         return True
 
@@ -460,6 +462,15 @@ class SmallHoldProbe:
                 self._urgent_pending.pop(request_id, None)
                 self._urgent_pending_logged.discard(request_id)
             elif hold.released_monotonic_s is None and now >= hold.deadline_monotonic_s:
+                # A pending FIFO urgent admission can take several scheduler
+                # rounds. Keep the borrowed slot reserved past the nominal
+                # request slice only while the controller's inventory lease
+                # remains valid. The controller checks live coverage each tick.
+                if (not hold.release_requested
+                        and hold.evidence.get("inventory_deadline_lease", False)
+                        and request_id in self._urgent_pending
+                        and now < hold.evidence.get("resume_by_monotonic_s", 0.)):
+                    continue
                 hold.released_monotonic_s = now
                 lateness = max(0.0, now - hold.deadline_monotonic_s)
                 self._event("small_hold_released", request_id, hold,
