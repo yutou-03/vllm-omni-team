@@ -40,7 +40,7 @@ def main():
       VLLM_OMNI_STAGE_BUFFER_CONFIG=str(r/('fixed_controller.json' if arm.startswith('fixed') else 'dynamic_controller.json')))
    args=['docker','exec']
    for k,v in env.items():args+=['-e',f'{k}={v}']
-   wrapper="import os,sys,runpy; from pathlib import Path; os.setsid(); Path(sys.argv[1]).write_text(str(os.getpid())); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')"
+   wrapper="import os,sys,runpy; from pathlib import Path; Path(sys.argv[1]).write_text(str(os.getpid())); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')"
    args += [name,'python','-u','-c',wrapper,str(pid_file),str(snap/'experiments/stage_buffer_budget/service_entry.py'),'serve','/data/models/Qwen3-Omni-30B-A3B-Instruct','--omni','--host','0.0.0.0','--port','8095','--deploy-config',str(deploy)]
    (service/'launch.json').write_text(json.dumps({'command':args,'environment':env,'source_manifest':str(r/'worker/manifest.json')},indent=2))
    service_log=(service/'server.log').open('w');service_process=subprocess.Popen(args,stdout=service_log,stderr=subprocess.STDOUT)
