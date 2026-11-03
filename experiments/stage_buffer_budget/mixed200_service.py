@@ -53,20 +53,30 @@ class Service:
         if self.process is None: return
         # The dedicated worker contains no unrelated jobs. Reparented GPU
         # workers can outlive the API process and disappear from its child tree.
-        cleanup = """import os,psutil
+        cleanup = """import os,psutil,time
 me=psutil.Process(os.getpid())
 protected={1,me.pid}|{p.pid for p in me.parents()}
-targets=[p for p in psutil.process_iter() if p.pid not in protected]
-for p in targets:
+def remaining():
+ result=[]
+ for p in psutil.process_iter():
+  try:
+   if p.pid not in protected and p.status()!=psutil.STATUS_ZOMBIE:result.append(p)
+  except psutil.NoSuchProcess:pass
+ return result
+for p in remaining():
  try:p.terminate()
  except psutil.NoSuchProcess:pass
-_,alive=psutil.wait_procs(targets,timeout=10)
-for p in alive:
+# Avoid pidfd_open in psutil.wait_procs: it is unsupported by this runtime.
+for _ in range(25):
+ if not remaining():break
+ time.sleep(.2)
+for p in remaining():
  try:p.kill()
  except psutil.NoSuchProcess:pass
-psutil.wait_procs(alive,timeout=10)
-remaining=[p.pid for p in psutil.process_iter() if p.pid not in protected and p.status()!=psutil.STATUS_ZOMBIE]
-if remaining:raise RuntimeError('worker processes remain: '+str(remaining))
+for _ in range(25):
+ if not remaining():break
+ time.sleep(.2)
+if remaining():raise RuntimeError('worker processes remain: '+str([p.pid for p in remaining()]))
 """
         result=subprocess.run(['docker','exec',self.name,'python','-c',cleanup],capture_output=True,text=True,timeout=35)
         if result.returncode:raise RuntimeError('owned worker cleanup failed: '+result.stderr)
