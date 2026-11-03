@@ -68,7 +68,7 @@ def main():
    (r/(arm+'_audit.json')).write_text(json.dumps(result,indent=2))
    progress(arm=arm,status='audited',holds=result['requested'],complete=result['complete_chains'],peak=result['peak_concurrent_holds'],errors=result['integrity_errors'])
    stop_service()
-   if arm=='dynamic16_smoke':
+   if arm==a.arms.split(',')[0] and arm.startswith('dynamic16'):
     positive=all(v>0 for v in result['minimum_owned_text_tokens_by_victim'].values())
     if result['peak_concurrent_holds']<3 or result['requested']!=result['complete_chains'] or result['kv_retained_chains']!=result['requested'] or result['integrity_errors'] or not positive:
      raise RuntimeError('mechanism gate failed; performance replay stopped')
