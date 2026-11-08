@@ -94,7 +94,7 @@ vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vllm_omni*"]
+include = ["vllm_omni*", "tokenflow_client_buffer*"]
 
 [tool.setuptools.package-data]
 "vllm_omni" = ["_version.py", "py.typed"]

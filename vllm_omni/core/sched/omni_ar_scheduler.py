@@ -228,6 +228,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         ) = _load_slo_active_preemption_config()
         self._slo_priority_witness_seen: set[tuple[str, str, int]] = set()
         self._small_hold_probe = SmallHoldProbe(self, emit=emit_stage_event)
+        self._client_buffer_adapter = None
+        if os.environ.get("VLLM_OMNI_CLIENT_BUFFER_CONFIG"):
+            from tokenflow_client_buffer.scheduler import create_adapter
+            self._client_buffer_adapter = create_adapter(self, emit_stage_event)
 
     def request_hold(
         self, request_id: str, duration_s: float, reason: str, evidence: dict[str, Any]
@@ -736,9 +740,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 ),
                 nvtx_range("omni:base_schedule"),
                 self._small_hold_probe.scheduling_context(),
+                (self._client_buffer_adapter.scheduling_context()
+                 if self._client_buffer_adapter is not None else nullcontext()),
             ):
                 scheduler_output = super().schedule()
             self._small_hold_probe.record_scheduled(scheduler_output)
+            if self._client_buffer_adapter is not None:
+                self._client_buffer_adapter.record_scheduled(scheduler_output)
             scheduler_output.preempted_req_ids = set(
                 scheduler_output.preempted_req_ids
             ) | controlled_preempted_req_ids | slo_active_preempted_req_ids

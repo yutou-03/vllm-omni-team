@@ -93,6 +93,7 @@ def _record_enabled(filename: str, payload: dict[str, Any]) -> bool:
             or (filename == "stage_events.jsonl" and (
                 event.startswith("stage_study_")
                 or event.startswith("stage_buffer_")
+                or event.startswith("client_buffer_")
                 or event.startswith("small_hold_")
                 or event.startswith("urgent_keep_")
                 or event in {"request_ingress", "stage_data_ready", "stage_done_metrics", "stage_first_forward",
