@@ -1677,7 +1677,10 @@ class AsyncOmniEngine:
         )
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
-        self.request_queue.sync_q.put_nowait(msg)
+        from tokenflow_client_buffer.submission_order import submit_benchmark_message
+
+        if not submit_benchmark_message(self, msg):
+            self.request_queue.sync_q.put_nowait(msg)
 
         # CFG companion expansion: create and enqueue companion requests
         # so the AR stage also generates their KV caches.
@@ -1798,6 +1801,8 @@ class AsyncOmniEngine:
 
     def abort(self, request_ids: list[str]) -> None:
         """Send abort message to the Orchestrator."""
+        if hasattr(self, "_benchmark_submission_order"):
+            self._benchmark_submission_order.abort(request_ids)
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         self.request_queue.sync_q.put_nowait(

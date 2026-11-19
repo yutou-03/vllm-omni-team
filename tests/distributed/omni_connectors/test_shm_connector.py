@@ -182,3 +182,46 @@ class TestCleanup:
         assert len(connector._pending_keys) == 3
         connector.close()
         assert len(connector._pending_keys) == 0
+
+
+class TestConcurrentCleanup:
+    def test_receive_interleaved_with_cleanup_key_matching(self, connector):
+        """A receive completion may retire another key during the scan."""
+        payload = connector.serialize_obj({'received': True})
+
+        class InterleavedKey(str):
+            def startswith(self, prefix, *args):
+                connector.get('s0', 's1', 'other',
+                              metadata={'inline_bytes': payload, 'size': len(payload)})
+                return super().startswith(prefix, *args)
+
+        connector._pending_keys.update({InterleavedKey('retired_chunk'), 'other'})
+        connector.cleanup('retired')
+        assert not connector._pending_keys
+
+    def test_close_does_not_forget_a_concurrent_new_put(self, connector, monkeypatch):
+        """Keys published while old segments are unlinked remain tracked."""
+        from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+        connector.put('s0', 's1', 'close_old', {'old': True})
+        original = module.shm_pkg.SharedMemory
+
+        def open_segment(*args, **kwargs):
+            seg = original(*args, **kwargs)
+            if kwargs.get('name') != 'close_old':
+                return seg
+
+            class Segment:
+                def close(self):
+                    seg.close()
+
+                def unlink(self):
+                    seg.unlink()
+                    assert connector.put('s0', 's1', 'close_new', {'new': True})[0]
+
+            return Segment()
+
+        monkeypatch.setattr(module.shm_pkg, 'SharedMemory', open_segment)
+        connector.close()
+        assert connector._pending_keys == {'close_new'}
+        assert connector.get('s0', 's1', 'close_new')[0] == {'new': True}

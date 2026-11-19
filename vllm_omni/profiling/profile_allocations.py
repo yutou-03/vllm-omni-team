@@ -26,11 +26,11 @@ def install(scheduler):
         current = state['current']
         if current is not None:
             current.update(required_new_blocks=int(count), free_blocks_at_check=int(free),
-                           check_monotonic=time.monotonic())
+                            check_monotonic=time.monotonic())
         if current is None and count > free:
             stage_study.emit('profile_capacity_check_failed', stage_id=stage,
-                             request_id=kwargs.get('request_id'), required_new_blocks=int(count),
-                             free_blocks_at_check=int(free), caller_scope='outside_allocate_slots')
+                                request_id=kwargs.get('request_id'), required_new_blocks=int(count),
+                                free_blocks_at_check=int(free), caller_scope='outside_allocate_slots')
         return count
 
     def allocate(request, *args, **kwargs):

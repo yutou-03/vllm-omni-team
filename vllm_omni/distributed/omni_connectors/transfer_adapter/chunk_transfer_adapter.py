@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import threading
 from vllm_omni.profiling import stage_study
 from collections import defaultdict, deque
 from types import SimpleNamespace
@@ -55,6 +56,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.connector = self.create_connector(model_config)
         self._receiver_buffer = None
+        # The sender thread performs terminal receiver cleanup. Serialize its
+        # queue replacement with scheduler moves/restores so no request is
+        # appended to a deque that cleanup has detached.
+        self._chunk_wait_queue_lock = threading.RLock()
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         self._qwen3_talker_conditioning_gate = is_qwen3_omni_async_talker(model_config)
@@ -724,16 +729,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._cancelled_load_reqs.add(request_id)
             self._finished_load_reqs.discard(request_id)
 
-        self.waiting_for_chunk_waiting_requests = deque(
-            request
-            for request in self.waiting_for_chunk_waiting_requests
-            if getattr(request, "request_id", None) != request_id
-        )
-        self.waiting_for_chunk_running_requests = deque(
-            request
-            for request in self.waiting_for_chunk_running_requests
-            if getattr(request, "request_id", None) != request_id
-        )
+        with self._chunk_wait_queue_lock:
+            self.waiting_for_chunk_waiting_requests = deque(
+                request
+                for request in self.waiting_for_chunk_waiting_requests
+                if getattr(request, "request_id", None) != request_id
+            )
+            self.waiting_for_chunk_running_requests = deque(
+                request
+                for request in self.waiting_for_chunk_running_requests
+                if getattr(request, "request_id", None) != request_id
+            )
 
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
@@ -869,35 +875,43 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self,
         waiting_queue: Any,
         running_queue: list[Request],
+        *,
+        enforce_running_limit: bool = True,
     ) -> None:
         """
         Process pending chunks for waiting and running queues.
         """
         if self.connector.stage_id == 0:
             return
-        self._process_chunk_queue(
-            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
-        )
-        self._process_chunk_queue(
-            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
-        )
-        while len(running_queue) > self.scheduler_max_num_seqs:
-            request = running_queue.pop()
-            request.status = RequestStatus.PREEMPTED
-            waiting_queue.prepend_requests([request])
+        with self._chunk_wait_queue_lock:
+            self._process_chunk_queue(
+                waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
+            )
+            self._process_chunk_queue(
+                running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
+            )
+            # A client-buffer scheduler retains paused KV owners in this list and
+            # selects the actual execution batch later. Trimming those residents
+            # here fabricates PREEMPTED transitions (without freeing KV), including
+            # requests executed in the previous step, violating native cache state.
+            while enforce_running_limit and len(running_queue) > self.scheduler_max_num_seqs:
+                request = running_queue.pop()
+                request.status = RequestStatus.PREEMPTED
+                waiting_queue.prepend_requests([request])
 
     def restore_queues(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         """
         Restore requests waiting for chunk to the waiting and running queues.
         """
-        # Add request waiting for chunk to the waiting and running queue
-        for request in self.waiting_for_chunk_waiting_requests:
-            waiting_queue.add_request(request)
-        self.waiting_for_chunk_waiting_requests = deque()
+        with self._chunk_wait_queue_lock:
+            # Add request waiting for chunk to the waiting and running queue
+            for request in self.waiting_for_chunk_waiting_requests:
+                waiting_queue.add_request(request)
+            self.waiting_for_chunk_waiting_requests = deque()
 
-        if self.waiting_for_chunk_running_requests:
-            running_queue.extend(self.waiting_for_chunk_running_requests)
-        self.waiting_for_chunk_running_requests = deque()
+            if self.waiting_for_chunk_running_requests:
+                running_queue.extend(self.waiting_for_chunk_running_requests)
+            self.waiting_for_chunk_running_requests = deque()
 
     def postprocess_scheduler_output(
         self,

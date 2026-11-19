@@ -32,6 +32,7 @@ def payload(total: int):
 
 def adapter_with_request(total: int, output_tokens: int = 0):
     adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._chunk_wait_queue_lock = __import__("threading").RLock()
     adapter._qwen3_talker_conditioning_gate = True
     adapter._qwen3_bootstrap_published = set()
     adapter._qwen3_prompt_rows = {"r": 10}
@@ -235,6 +236,7 @@ def test_real_poll_schedule_worker_chain_waits_for_embedding_and_preserves_prefi
     chunks = deque([initial, next_chunk([10, 11], 11),
                     next_chunk([10, 11, 12], 12)])
     adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._chunk_wait_queue_lock = __import__("threading").RLock()
     adapter.connector = SimpleNamespace(stage_id=1, get=lambda *args: (chunks.popleft(), 8))
     adapter.model_mode = "ar"
     adapter.scheduler_max_num_seqs = 64
@@ -403,6 +405,7 @@ def test_real_poll_schedule_worker_chain_waits_for_embedding_and_preserves_prefi
 def test_bootstrap_keeps_all_unsent_decode_deltas_then_returns_to_incremental_mode():
     import torch
     adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._chunk_wait_queue_lock = __import__("threading").RLock()
     adapter.request_payload = {}
     first = {
         "embed": {"prefill": torch.tensor([[7.0]])},
@@ -444,6 +447,7 @@ def test_prefill_generated_row_is_cached_at_absolute_output_index_zero():
         "meta": {"finished": False},
     }
     adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._chunk_wait_queue_lock = __import__("threading").RLock()
     adapter.request_payload = {}
     prepared = adapter._update_request_payload("r", first, preserve_bootstrap=True)
     assert prepared is not first

@@ -1,4 +1,7 @@
 """Host-side pilot runner. Owns only its gateway/client processes, not the model."""
+from .core import buffer_conservativeness
+from .generation_metric import configured_trace, trace_offset
+
 import argparse
 import hashlib
 import json
@@ -23,7 +26,15 @@ def main():
     p.add_argument('--capacity-drop-after',type=float)
     p.add_argument('--capacity-drop-gamma',type=float)
     p.add_argument('--container',default='zy-tokenflow-client-20261106')
+    p.add_argument('--max-inflight',type=int,default=256)
+    p.add_argument('--admission-safety',type=float,default=1.0)
+    p.add_argument('--pause-releases-admission',action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument('--timeout',type=float,default=1800.)
+    p.add_argument('--buffer-conservativeness', type=buffer_conservativeness, default=1.0,
+                   help='Multiply the client-buffer time reserved for resuming a paused stream (>= 1).')
     a=p.parse_args()
+    if a.max_inflight < 1 or a.timeout <= 0:
+        p.error('max-inflight and timeout must be positive')
     if a.capacity_only and (a.arm!='buffer' or not a.capacity_profile):
         p.error('capacity-only ablation requires buffer arm and calibrated profile')
     if a.capacity_drop_after is not None and (not a.capacity_profile or
@@ -35,14 +46,19 @@ def main():
     if active.exists():(case/'service_manifest.json').write_bytes(active.read_bytes())
     (case/'transport_source.json').write_text(json.dumps({str(p.relative_to(snap)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (snap/'tokenflow_client_buffer').glob('*.py')},indent=2))
     config=dict(session=f'tokenflow-{a.modality}-pilot',modality=a.modality,arm=a.arm,capacity_only=a.capacity_only,
-        model='/data/models/Qwen3-Omni-30B-A3B-Instruct',max_inflight=32,recovery_samples=1,
+        model='/data/models/Qwen3-Omni-30B-A3B-Instruct',max_inflight=a.max_inflight,recovery_samples=1,
         snapshot_path=str(root/'runtime/snapshot.json'),execution_telemetry_path=str(root/'runtime/execution.json'),
-        gateway_log=str(case/'gateway.jsonl'),upstream='http://127.0.0.1:18195',capacity_ttl_s=30.,capacity_safety=.85)
+        gateway_log=str(case/'gateway.jsonl'),upstream='http://127.0.0.1:18195',capacity_ttl_s=30.,capacity_safety=a.admission_safety,pause_releases_admission=a.pause_releases_admission,
+        upstream_timeout_s=a.timeout,buffer_conservativeness=a.buffer_conservativeness,
+        native_execution_limit=(json.loads(active.read_text()).get('max_num_seqs', 1)
+                                if active.exists() else 1))
     if a.capacity_profile:
         profile=json.loads(Path(a.capacity_profile).read_text())
         if profile['modality']!=a.modality:raise ValueError('capacity profile modality mismatch')
+        if a.arm=='buffer' and a.pause_releases_admission and not a.capacity_only:
+            config['admission_startup_s']=profile.get('startup_bound_s', .5)  # diagnostic estimate only
         now=time.monotonic()
-        capacity=dict(gamma=profile['raw_capacity']*.85,observed_at=now,valid_until=now+60.,modality=a.modality,
+        capacity=dict(gamma=profile['raw_capacity'],admission_gamma=profile['raw_capacity']*a.admission_safety,observed_at=now,valid_until=now+60.,modality=a.modality,
             profile_id=hashlib.sha256(Path(a.capacity_profile).read_bytes()).hexdigest(),source='heldout_calibration')
         (case/'capacity.json').write_text(json.dumps(capacity,indent=2))
         config['capacity_path']=str(case/'capacity.json')
@@ -93,14 +109,19 @@ def main():
                 except OSError:time.sleep(.1)
             else:raise TimeoutError('gateway readiness')
             client=base+['-m','tokenflow_client_buffer.client','--endpoint','http://127.0.0.1:18196',
-                '--workload',str(Path(a.workload).resolve()),'--output',str(case/'client')]
+                '--workload',str(Path(a.workload).resolve()),'--output',str(case/'client'),'--timeout',str(a.timeout)]
             (case/'launch.json').write_text(json.dumps(dict(gateway=cmd,client=client,config=config),indent=2))
             if a.capacity_drop_after is not None:
                 fault_thread = threading.Thread(target=inject_capacity_drop,daemon=True)
                 fault_thread.start()
-            result=subprocess.run(client,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=660)
+            generation_trace = configured_trace(json.loads(active.read_text())) if active.exists() else None
+            start_offset = trace_offset(generation_trace)
+            result=subprocess.run(client,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=a.timeout+60)
             (case/'client.log').write_text(result.stdout)
             print(result.stdout,flush=True)
+            if generation_trace and generation_trace.exists():
+                (case/'generation_trace_window.json').write_text(json.dumps(dict(trace=str(generation_trace.parent),
+                    start_offset=start_offset, end_offset=trace_offset(generation_trace))))
             if (case/'client/results.json').exists():
                 analysis=subprocess.run(base+['-m','tokenflow_client_buffer.analyze',str(case/'client')],capture_output=True,text=True)
                 print(analysis.stdout,flush=True)

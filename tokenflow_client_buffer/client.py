@@ -12,6 +12,7 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector
 
 from .core import ConsumerBuffer, rate_field, stream_contract
 from .stream import StreamDecoder, clock_domain, special_ids, sse_events
+from .ordered_ingress import ordered_requests
 
 
 async def consume_request(row, *, session, endpoint, contract, output, special, origin,
@@ -24,47 +25,68 @@ async def consume_request(row, *, session, endpoint, contract, output, special, 
     log = (directory / "events.jsonl").open("w", buffering=1)
     def event(name, **values):
         log.write(json.dumps(dict(event=name, monotonic=time.monotonic(), **values), allow_nan=False) + "\n")
-    buffer = ConsumerBuffer(rate, row.get("startup_s", 0.) * rate)
+    # Historical workloads may contain startup_s. It must never delay playout:
+    # only scheduler preemption has a buffer threshold, not client consumption.
+    buffer = ConsumerBuffer(rate)
     queue = deque()
     decoder = StreamDecoder(contract["modality"], special)
     start = time.monotonic()
     stopped = False
     received_done = asyncio.Event()
+    first_output_ready = asyncio.Event()
     feedback_errors = []
     last_feedback = 0.
     consumed_cursor = 0.
     result = dict(request_id=rid, modality=contract["modality"], rate=rate,
                   scheduled_at=scheduled, sent_at=start, send_lag_s=start-scheduled,
-                  status="error", workload=row)
+                  status="error", workload=row, playback_start_policy="first_ready")
+
+    def drain_consumed_payloads():
+        nonlocal consumed_cursor
+        consume = buffer.consumed - consumed_cursor
+        consumed_cursor = buffer.consumed
+        while consume > 1e-9 and queue:
+            units, payload = queue[0]
+            used = min(consume, units)
+            consume -= used
+            if units - used <= 1e-9:
+                queue.popleft()
+            else:
+                queue[0] = (units-used, payload)
 
     async def sink():
-        nonlocal last_feedback, consumed_cursor
+        nonlocal last_feedback
+        await first_output_ready.wait()
         while not stopped:
             now = time.monotonic()
             buffer.tick(now)
-            consume = buffer.consumed - consumed_cursor
-            consumed_cursor = buffer.consumed
-            while consume > 1e-9 and queue:
-                units, payload = queue[0]
-                used = min(consume, units)
-                consume -= used
-                if units - used <= 1e-9:
-                    queue.popleft()
-                else:
-                    queue[0] = (units-used, payload)
+            drain_consumed_payloads()
             if now - last_feedback >= feedback_interval or buffer.completed_at is not None:
                 raw = buffer.feedback(now, request_id=rid, session=contract["session"],
                         modality=contract["modality"], clock_domain=clock_domain())
-                try:
-                    async with session.post(endpoint + "/feedback", json=raw, timeout=ClientTimeout(total=2)) as reply:
-                        text = await reply.text()
-                        if reply.status not in (200, 409):
-                            feedback_errors.append(text)
-                except Exception as error:
-                    feedback_errors.append(repr(error))
+                if not buffer.eos:
+                    feedback_started = time.monotonic()
+                    try:
+                        async with session.post(endpoint + "/feedback", json=raw, timeout=ClientTimeout(total=2)) as reply:
+                            text = await reply.text()
+                            if reply.status not in (200, 409):
+                                feedback_errors.append(text)
+                                event('feedback_error', sequence=raw['sequence'],
+                                      observed_at=raw['observed_at'],
+                                      elapsed_s=time.monotonic()-feedback_started,
+                                      http_status=reply.status, error=text)
+                    except Exception as error:
+                        feedback_errors.append(repr(error))
+                        event('feedback_error', sequence=raw['sequence'],
+                              observed_at=raw['observed_at'],
+                              elapsed_s=time.monotonic()-feedback_started,
+                              error=repr(error))
                 last_feedback = now
                 event("client_buffer", **raw, queued_units=sum(x[0] for x in queue))
             if buffer.completed_at is not None:
+                # Receipt/EOS can run while the feedback POST is awaited and
+                # advance consumption. Reconcile that final progress as well.
+                drain_consumed_payloads()
                 return
             await asyncio.sleep(.02)
 
@@ -87,6 +109,7 @@ async def consume_request(row, *, session, endpoint, contract, output, special, 
                             before = buffer.buffered
                             queue.append((units, retained))
                             buffer.receive(units, ready)
+                            first_output_ready.set()
                             event("received", units=units, buffered_before=before,
                                   arrived_at=arrived, ready_at=ready,
                                   total_received=buffer.received)
@@ -134,11 +157,25 @@ async def run(args):
         origin = time.monotonic()+.5
         (output / "manifest.json").write_text(json.dumps(dict(contract=contract, origin=origin,
             workload_sha256=hashlib.sha256(Path(args.workload).read_bytes()).hexdigest(),
-            sink="paced simulator with retained payload queue; no physical speaker", args=vars(args)), indent=2))
+            sink="paced simulator with retained payload queue; no physical speaker",
+            playback_start_policy="first_ready", args=vars(args),
+            benchmark_protocol_revision=4, ingress_order_policy="server_order_open_loop" if getattr(args, 'ingress_trace', None) else "concurrent_uncontrolled",
+            planned_ingress_order=[r['payload']['omni_scheduling']['source_request_id'] for _, r in
+                sorted(enumerate(rows), key=lambda pair: (pair[1].get('arrival_s', 0), pair[0]))]), indent=2))
         special = special_ids(args.model)
-        results = await asyncio.gather(*(consume_request(row, session=session, endpoint=args.endpoint,
-            contract=contract, output=output, special=special, origin=origin, timeout=args.timeout)
-            for row in rows))
+        def route(row):
+            if contract.get('modality') != 'mixed':
+                return args.endpoint, contract
+            modality = row['payload']['omni_scheduling']['request_path']
+            return args.endpoint + '/' + modality, contract['contracts'][modality]
+        async def launch(row):
+            return await consume_request(row, session=session, endpoint=route(row)[0],
+                contract=route(row)[1], output=output, special=special, origin=origin, timeout=args.timeout)
+        if getattr(args, 'ingress_trace', None):
+            results = await ordered_requests(rows, launch=launch, trace_path=args.ingress_trace,
+                output=output, origin=origin, timeout=args.ingress_ack_timeout)
+        else:
+            results = await asyncio.gather(*(launch(row) for row in rows))
         (output / "results.json").write_text(json.dumps(results, indent=2, allow_nan=False))
         return results
 
@@ -150,6 +187,8 @@ def main():
     p.add_argument("--endpoint", default="http://127.0.0.1:8096")
     p.add_argument("--model", default="/data/models/Qwen3-Omni-30B-A3B-Instruct")
     p.add_argument("--timeout", type=float, default=600)
+    p.add_argument("--ingress-trace", help="Live stage_events.jsonl; audit stage-0 enqueue independently of dispatch")
+    p.add_argument("--ingress-ack-timeout", type=float, default=30.)
     args = p.parse_args()
     results = asyncio.run(run(args))
     if any(r["status"] != "success" for r in results):

@@ -153,6 +153,7 @@ def test_engine_core_snapshot_error_fails_closed() -> None:
 
 def _make_chunk_adapter() -> OmniChunkTransferAdapter:
     adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._chunk_wait_queue_lock = __import__("threading").RLock()
     adapter._drain_state_lock = threading.Lock()
     adapter._pending_load_reqs = deque()
     adapter._pending_save_reqs = deque()

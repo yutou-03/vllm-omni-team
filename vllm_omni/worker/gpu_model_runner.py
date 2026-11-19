@@ -1384,7 +1384,15 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # call the custom process function
                 req_infos["request_id"] = req_id
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                phase = "decode" if span_len == 1 else "prefill"
+                is_prefill = span_len > 1
+                phase_kwargs = {}
+                if self.has_talker_mtp and hasattr(self.model, "talker_is_prefill"):
+                    is_prefill = self.model.talker_is_prefill(
+                        span_len, req_infos,
+                        num_computed_tokens=int(self.input_batch.num_computed_tokens_cpu[req_index]),
+                    )
+                    phase_kwargs["is_prefill"] = is_prefill
+                phase = "prefill" if is_prefill else "decode"
                 stage_id = getattr(self.model_config, "stage_id", "?")
                 audit_index = conditioning_audit.before_preprocess(
                     stage_id, req_id, req_infos, input_ids[s:e], span_len
@@ -1394,7 +1402,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     f"req={str(req_id)[-8:]}:tokens={span_len}"
                 ):
                     req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                        input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                        input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos, **phase_kwargs
                     )
                 conditioning_audit.after_preprocess(req_id, audit_index, req_input_ids, req_embeds, update_dict)
                 if inputs_embeds is None:
@@ -1404,7 +1412,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         dtype=req_embeds.dtype,
                     )
 
-                if self.has_talker_mtp and span_len == 1:
+                if self.has_talker_mtp and not is_prefill:
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
                     decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
                     self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)

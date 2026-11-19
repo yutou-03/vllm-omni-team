@@ -701,7 +701,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_running_before = len(self.running)
         num_waiting_before = len(self.waiting)
         if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            buffer_adapter = self._client_buffer_adapter
+            if buffer_adapter is not None and (
+                buffer_adapter.pauses or buffer_adapter.active_ids is not None
+            ):
+                # The buffer policy owns execution selection; this list also
+                # contains paused requests whose KV remains resident.
+                self.chunk_transfer_adapter.process_pending_chunks(
+                    self.waiting, self.running, enforce_running_limit=False
+                )
+            else:
+                self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
             # Reset queue-time tracking for pre-warmed requests that just
             # received their first real chunk.  The pre-warm dummy request
             # fires a QUEUED event too early (before upstream data exists);
@@ -1060,6 +1070,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     is_segment_finished = request.is_finished() and request.resumable
                     finished = self._handle_stopped_request(request)
                     if finished:
+                        if self._client_buffer_adapter is not None:
+                            self._client_buffer_adapter.record_phase_completed(request, finish_reason)
                         kv_transfer_params = self._free_request(request)
                     if status_before_stop == RequestStatus.RUNNING:
                         stopped_running_reqs.add(request)

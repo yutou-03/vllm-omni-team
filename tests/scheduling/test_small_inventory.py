@@ -59,6 +59,7 @@ def test_metadata_does_not_change_codec_content_and_excludes_replayed_context(mo
 def test_receive_is_recorded_only_after_publication_not_cancelled_get(monkeypatch):
     payload = _payloads(monkeypatch, True)[0]
     adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._chunk_wait_queue_lock = __import__("threading").RLock()
     adapter.connector = SimpleNamespace(stage_id=2, get=lambda *args: (payload, 128))
     adapter.model_mode = "generation"
     adapter.get_req_chunk = defaultdict(int)

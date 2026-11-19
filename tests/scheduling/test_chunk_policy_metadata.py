@@ -16,6 +16,7 @@ def test_chunk_poll_keeps_policy_metadata_when_runtime_payload_replaces_it(
     model_mode,
 ):
     adapter = OmniChunkTransferAdapter.__new__(OmniChunkTransferAdapter)
+    adapter._chunk_wait_queue_lock = __import__("threading").RLock()
     adapter.connector = SimpleNamespace(
         stage_id=2,
         get=lambda *args, **kwargs: (

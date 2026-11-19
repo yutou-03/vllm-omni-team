@@ -76,9 +76,22 @@ def plots(root, prefix, summary, pairs):
                             ('Mean startup (s)','Total rebuffering per run (s)','Streaming QoS',
                              'Raw generation (tokens/s)' if prefix.startswith('text') else 'Raw generation (media seconds/s)')):
         metric=summary['metrics'][key]
+        if 'error' in metric:
+            ax.set_title(title)
+            ax.text(.5,.5,"Metric unavailable",transform=ax.transAxes,ha='center')
+            continue
         for x,y in zip(metric['per_pair_fcfs'],metric['per_pair_buffer']):
             ax.plot([0,1],[x,y],marker='o',alpha=.65)
-        ax.set_xticks([0,1],['FCFS\nK=4, R=16','Client buffer\nK=4, R=16']);ax.set_title(title);ax.grid(axis='y',alpha=.2)
+        labels=[]
+        for arm,title_arm in [('fcfs','FCFS'),('buffer','Client buffer')]:
+            manifest_path=Path(pairs[0]['arms'][arm]['case'])/'service_manifest.json'
+            manifest=json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+            limit=manifest.get('max_num_seqs')
+            config=manifest.get('scheduler_config',{})
+            detail=(f'max_num_seqs={limit}' if limit is not None else
+                    f"execution_cap={config['execution_cap']}" if 'execution_cap' in config else '')
+            labels.append(title_arm+('\n'+detail if detail else ''))
+        ax.set_xticks([0,1],labels);ax.set_title(title);ax.grid(axis='y',alpha=.2)
     fig.suptitle(prefix+' — paired repetitions')
     out=Path(root)/'reports'
     fig.savefig(out/f'{prefix}_paired.png',dpi=180);fig.savefig(out/f'{prefix}_paired.pdf');plt.close(fig)

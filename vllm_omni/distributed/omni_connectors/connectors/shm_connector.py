@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import threading
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -30,6 +31,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.device = config.get("device", "cuda:0")
         self.threshold = int(config.get("shm_threshold_bytes", 65536))
         self._pending_keys: set[str] = set()
+        self._pending_keys_lock = threading.Lock()
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -64,7 +66,8 @@ class SharedMemoryConnector(OmniConnectorBase):
 
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
-                self._pending_keys.add(put_key)
+                with self._pending_keys_lock:
+                    self._pending_keys.add(put_key)
                 self._metrics["shm_writes"] += 1
             else:
                 # Inline - pass bytes directly to avoid double serialization of the object
@@ -110,7 +113,8 @@ class SharedMemoryConnector(OmniConnectorBase):
             shm_handle = {"name": get_key, "size": shm.size}
             result = self._get_data_with_lock(lock_file, shm_handle)
             if result is not None:
-                self._pending_keys.discard(get_key)
+                with self._pending_keys_lock:
+                    self._pending_keys.discard(get_key)
             return result
         except FileNotFoundError:
             return None
@@ -138,7 +142,8 @@ class SharedMemoryConnector(OmniConnectorBase):
             if "inline_bytes" in metadata:
                 try:
                     obj = self.deserialize_obj(metadata["inline_bytes"])
-                    self._pending_keys.discard(get_key)
+                    with self._pending_keys_lock:
+                        self._pending_keys.discard(get_key)
                     return obj, int(metadata.get("size", 0))
                 except Exception as e:
                     logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
@@ -149,7 +154,8 @@ class SharedMemoryConnector(OmniConnectorBase):
                 lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
                 result = self._get_data_with_lock(lock_file, shm_handle)
                 if result is not None:
-                    self._pending_keys.discard(get_key)
+                    with self._pending_keys_lock:
+                        self._pending_keys.discard(get_key)
                 return result
 
             # Metadata is a dict but has no SHM-specific handle (e.g. RDMA-
@@ -166,13 +172,19 @@ class SharedMemoryConnector(OmniConnectorBase):
         If ``get()`` was never called, we unlink it here so /dev/shm
         doesn't leak.
         """
+        # Save/get workers can mutate the tracking set while the engine
+        # thread retires an execution. Match a stable snapshot outside the
+        # lock, and keep shared-memory I/O out of the critical section.
+        with self._pending_keys_lock:
+            pending = self._pending_keys.copy()
         stale = [
             k
-            for k in self._pending_keys
+            for k in pending
             if k == request_id or k.startswith(request_id + "_") or k.endswith("_" + request_id)
         ]
+        with self._pending_keys_lock:
+            self._pending_keys.difference_update(stale)
         for key in stale:
-            self._pending_keys.discard(key)
             try:
                 seg = shm_pkg.SharedMemory(name=key)
                 seg.close()
@@ -191,7 +203,10 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def close(self) -> None:
         """Unlink all remaining tracked SHM segments."""
-        for key in list(self._pending_keys):
+        with self._pending_keys_lock:
+            pending = self._pending_keys.copy()
+            self._pending_keys.clear()
+        for key in pending:
             try:
                 seg = shm_pkg.SharedMemory(name=key)
                 seg.close()
@@ -204,7 +219,6 @@ class SharedMemoryConnector(OmniConnectorBase):
                     os.remove(lock_file)
                 except OSError:
                     pass
-        self._pending_keys.clear()
 
     def health(self) -> dict[str, Any]:
         return {"status": "healthy", "threshold": self.threshold, **self._metrics}

@@ -92,6 +92,7 @@ def _record_enabled(filename: str, payload: dict[str, Any]) -> bool:
             (filename == "iteration_events.jsonl" and event == "iteration")
             or (filename == "stage_events.jsonl" and (
                 event.startswith("stage_study_")
+                or (event == "stage_token_output" and str(payload.get("stage_id")) == "0")
                 or event.startswith("stage_buffer_")
                 or event.startswith("client_buffer_")
                 or event.startswith("small_hold_")

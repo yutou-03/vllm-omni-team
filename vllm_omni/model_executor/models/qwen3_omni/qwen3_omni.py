@@ -716,7 +716,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         reset["meta"] = {}
         return reset
 
-    def talker_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
+    def talker_is_prefill(self, span_len: int, payload: OmniPayload, *, num_computed_tokens: int | None = None) -> bool:
+        """A one-token scheduler span can still belong to the initial prompt."""
+        if span_len > 1:
+            return True
+        meta = payload.get("meta", {})
+        if meta.get("decode_flag", False) or meta.get("prefill_consumed_text_tokens") is not None:
+            return False
+        if num_computed_tokens == 0:
+            return True
+        prefill_total = meta.get("prefill_total_tokens")
+        return prefill_total is not None and meta.get("num_processed_tokens", 0) < prefill_total
+
+    def talker_preprocess(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor,
+        *, is_prefill: bool | None = None, **info_dict: dict,
+    ):
         """
         Preprocess talker embeds. Noted that we set the MTP here.
         """
@@ -729,8 +744,10 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         span_len = input_ids.shape[0]
         update_dict: OmniPayload = {}
-        if span_len > 1:
-            # prefill
+        if is_prefill is None:
+            is_prefill = self.talker_is_prefill(span_len, payload)
+        if is_prefill:
+            # Includes one-token chunks of the initial prompt.
             input_ids, input_embeds, update_dict = self.talker_preprocess_prefill(input_ids, input_embeds, payload)
             code_predictor_codes = torch.zeros(
                 (input_embeds.shape[0], self.talker.num_code_groups),
@@ -929,6 +946,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 update_dict.setdefault("embed", {})["tts_pad_projected"] = pad_proj.detach()
         except Exception:
             pass
+        # Persist the full prompt boundary: a later chunk can contain just
+        # one token and must finish prefill before entering MTP decode.
+        update_dict.setdefault("meta", {})["prefill_total_tokens"] = int(req_input_ids.shape[0])
         # The assistant bootstrap embedding is in the final prompt span.
         # Chunked prefill can run earlier spans without consuming it.
         if end_index >= req_input_ids.shape[0]:

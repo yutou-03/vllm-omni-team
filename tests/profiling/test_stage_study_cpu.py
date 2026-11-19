@@ -151,7 +151,13 @@ class StudyContracts(unittest.TestCase):
                                                   get_block_ids=lambda rid:([1,2],)),
             kv_cache_config=types.SimpleNamespace(kv_cache_groups=[]))
         rows=[]
-        with patch.object(STUDY,'emit_stage_event',lambda e,**kw:rows.append(kw)):
+        # This test covers the snapshot, not allocator monkey-patch installation.
+        # The CPU fake has no allocate_slots/coordinator; keep that independent
+        # dependency isolated instead of importing the full vLLM package.
+        allocator = types.ModuleType('vllm_omni.profiling.profile_allocations')
+        allocator.install = lambda scheduler: None
+        with patch.dict(sys.modules, {'vllm_omni.profiling.profile_allocations': allocator}), \
+             patch.object(STUDY,'emit_stage_event',lambda e,**kw:rows.append(kw)):
             fn(scheduler,point='before_schedule')
             fn(scheduler,point='before_schedule')  # Same monotonic time: 50 ms throttle remains active.
         self.assertEqual(len(rows),1)

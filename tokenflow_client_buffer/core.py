@@ -5,6 +5,7 @@ use a different timestamp protocol; the pilot rejects clock-domain mismatch.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 import math
 import threading
@@ -18,6 +19,13 @@ def number(value: Any, name: str, *, positive: bool = False) -> float:
     if not math.isfinite(value) or (value <= 0 if positive else value < 0):
         raise ValueError(f"invalid {name}: {value}")
     return value
+
+
+def buffer_conservativeness(value):
+    factor = number(value, "buffer conservativeness", positive=True)
+    if factor < 1:
+        raise ValueError("buffer conservativeness must be at least 1")
+    return factor
 
 
 def rate_field(modality: str) -> str:
@@ -42,12 +50,12 @@ def stream_contract(payload: dict, modality: str) -> tuple[str, float]:
 class ConsumerBuffer:
     """Fluid consumer clock shared by text and decoded PCM.
 
+    Consumption starts at the first usable receipt, with no startup threshold.
     Receiving and ticking are separate operations. Empty intervals after
     startup are stalls, but an EOS tail never becomes a stall. Units are
     canonical visible tokens or decoded media seconds, never codec tokens.
     """
     rate: float
-    startup_units: float = 0.0
     received: float = 0.0
     consumed: float = 0.0
     last_time: float | None = None
@@ -63,7 +71,6 @@ class ConsumerBuffer:
 
     def __post_init__(self):
         self.rate = number(self.rate, "rate", positive=True)
-        self.startup_units = number(self.startup_units, "startup units")
 
     @property
     def buffered(self):
@@ -99,17 +106,12 @@ class ConsumerBuffer:
         self.current_stall_s = 0.0
         if self.first_ready is None:
             self.first_ready = now
-        if self.started_at is None and self.buffered >= self.startup_units:
+        if self.started_at is None:
             self.started_at = now
 
     def finish(self, now: float):
         self.tick(now)
         self.eos = True
-        if self.started_at is None:
-            if self.buffered:
-                self.started_at = now  # short stream below initial threshold
-            else:
-                self.completed_at = now
         if not self.buffered and self.completed_at is None:
             self.completed_at = now
 
@@ -182,21 +184,31 @@ class CapacityEstimate:
     modality: str
     profile_id: str
     source: str
+    admission_gamma: float | None = None
+
+    @property
+    def admission_bound(self):
+        return min(self.gamma, self.admission_gamma if self.admission_gamma is not None else self.gamma)
 
     def valid(self, now, modality):
         return (self.modality == modality and math.isfinite(self.gamma) and self.gamma > 0
-                and self.observed_at <= now <= self.valid_until and bool(self.profile_id))
+                and self.observed_at <= now <= self.valid_until and bool(self.profile_id)
+                and (self.admission_gamma is None or
+                     math.isfinite(self.admission_gamma) and self.admission_gamma > 0))
 
 
 class CapacityEstimator:
-    """Conservative sustained-window estimate, never fitted to client pacing.
+    """Current delivered service estimate from complete execution windows.
 
-    A pre-calibrated profile can seed this estimator. Saturated measurement
-    windows update it downward immediately and upward by EWMA. Demand-limited
-    windows cannot lower or refresh its evidence. The caller must measure
-    final generated output and label saturation from execution, not arrivals.
+    Every sustained output window supplies a demonstrated rate lower bound,
+    regardless of FCFS/buffer policy or sequence count. A lower observation
+    updates a still-valid capacity only with independent backend pressure evidence.
+    After expiry, fresh output establishes a new lower bound without inheriting
+    the stale calibration. Policy
+    and request-length context are logged by callers; this is an online
+    measurement, not a fitted physical peak or an extrapolation from GPU busy.
     """
-    def __init__(self, modality: str, *, safety: float = .9, ttl_s: float = 30.0,
+    def __init__(self, modality: str, *, safety: float = 1.0, ttl_s: float = 30.0,
                  min_window_s: float = 2.0, alpha: float = .2):
         rate_field(modality)
         if not 0 < safety <= 1 or not 0 < alpha <= 1:
@@ -210,24 +222,37 @@ class CapacityEstimator:
         raw_capacity = number(raw_capacity, "capacity", positive=True)
         if not profile_id:
             raise ValueError("calibration provenance required")
-        self.estimate = CapacityEstimate(raw_capacity * self.safety, now, now + self.ttl_s,
-                                        self.modality, profile_id, "calibration")
+        self.estimate = CapacityEstimate(raw_capacity, now, now + self.ttl_s,
+                                        self.modality, profile_id, "calibration",
+                                        raw_capacity * self.safety)
         return self.estimate
 
     def observe(self, *, generated_units: float, duration_s: float, now: float,
-                saturated: bool, profile_id: str):
+                saturated: bool, profile_id: str, policy: str = "buffer"):
         units = number(generated_units, "generated units")
         duration = number(duration_s, "capacity duration", positive=True)
-        if not saturated or duration < self.min_window_s:
+        # A chunk-free interval is not evidence of zero service capacity. The
+        # caller retains its elapsed time and joins it with the next output.
+        if units == 0 or duration < self.min_window_s:
             return self.estimate
         if not profile_id:
             raise ValueError("execution profile required")
-        raw = self.safety * units / duration
-        if self.estimate and self.estimate.profile_id == profile_id:
-            old = self.estimate.gamma
-            raw = min(raw, (1 - self.alpha) * old + self.alpha * raw)
+        raw = units / duration
+        old = (self.estimate if self.estimate and self.estimate.profile_id == profile_id
+               and self.estimate.valid(now, self.modality) else None)
+        if not saturated and old and raw < old.gamma:
+            # Self-limited/idle windows cannot shrink the proven service bound.
+            return self.estimate
+        if not saturated and old is None:
+            # An uncalibrated sustained observation still establishes a lower
+            # bound; it does not establish a physical maximum.
+            source = "observed_output_lower_bound"
+        else:
+            source = "saturated_execution_window" if saturated else "observed_output_lower_bound"
+        if old:
+            raw = (1 - self.alpha) * old.gamma + self.alpha * raw
         self.estimate = CapacityEstimate(raw, now, now + self.ttl_s, self.modality,
-                                        profile_id, "saturated_execution_window")
+                                        profile_id, source, raw * self.safety)
         return self.estimate
 
 
@@ -242,51 +267,103 @@ class StreamRequest:
 class WorkingSet:
     """Single authoritative, atomic admission ledger for logical requests.
 
-    W persists across stage waits and scheduler pauses. Only terminal
-    generation/cancellation releases demand. A fallback does not delete W.
+    Active W excludes confirmed buffer-safe pauses. Paused requests retain
+    their identity and memory accounting; resumption restores their demand
+    before execution. A capacity overload freezes NEW admissions, not restores.
     """
-    def __init__(self, modality: str, *, max_inflight: int = 64, recovery_samples: int = 2):
+    def __init__(self, modality: str, *, max_inflight: int = 64, recovery_samples: int = 2,
+                 native_execution_limit: int = 1, terminal_history_limit: int = 4096):
         rate_field(modality)
-        if max_inflight < 1 or recovery_samples < 1:
+        if max_inflight < 1 or recovery_samples < 1 or native_execution_limit < 1:
             raise ValueError("invalid working set bounds")
+        if type(terminal_history_limit) is not int or terminal_history_limit < 1:
+            raise ValueError("positive terminal history limit required")
         self.modality = modality
         self.max_inflight, self.recovery_samples = max_inflight, recovery_samples
         self.requests: dict[str, StreamRequest] = {}
+        self.completed_ids = OrderedDict()
+        self.terminal_history_limit = terminal_history_limit
+        self._arrival_sequence = 0
         self.mode, self.reason = "fcfs", "capacity_unknown"
         self._safe_samples = 0
         self._last_estimate = None
+        self._last_safe_demand = None
         self._lock = threading.RLock()
+        self.admission_guard = None
+        # Only unknown-capacity fallback uses this bound, replenishing native
+        # slots as requests finish. Buffer mode admits by rate, never by |W|.
+        self.native_execution_limit = native_execution_limit
 
     @property
     def members(self):
         return [r for r in self.requests.values() if r.state == "admitted"]
 
+
+    @property
+    def outstanding(self):
+        return [r for r in self.requests.values() if r.state in {"admitted", "paused"}]
+
     @property
     def demand(self):
         return math.fsum(r.rate for r in self.members)
 
+
+
+    def pause(self, rid: str):
+        with self._lock:
+            r = self.requests[rid]
+            if r.state == "admitted":
+                r.state = "paused"
+                return True
+            return False
+
+    def resume(self, rid: str):
+        with self._lock:
+            r = self.requests[rid]
+            if r.state == "paused":
+                r.state = "admitted"
+                return True
+            return False
+
     def add(self, rid: str, rate: float):
         with self._lock:
-            if rid in self.requests:
+            if self.has_request_id(rid):
                 raise ValueError("duplicate logical request")
-            self.requests[rid] = StreamRequest(rid, number(rate, "rate", positive=True), len(self.requests))
+            self.requests[rid] = StreamRequest(rid, number(rate, "rate", positive=True), self._arrival_sequence)
+            self._arrival_sequence += 1
+
+    def has_request_id(self, rid: str):
+        return rid in self.requests or rid in self.completed_ids
 
     def complete(self, rid: str):
         with self._lock:
-            self.requests[rid].state = "finished"
+            request = self.requests.pop(rid, None)
+            if request is None:
+                return
+            request.state = "finished"
+            # Full history belongs in the event journal, not the hot ledger.
+            self.completed_ids[rid] = None
+            while len(self.completed_ids) > self.terminal_history_limit:
+                self.completed_ids.popitem(last=False)
 
     def update(self, estimate: CapacityEstimate | None, now: float):
         with self._lock:
             if estimate is None or not estimate.valid(now, self.modality):
                 self.mode, self.reason, self._safe_samples = "fcfs", "capacity_unknown", 0
                 self._last_estimate = None
+                self._last_safe_demand = None
             elif self.demand > estimate.gamma + 1e-9:
                 self.mode, self.reason, self._safe_samples = "fcfs", "overload", 0
                 self._last_estimate = estimate
+                self._last_safe_demand = None
             else:
-                if estimate != self._last_estimate:
+                # Completion and acknowledged quota exchange can restore
+                # feasibility without a new throughput sample. Do not retain
+                # a stale overload reason merely because Gamma is unchanged.
+                if estimate != self._last_estimate or self.demand != self._last_safe_demand:
                     self._safe_samples += 1
                     self._last_estimate = estimate
+                    self._last_safe_demand = self.demand
                 if self.mode == "buffer" or self._safe_samples >= self.recovery_samples:
                     self.mode, self.reason = "buffer", "capacity_feasible"
             return self.mode
@@ -295,18 +372,31 @@ class WorkingSet:
         with self._lock:
             self.update(estimate, now)
             pending = [r for r in self.requests.values() if r.state == "waiting"]
-            if not pending or len(self.members) >= self.max_inflight:
+            if not pending or len(self.outstanding) >= self.max_inflight:
                 return None
             candidate = pending[0]
             # Overload drains the existing working set under native FCFS;
             # waiting requests cannot expand it while D still exceeds Gamma.
             if not native and self.reason == "overload" and self.members:
                 return None
-            if not native and self.mode == "buffer" and self.demand + candidate.rate > estimate.gamma + 1e-9:
+            valid = estimate is not None and estimate.valid(now, self.modality)
+            if not native and not valid:
+                # Keep a rolling native FCFS window while capacity is unknown.
+                # Expiry neither flushes the entire queue nor requires the last
+                # member of a batch to finish before replenishing a free slot.
+                # Paused owners must recover first; they still retain KV/state.
+                if any(r.state == "paused" for r in self.outstanding):
+                    return None
+                if len(self.outstanding) >= self.native_execution_limit:
+                    return None
+            if not native and valid and self.demand + candidate.rate > estimate.admission_bound + 1e-9:
                 if self.members:
                     return None  # preserve FIFO, no skipping smaller requests
                 # A single demand exceeds capacity: service via FCFS, not deadlock.
                 self.mode, self.reason = "fcfs", "single_request_overload"
+            if (not native and self.mode == "buffer" and self.admission_guard is not None
+                    and not self.admission_guard(candidate, now)):
+                return None
             candidate.state = "admitted"
             self.update(estimate, now)
             return candidate.request_id
@@ -317,5 +407,7 @@ class WorkingSet:
             return dict(mode="fcfs" if native else self.mode,
                         reason="baseline" if native else self.reason,
                         demand=self.demand, gamma=estimate.gamma if estimate and estimate.valid(now, self.modality) else None,
+                        admission_gamma=estimate.admission_bound if estimate and estimate.valid(now, self.modality) else None,
                         members={r.request_id: asdict(r) for r in self.members},
+                        paused_members={r.request_id: asdict(r) for r in self.outstanding if r.state == "paused"},
                         waiting=sum(r.state == "waiting" for r in self.requests.values()))

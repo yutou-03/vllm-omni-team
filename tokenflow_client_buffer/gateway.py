@@ -12,18 +12,29 @@ import time
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from .core import CapacityEstimate, CapacityEstimator, ClientFeedback, WorkingSet, stream_contract
+from .core import buffer_conservativeness, CapacityEstimate, CapacityEstimator, ClientFeedback, WorkingSet, stream_contract
+from .leases import PauseAdmission
+from .admission import AdmissionSafety
 from .stream import StreamDecoder, atomic_json, clock_domain, special_ids, sse_events
 
 
-class Gateway:
+from .ordered_backend import OrderedBackend
+
+
+class Gateway(PauseAdmission, AdmissionSafety):
     def __init__(self, config):
         self.config = config
+        self.buffer_conservativeness = buffer_conservativeness(config.get("buffer_conservativeness", 1.0))
+        self.ordered_backend = OrderedBackend(config["ordered_backend_trace"], event=self.event) if config.get("ordered_backend_trace") else None
+        self.init_pause_admission()
+        self.admission_safety_init()
         self.modality = config["modality"]
         self.session = config["session"]
         self.clock_domain = clock_domain()
         self.w = WorkingSet(self.modality, max_inflight=config.get("max_inflight", 32),
-                            recovery_samples=config.get("recovery_samples", 1))
+                            recovery_samples=config.get("recovery_samples", 1),
+                            native_execution_limit=config.get("native_execution_limit", 1))
+        self.w.admission_guard = self.admission_safety
         self.feedback = {}
         self.ready = {}
         self.special = special_ids(config["model"])
@@ -34,14 +45,29 @@ class Gateway:
         self.last_publish = 0.
         self.last_status = None
         self.stopping = False
-        self.estimator = CapacityEstimator(self.modality, safety=config.get("capacity_safety", .85),
-            ttl_s=config.get("capacity_ttl_s", 30.), min_window_s=2.)
+        self.estimator = CapacityEstimator(self.modality, safety=config.get("capacity_safety", 1.0),
+            ttl_s=config.get("capacity_ttl_s", 30.),
+            min_window_s=config.get("capacity_window_s", 8. if self.modality == "audio" else 2.))
         self.window_start = time.monotonic()
         self.window_units = 0.
         self.previous_telemetry = None
+        self.last_capacity_check = self.window_start
 
     def event(self, name, **values):
         self.log.write(json.dumps(dict(event=name, monotonic=time.monotonic(), **values), allow_nan=False) + "\n")
+
+    def engine_queue_enabled(self):
+        coordinator = getattr(self, 'coordinator', None)
+        configured = self.config.get('engine_queue_admission',
+            coordinator.config.get('engine_queue_admission', False) if coordinator else False)
+        return self.config['arm'] == 'buffer' and configured is True
+
+    def engine_queue_snapshot(self):
+        enabled = self.engine_queue_enabled()
+        return dict(engine_queue_admission=enabled,
+                    admission_scope='target_output_stage' if enabled else 'http_ingress',
+                    registered_ids=[rid for rid, r in self.w.requests.items()
+                                    if r.state != 'finished'] if enabled else [])
 
     def capacity(self, now):
         path = self.config.get("capacity_path")
@@ -68,11 +94,12 @@ class Gateway:
         if self.config.get("capacity_only"):
             # Ablation: retain the same W/Gamma gate but run native FCFS.
             state.update(mode="fcfs", reason="capacity_only")
-        state.update(schema_version=1, session=self.session, modality=self.modality,
+        state.update(buffer_conservativeness=self.buffer_conservativeness, schema_version=1, session=self.session, modality=self.modality,
                      clock_domain=self.clock_domain, written_at=now,
                      capacity_valid_until=est.valid_until if est else 0.,
                      feedback={rid: asdict(f) for rid, f in self.feedback.items()
-                               if rid in state["members"]})
+                               if rid in state["members"] or rid in state["paused_members"]},
+                     **self.pause_snapshot(now), **self.engine_queue_snapshot())
         atomic_json(self.snapshot, state)
         status = (state["mode"], state["reason"], state["demand"], state["gamma"], state["waiting"])
         if status != self.last_status or now - self.last_publish > 1:
@@ -80,43 +107,102 @@ class Gateway:
             self.last_status, self.last_publish = status, now
 
     def update_capacity(self, now):
-        if now-self.window_start < 2.:
+        from .capacity_signals import execution_window_evidence
+        if (now-self.window_start < self.estimator.min_window_s
+                or now-self.last_capacity_check < 2.):
             return
+        self.last_capacity_check = now
+        defer_empty = False
+        telemetry = None
         try:
             telemetry = json.loads(Path(self.config["execution_telemetry_path"]).read_text())
             previous = self.previous_telemetry
-            self.previous_telemetry = telemetry
             if previous and self.est:
                 steps = telemetry["steps"]-previous["steps"]
                 full = telemetry["full_steps"]-previous["full_steps"]
                 holds = telemetry["held_steps"]-previous["held_steps"]
-                saturated = (steps > 0 and full/steps >= .9 and holds == 0
+                duration = now-self.window_start
+                measurement_valid = (steps > 0
                     and 0 <= now-telemetry["written_at"] <= .5
                     and telemetry["session"] == self.session)
+                pending = next((r for r in self.w.requests.values() if r.state == 'waiting'), None)
+                capacity_limited = (pending is not None and bool(self.w.members)
+                    and self.w.demand + pending.rate > self.est.admission_bound)
+                evidence = execution_window_evidence(telemetry, previous, duration)
+                saturated = measurement_valid and evidence['saturated']
+                buffer_steps = telemetry.get("buffer_steps", 0) - previous.get("buffer_steps", 0)
+                fcfs_steps = telemetry.get("fcfs_steps", 0) - previous.get("fcfs_steps", 0)
+                policy = ("buffer" if buffer_steps == steps else
+                          "fcfs" if fcfs_steps == steps else "mixed")
                 before = self.est
-                self.est = self.estimator.observe(generated_units=self.window_units,
-                    duration_s=now-self.window_start, now=now, saturated=saturated,
-                    profile_id=self.est.profile_id)
-                self.event("capacity_window", units=self.window_units, duration_s=now-self.window_start,
+                # Silence belongs to the output window whether 1 or 32
+                # requests execute. Never shorten a chunk's denominator.
+                defer_empty = self.window_units == 0
+                if measurement_valid:
+                    self.est = self.estimator.observe(generated_units=self.window_units,
+                        duration_s=duration, now=now, saturated=saturated,
+                        profile_id=self.est.profile_id, policy=policy)
+                if not measurement_valid:
+                    evidence['saturation_basis'] = 'no_valid_execution'
+                self.event("capacity_window", units=self.window_units, duration_s=duration,
                     full_steps=full, steps=steps, holds=holds, saturated=saturated,
+                    policy=policy, buffer_steps=buffer_steps, fcfs_steps=fcfs_steps,
+                    observed_output_per_s=self.window_units/duration,
+                    capacity_limited=capacity_limited,
+                    **{k:v for k,v in evidence.items() if k!='saturated'},
+                    updated=self.est is not before, deferred_empty_window=defer_empty,
+                    capacity_scope='current_delivered_service; no peak extrapolation; policy costs remain in wall time',
                     estimate=asdict(self.est))
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        self.window_start, self.window_units = now, 0.
+        if not defer_empty:
+            self.previous_telemetry = telemetry
+            self.window_start, self.window_units = now, 0.
 
     async def loop(self):
         while not self.stopping:
             now = time.monotonic()
             self.capacity(now)
             self.update_capacity(now)
+            # Bound CPU time, not W size or execution concurrency. Admission
+            # and HTTP feedback share this event loop; a large queue must not
+            # monopolize it until every request has been handed off.
+            admission_started = time.monotonic()
+            admission_count = 0
+            yielded = False
             while True:
+                # Both routes borrow shared resources. Refresh all restoration
+                # obligations atomically before EACH new admission; a local
+                # flag alone lets text bypass an audio recovery (or vice versa).
+                now = time.monotonic()
+                if hasattr(self, 'coordinator'):
+                    recovering = self.coordinator.admission_recovery_pending(now)
+                else:
+                    self.process_pause_leases(now)
+                    recovering = self.recovery_pending
+                if recovering:
+                    break
+                # W is a rate budget, not the native execution batch.
+                # Returning KV owners may raise |W| above max_num_seqs;
+                # only the scheduler limits simultaneous execution.
                 rid = self.w.admit_next(self.capacity(now), now, native=self.config["arm"] == "fcfs")
                 if rid is None:
                     break
-                self.event("admitted", request_id=rid, rate=self.w.requests[rid].rate)
+                self.event("native_queued" if self.w.requests[rid].state == 'native_queued' else "admitted",
+                           request_id=rid, rate=self.w.requests[rid].rate)
                 self.ready[rid].set()
+                admission_count += 1
+                if time.monotonic() - admission_started >= .01:
+                    yielded = True
+                    break
             self.publish()
-            await asyncio.sleep(.025)
+            elapsed = time.monotonic() - admission_started
+            if elapsed >= .1:
+                self.event('gateway_slow_admission_turn', duration_s=elapsed,
+                           admitted=admission_count, yielded=yielded)
+            # Publish before yielding; recheck live recovery/capacity next
+            # turn. A CPU time slice is not an admission quota or rate limit.
+            await asyncio.sleep(0 if yielded else .025)
 
     async def contract(self, request):
         return web.json_response(dict(session=self.session, modality=self.modality,
@@ -126,12 +212,15 @@ class Gateway:
         try:
             raw = await request.json()
             rid = raw["request_id"]
-            if rid not in self.w.requests:
+            if rid not in self.w.requests or self.w.requests[rid].state == "finished":
                 return web.json_response({"error":"request not registered"}, status=409)
             f = ClientFeedback.parse(raw, now=time.monotonic(), session=self.session,
                     modality=self.modality, clock_domain=self.clock_domain,
                     rate=self.w.requests[rid].rate, previous=self.feedback.get(rid))
+            if f.observed_at < self.registered_at[rid]:
+                raise ValueError("feedback predates request registration")
             self.feedback[rid] = f
+            self.observe_client_delivery(f)
             self.event("client_feedback", **asdict(f))
             return web.json_response({"accepted":True})
         except (ValueError, KeyError, TypeError) as e:
@@ -144,17 +233,27 @@ class Gateway:
             rid, rate = stream_contract(payload, self.modality)
             if request.headers.get("X-TokenFlow-Session") != self.session:
                 raise ValueError("client session mismatch")
+            benchmark_rank = payload["omni_scheduling"].get("ingress_order")
+            if self.ordered_backend:
+                if type(benchmark_rank) is not int or benchmark_rank < 0:
+                    raise ValueError("invalid benchmark ingress rank")
+                await self.ordered_backend.register(benchmark_rank)
             self.w.add(rid, rate)
+            self.registered_at[rid] = time.monotonic()
             self.ready[rid] = asyncio.Event()
             # Arrival order is server-owned, never supplied for priority gaming.
             payload["omni_scheduling"]["ingress_order"] = self.w.requests[rid].arrival_order
             self.event("arrived", request_id=rid, rate=rate, payload=payload)
+            if self.engine_queue_enabled():
+                # Registration must reach the target stage before this POST.
+                # Upstream preparation never supplies client buffer credit.
+                self.publish()
         except (ValueError, KeyError, TypeError) as e:
             return web.json_response({"error":str(e)}, status=400)
         response = None
         status = "cancelled"
         try:
-            while not self.ready[rid].is_set():
+            while not self.engine_queue_enabled() and not self.ready[rid].is_set():
                 if request.transport is None or request.transport.is_closing():
                     raise ConnectionResetError("client disconnected while queued")
                 try:
@@ -162,7 +261,11 @@ class Gateway:
                 except asyncio.TimeoutError:
                     pass
             decoder = StreamDecoder(self.modality, self.special)
-            async with self.http.post(self.config["upstream"] + "/v1/chat/completions", json=payload) as upstream:
+            self.event('upstream_forwarded', request_id=rid,
+                       admission_scope='target_output_stage' if self.engine_queue_enabled() else 'http_ingress',
+                       quota_state=self.w.requests[rid].state)
+            upstream_context = (self.ordered_backend.post(self.http, self.config["upstream"] + "/v1/chat/completions", payload=payload, rid=rid, rank=benchmark_rank) if self.ordered_backend else self.http.post(self.config["upstream"] + "/v1/chat/completions", json=payload))
+            async with upstream_context as upstream:
                 if upstream.status != 200:
                     error = await upstream.text()
                     self.event("upstream_error", request_id=rid, status=upstream.status, error=error)
@@ -198,12 +301,27 @@ class Gateway:
                 pass
             return response
         finally:
-            self.w.complete(rid)
+            self.finish_request(rid)
             self.event("terminal", request_id=rid, status=status)
             self.publish()
 
+    def finish_request(self, rid):
+        """Retire all control state after generation or transport termination."""
+        self.w.complete(rid)
+        for states in (self.feedback, self.delivery_history, self.ready,
+                       self.registered_at, self.pause_acks, self.accepted_pause_leases):
+            states.pop(rid, None)
+        coordinator = getattr(self, 'coordinator', None)
+        if coordinator is not None:
+            coordinator.phase_attempts.pop(rid, None)
+
     async def startup(self, app):
-        self.http = ClientSession(timeout=ClientTimeout(total=600), connector=__import__("aiohttp").TCPConnector(limit=0))
+        self.http = ClientSession(timeout=ClientTimeout(total=self.config.get("upstream_timeout_s", 600)),
+                                  # Each upstream POST is a long-lived generation stream. Avoid
+                                  # reusing an idle connection closed by the server while
+                                  # admission queued the next request; do not retry POSTs
+                                  # whose acceptance is uncertain.
+                                  connector=__import__("aiohttp").TCPConnector(limit=0, force_close=True))
         self.task = asyncio.create_task(self.loop())
 
     async def cleanup(self, app):
