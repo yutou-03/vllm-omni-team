@@ -57,6 +57,8 @@ class VirtualOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.g.feedback['new'],sample)
         self.g.refresh_virtual_output(15.)
         self.assertEqual(self.g.feedback['new'].coverage(15., .5),0.)
+        self.g.config['recovery_ranking'] = 'paper'
+        self.assertEqual(self.g.ranking_snapshot(15.)['signed_buffer_s']['new'], -1.)
         self.g.finish_request('new')
         self.g.refresh_virtual_output(16.)
         self.assertFalse(self.g.feedback)
@@ -80,3 +82,6 @@ class VirtualOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.feedback('s','audio',11.).coverage(11.,.5),1.)
         state.produce(.25,19.)
         self.assertEqual(state.feedback('s','audio',19.).coverage(19.,.5),.5)
+        self.assertEqual(state.signed_seconds(19.),-6.5)
+        state.produce(4., 19.)
+        self.assertEqual(state.signed_seconds(19.),1.5)

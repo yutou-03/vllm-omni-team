@@ -34,7 +34,7 @@ def main():
     p.add_argument('--pause-releases-admission',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--admission-policy',choices=['global_fifo','resource_fifo'],default='resource_fifo')
     p.add_argument('--ordered-ingress', action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument('--recovery-ranking',choices=['deadline','weighted'],default='deadline')
+    p.add_argument('--recovery-ranking',choices=['deadline','weighted','paper'],default='deadline')
     p.add_argument('--buffer-source', choices=('server_virtual_output', 'client_consumption_buffer'),
                    default='server_virtual_output', help='Origin of unread output for policy decisions.')
     p.add_argument('--buffer-conservativeness', type=buffer_conservativeness, default=1.0,

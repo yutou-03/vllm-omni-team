@@ -30,6 +30,7 @@ def main():
     p.add_argument('--admission-safety',type=float,default=1.0)
     p.add_argument('--pause-releases-admission',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--timeout',type=float,default=1800.)
+    p.add_argument('--recovery-ranking',choices=['deadline','weighted','paper'],default='deadline')
     p.add_argument('--buffer-source', choices=('server_virtual_output', 'client_consumption_buffer'),
                    default='server_virtual_output', help='Origin of unread output for policy decisions.')
     p.add_argument('--buffer-conservativeness', type=buffer_conservativeness, default=1.0,
@@ -51,7 +52,7 @@ def main():
         model='/data/models/Qwen3-Omni-30B-A3B-Instruct',max_inflight=a.max_inflight,recovery_samples=1,
         snapshot_path=str(root/'runtime/snapshot.json'),execution_telemetry_path=str(root/'runtime/execution.json'),
         gateway_log=str(case/'gateway.jsonl'),upstream='http://127.0.0.1:18195',capacity_ttl_s=30.,capacity_safety=a.admission_safety,pause_releases_admission=a.pause_releases_admission,
-        upstream_timeout_s=a.timeout,buffer_source=a.buffer_source,buffer_conservativeness=a.buffer_conservativeness,
+        upstream_timeout_s=a.timeout,recovery_ranking=a.recovery_ranking,buffer_source=a.buffer_source,buffer_conservativeness=a.buffer_conservativeness,
         native_execution_limit=(json.loads(active.read_text()).get('max_num_seqs', 1)
                                 if active.exists() else 1))
     if a.capacity_profile:

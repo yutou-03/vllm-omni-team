@@ -70,6 +70,45 @@ class PolicyCadenceTests(unittest.TestCase):
         self.adapter.record_scheduled(NS(num_scheduled_tokens=selected))
         return set(selected),visible_waiters
 
+    def test_shared_ranking_prices_prefill_and_preserves_unbuffered_owners(self):
+        for rid in 'abcd':
+            self.add(rid, running=True, coverage=5. if rid == 'a' else .1, executed=True)
+        self.s.max_num_scheduled_tokens = 32
+        for rid, length in [('long', 512), ('short', 8)]:
+            r = self.add(rid)
+            r.num_output_tokens = r.num_computed_tokens = 0
+            r.num_prompt_tokens = length
+        self.adapter.active_ids = set('abcd')
+        self.write(recovery_ranking='paper')
+        selected, _ = self.step(write=False)
+        self.assertEqual(selected, {'b','c','d','short'})
+        self.assertEqual(set(self.adapter.pauses), {'a'})
+
+    def test_debt_can_protect_safe_donor_and_fcfs_bypasses_score(self):
+        for rid in 'abcd':
+            self.add(rid, running=True, coverage=8., executed=True)
+        self.add('new')
+        self.adapter.active_ids = set('abcd')
+        self.write(recovery_ranking='paper', signed_buffer_s={rid:-30. for rid in 'abcd'})
+        self.assertEqual(self.step(write=False)[0], set('abcd'))
+        self.assertFalse(self.adapter.pauses)
+        self.now += .6
+        self.write(mode='fcfs',reason='overload',recovery_ranking='paper')
+        self.assertEqual(self.step(write=False)[0],set('abcd'))
+
+    def test_scored_optional_return_gets_vacancy_but_waits_for_quota_ack(self):
+        self.add('a', running=True, coverage=10., executed=True)
+        self.pause('a', 10., quota=True)
+        self.adapter.active_ids = set()
+        self.write(recovery_ranking='paper', signed_buffer_s={'a':-5.})
+        self.assertNotIn('a', self.step(write=False)[0])
+        self.assertIn('a', self.adapter.pauses.requested_resumes)
+        self.acks['a'] = dict(epoch=9.,state='active')
+        self.members['a'] = self.paused.pop('a')
+        self.now += .1
+        self.write(recovery_ranking='paper')
+        self.assertIn('a', self.step(write=False)[0])
+
     def test_initial_cohort_immediate_and_later_new_prefills_share_tick(self):
         self.add('a');self.add('b')
         self.assertEqual(self.step()[0],{'a','b'})

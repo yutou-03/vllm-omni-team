@@ -36,7 +36,7 @@ class OutputGateway(Gateway):
         book=self.coordinator.book
         state.update(schema_version=1,session=self.session,modality=self.modality,
             buffer_source=self.buffer_source, buffer_conservativeness=self.buffer_conservativeness,
-            recovery_ranking=self.config.get('recovery_ranking', 'deadline'),
+            **self.ranking_snapshot(now),
             clock_domain=self.clock_domain,written_at=now,capacity_valid_until=est.valid_until if est else 0.,
             feedback={rid:asdict(f) for rid,f in self.feedback.items() if rid in state['members'] or rid in state['paused_members']},
             startup_members={r.request_id:dict(rate=r.rate) for v in book.views.values()
@@ -67,7 +67,7 @@ class OutputGateway(Gateway):
         status=(state['mode'],state['reason'],state['demand'],state['gamma'],state['waiting'])
         if status!=self.last_status or now-self.last_publish>1.:
             self.event('working_set',**{k:v for k,v in state.items()
-                if k not in ('feedback','startup_members','startup_feedback')})
+                if k not in ('feedback','startup_members','startup_feedback','registered_at','signed_buffer_s')})
             self.last_status,self.last_publish=status,now
 
 

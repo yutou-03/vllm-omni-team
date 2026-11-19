@@ -21,6 +21,7 @@ from .capacity_signals import CapacityExecutionSignals
 from .engine_queue import engine_queue_admission_context
 from .stream import atomic_json
 from .pause import PausedRequest, PauseRegistry
+from .candidate_priority import CandidatePriority
 from .recovery_ranking import rank_recovery
 from .execution import ExecutionDecision, apply_execution_decision
 
@@ -475,6 +476,7 @@ class ClientBufferScheduler:
         resume_from_waiting = []
         beneficiary_waiters = []
         due_order = {}
+        scored_step = False
         if mode == "buffer" or recovering:
             # Retain execution-slot owners until a safe, deliberate swap. Merely
             # having a lower priority never pauses a client without buffer credit.
@@ -483,6 +485,12 @@ class ClientBufferScheduler:
             chosen = [r for r in ordered if r.request_id in self.active_ids][:self.cap]
             waiting_requests = self._waiting_requests()
             waiting_ids = {r.request_id for r in waiting_requests}
+            scored_step = (mode == 'buffer' and self.policy_tick
+                           and snapshot.get('recovery_ranking') == 'paper'
+                           and not snapshot.get('admission_waiter')
+                           and all(self.metadata(r).get('sched_request_path') == self.config['modality']
+                                   for r in original + waiting_requests))
+            priority = CandidatePriority(self, snapshot, now, cover) if scored_step else None
             held = [r for r in ordered + waiting_requests if r.request_id in self.pauses]
             # A chunk boundary may move a policy pause into native waiting.
             # It remains the same recovery obligation, including quota ACK.
@@ -541,7 +549,8 @@ class ClientBufferScheduler:
                                    snapshot.get('pause_release_min_s', .5) + step_guard]
                     if not victims:
                         break
-                    victim = max(victims, key=lambda x: cover[x.request_id])
+                    victim = (min(victims, key=priority.score) if priority else
+                              max(victims, key=lambda x: cover[x.request_id]))
                     chosen.remove(victim)
                     planned_demand -= active_rate(victim)
                     source = self.source_id(r)
@@ -590,7 +599,8 @@ class ClientBufferScheduler:
                 r.request_id not in self.pauses
                 and not startup_feedback.get(self.source_id(r), {}).get('started', False)
                 for r in waiting_requests)
-            for r in ordered:
+            scored_step = scored_step and mode == 'buffer'
+            for r in (() if scored_step else ordered):
                 if len(chosen) + len(resume_from_waiting) >= self.cap:
                     break
                 quota_needed = (self.pauses.releases_quota(r.request_id) and
@@ -632,10 +642,21 @@ class ClientBufferScheduler:
                 and cover[r.request_id] > guard + max(snapshot.get('pause_release_min_s', .5),
                     admission_waiter.get('startup_latency_estimate_s', 0.) if admission_waiter else 0.) + step_guard]
             can_admit = execution_waiter or admission_victims
+            if scored_step and mode == 'buffer':
+                def eligible_return(r):
+                    if self.pauses.is_resume_requested(r.request_id) and not resume_acknowledged(r):
+                        return False
+                    return r not in due and not beneficiary_pending(r)
+
+                can_admit = priority.fill(chosen, resume_from_waiting, beneficiary_waiters,
+                                          waiting_requests, original, newly_paused, guard,
+                                          safe_victims, planned_demand, quota_protocol, eligible_return)
+            else:
+                scored_step = False
             # Buffer-safe requests may yield compute to actual waiting work
             # even below max_num_seqs. Full sequence occupancy is not required
             # for compute contention (in particular during a new prefill).
-            if (mode == "buffer" and self.policy_tick and not due_order
+            if (not scored_step and mode == "buffer" and self.policy_tick and not due_order
                     and (not due or self.first_output_refill) and can_admit and chosen
                     and now - self.last_opportunistic_pause >= self.min_slice):
                 self.decision_counts['waiting_work_checks'] += 1
@@ -769,6 +790,11 @@ class ClientBufferScheduler:
             ready_returns = {r.request_id for r in resume_from_waiting}
             if not self.first_output_refill:
                 blocked_paused_waiters.update(r.request_id for r in self._waiting_requests() if r.request_id not in ready_returns)
+        if scored_step:
+            # The native skipped and regular queues have separate orderings.
+            # Enforce the same score winners even when they occupy different queues.
+            allowed = {r.request_id for r in resume_from_waiting + beneficiary_waiters}
+            blocked_paused_waiters.update(r.request_id for r in waiting_requests if r.request_id not in allowed)
         if mode == "buffer":
             blocked_paused_waiters.update(self._new_prefill_waiters(snapshot))
         if self.first_output_refill and (waiting_resume_ack or resume_from_waiting or beneficiary_waiters):

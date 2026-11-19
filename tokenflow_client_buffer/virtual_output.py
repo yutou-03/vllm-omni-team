@@ -22,6 +22,10 @@ class VirtualOutput:
         self.produced_at = now
         self.sequence += 1
 
+    def signed_seconds(self, now):
+        # Production minus nominal demand since first output; surplus repays debt.
+        return self.received / self.rate - (now - self.first_at)
+
     def feedback(self, session, modality, now):
         consumed = min(self.received, self.consumed + (now - self.produced_at) * self.rate)
         return ClientFeedback(self.source_id, session, modality, self.rate, self.received,

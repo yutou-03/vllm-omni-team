@@ -124,6 +124,14 @@ class Gateway(PauseAdmission, AdmissionSafety):
                 self.observe_client_delivery(state.feedback(self.session, self.modality, state.produced_at))
             self.feedback[rid] = sample
 
+    def ranking_snapshot(self, now):
+        ranking = self.config.get('recovery_ranking', 'deadline')
+        if ranking != 'paper':
+            return {'recovery_ranking': ranking}
+        return dict(recovery_ranking=ranking, registered_at=self.registered_at.copy(),
+                    signed_buffer_s={rid: state.signed_seconds(now)
+                                     for rid, state in self.virtual_output.items()})
+
     def publish(self):
         now = time.monotonic()
         est = self.capacity(now)
@@ -137,11 +145,11 @@ class Gateway(PauseAdmission, AdmissionSafety):
                      capacity_valid_until=est.valid_until if est else 0.,
                      feedback={rid: asdict(f) for rid, f in self.feedback.items()
                                if rid in state["members"] or rid in state["paused_members"]},
-                     **self.pause_snapshot(now), **self.engine_queue_snapshot())
+                     **self.ranking_snapshot(now), **self.pause_snapshot(now), **self.engine_queue_snapshot())
         atomic_json(self.snapshot, state)
         status = (state["mode"], state["reason"], state["demand"], state["gamma"], state["waiting"])
         if status != self.last_status or now - self.last_publish > 1:
-            self.event("working_set", **{k:v for k,v in state.items() if k != "feedback"})
+            self.event("working_set", **{k:v for k,v in state.items() if k not in ("feedback", "registered_at", "signed_buffer_s")})
             self.last_status, self.last_publish = status, now
 
     def update_capacity(self, now):
