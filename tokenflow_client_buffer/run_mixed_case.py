@@ -35,6 +35,8 @@ def main():
     p.add_argument('--admission-policy',choices=['global_fifo','resource_fifo'],default='resource_fifo')
     p.add_argument('--ordered-ingress', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--recovery-ranking',choices=['deadline','weighted'],default='deadline')
+    p.add_argument('--buffer-source', choices=('server_virtual_output', 'client_consumption_buffer'),
+                   default='server_virtual_output', help='Origin of unread output for policy decisions.')
     p.add_argument('--buffer-conservativeness', type=buffer_conservativeness, default=1.0,
                    help='Multiply the client-buffer time reserved for resuming a paused stream (>= 1).')
     a=p.parse_args()
@@ -70,7 +72,7 @@ def main():
     startup_profile=json.loads(a.profile.read_text())
     for m in ('text','audio'):
         (case/m).mkdir()
-        config['outputs'][m]=dict(buffer_conservativeness=a.buffer_conservativeness,recovery_ranking=a.recovery_ranking,session='tokenflow-'+m+'-pilot',modality=m,
+        config['outputs'][m]=dict(buffer_source=a.buffer_source,buffer_conservativeness=a.buffer_conservativeness,recovery_ranking=a.recovery_ranking,session='tokenflow-'+m+'-pilot',modality=m,
             model='/data/models/Qwen3-Omni-30B-A3B-Instruct',max_inflight=int(experiment.get("transport_max_inflight",256)),native_execution_limit=execution_limit,capacity_only=a.capacity_only,pause_releases_admission=a.pause_releases_admission,
             engine_queue_admission=engine_queue,
             admission_startup_s=startup_profile.get(m+'_startup_bound_s', .5),

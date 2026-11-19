@@ -1,4 +1,4 @@
-"""Opt-in synchronous scheduler adapter using only gateway-validated client credit.
+"""Synchronous scheduler adapter using the configured end-user output buffer.
 
 The gateway owns W across the whole audio pipeline. This adapter never reads
 connector queues for buffer credit and never changes KV ownership. PauseRegistry
@@ -7,6 +7,8 @@ execution adapter which preserves native queue and KV ownership.
 """
 from __future__ import annotations
 
+from dataclasses import asdict
+from .virtual_output import VirtualOutput
 from collections import Counter
 from contextlib import contextmanager
 import json
@@ -62,6 +64,7 @@ class ClientBufferScheduler:
         self.policy_tick = True
         self.executed_requests = {}
         self.phase_started = {}
+        self.virtual_text_output = {}
         self.feedback_cache = {}
         self.snapshot_cache_key = None
         self.snapshot_cache_data = None
@@ -812,7 +815,7 @@ class ClientBufferScheduler:
                     self.pauses[rid] = newly_paused[rid]
                     self.emit("client_buffer_pause", stage_id=self.stage, request_id=rid,
                               source_request_id=self.source_id(r), coverage_s=cover[rid],
-                              resume_by=self.pauses[rid].resume_by, inventory_source="client_consumption_buffer",
+                              resume_by=self.pauses[rid].resume_by, inventory_source=snapshot.get("buffer_source", "client_consumption_buffer"),
                               mode=mode, decision_monotonic=now, demand=snapshot.get("demand"), gamma=snapshot.get("gamma"),
                               trigger="resume_due" if due else "waiting_work",
                               beneficiary_source_request_id=self.pauses[rid].beneficiary,
@@ -855,11 +858,25 @@ class ClientBufferScheduler:
         self.pauses.discard_terminal(requests)
         live = {rid for rid, r in requests.items()
                 if not getattr(r.status, 'name', '').startswith('FINISHED')}
-        for states in (self.executed_requests, self.phase_started, self.feedback_cache, self.metadata_cache):
+        for states in (self.executed_requests, self.phase_started, self.virtual_text_output, self.feedback_cache, self.metadata_cache):
             for rid in states.keys() - live:
                 states.pop(rid)
         self.seen_contracts.intersection_update(live)
         self.native_execution_seen.intersection_update(live)
+
+    def record_final_text(self, request, units):
+        if (self.stage != 0 or units <= 0
+                or self.last_snapshot.get('buffer_source') != 'server_virtual_output'):
+            return
+        metadata = self.metadata(request)
+        if metadata.get('sched_request_path') != 'text':
+            return  # Thinker output on an audio path is not playable output.
+        rid = request.request_id
+        now = self.clock()
+        if rid not in self.virtual_text_output:
+            self.virtual_text_output[rid] = VirtualOutput(
+                self.source_id(request), metadata['sched_text_consume_rate_tps'], now, now)
+        self.virtual_text_output[rid].produce(units, now)
 
     def record_phase_completed(self, request, finish_reason):
         path = self.config.get('execution_telemetry_path')
@@ -957,6 +974,7 @@ class ClientBufferScheduler:
                 written_at=now, session=self.config["session"], stage=self.stage,
                 last_scheduled=len(output.num_scheduled_tokens), execution_limit=self.cap,
                 recovery_pending=self.recovery_pending and bool(self.pauses),
+                virtual_text_output=[asdict(state) for state in self.virtual_text_output.values()],
                 pause_leases=leases))
             self.last_telemetry = now
             self.last_lease_payload = signature

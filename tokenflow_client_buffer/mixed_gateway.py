@@ -31,10 +31,11 @@ class OutputGateway(Gateway):
 
     def publish(self):
         now=time.monotonic();est=self.capacity(now)
+        self.refresh_virtual_output(now)
         state=self.w.snapshot(est,now,native=self.config['arm']=='fcfs')
         book=self.coordinator.book
         state.update(schema_version=1,session=self.session,modality=self.modality,
-            buffer_conservativeness=self.buffer_conservativeness,
+            buffer_source=self.buffer_source, buffer_conservativeness=self.buffer_conservativeness,
             recovery_ranking=self.config.get('recovery_ranking', 'deadline'),
             clock_domain=self.clock_domain,written_at=now,capacity_valid_until=est.valid_until if est else 0.,
             feedback={rid:asdict(f) for rid,f in self.feedback.items() if rid in state['members'] or rid in state['paused_members']},
@@ -103,7 +104,7 @@ class MixedGateway(PhaseAccounting):
 
     async def contract(self,request):
         return web.json_response(dict(modality='mixed',clock_domain=clock_domain(),
-            contracts={m:dict(session=g.session,modality=m,clock_domain=clock_domain(),arm=self.config['arm'])
+            contracts={m:dict(session=g.session,modality=m,clock_domain=clock_domain(),arm=self.config['arm'],buffer_source=g.buffer_source)
                        for m,g in self.gateways.items()}))
 
     def process_native_execution(self):

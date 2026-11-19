@@ -1,6 +1,6 @@
 """Local experiment ingress and authoritative W ledger.
 
-Output is forwarded immediately. Only client acknowledgements fund pauses.
+Output is forwarded immediately. The selected final-output buffer funds pauses.
 Server-stream parsing supplies a separate production trace for calibration.
 """
 import argparse
@@ -19,6 +19,7 @@ from .stream import StreamDecoder, atomic_json, clock_domain, special_ids, sse_e
 
 
 from .ordered_backend import OrderedBackend
+from .virtual_output import VirtualOutput
 
 
 class Gateway(PauseAdmission, AdmissionSafety):
@@ -35,6 +36,12 @@ class Gateway(PauseAdmission, AdmissionSafety):
                             recovery_samples=config.get("recovery_samples", 1),
                             native_execution_limit=config.get("native_execution_limit", 1))
         self.w.admission_guard = self.admission_safety
+        self.buffer_source = config.get('buffer_source', 'client_consumption_buffer')
+        if self.buffer_source not in ('server_virtual_output', 'client_consumption_buffer'):
+            raise ValueError('unknown buffer source')
+        self.client_observations = {}
+        self.virtual_output = {}
+        self.virtual_telemetry_key = None
         self.feedback = {}
         self.ready = {}
         self.special = special_ids(config["model"])
@@ -87,14 +94,45 @@ class Gateway(PauseAdmission, AdmissionSafety):
                 self.est = None
         return self.est
 
+    def refresh_virtual_output(self, now):
+        if self.buffer_source != 'server_virtual_output':
+            return
+        if self.modality == 'text':
+            path = Path(self.config['execution_telemetry_path'])
+            try:
+                stat = path.stat()
+                key = (stat.st_ino, stat.st_mtime_ns)
+                if key != self.virtual_telemetry_key:
+                    packet = json.loads(path.read_bytes())
+                    if packet['session'] == self.session and packet['stage'] == 0:
+                        for record in packet.get('virtual_text_output', ()):
+                            state = VirtualOutput(**record)
+                            rid = state.source_id
+                            previous = self.virtual_output.get(rid)
+                            if (rid in self.registered_at and self.registered_at[rid] <= state.first_at
+                                    and state.produced_at <= now and state.rate == self.w.requests[rid].rate
+                                    and (previous is None or previous.first_at == state.first_at
+                                         and previous.sequence < state.sequence)):
+                                self.virtual_output[rid] = state
+                    self.virtual_telemetry_key = key
+            except (FileNotFoundError, KeyError, ValueError, OSError):
+                pass  # No additional production credit from missing data.
+        for rid, state in self.virtual_output.items():
+            sample = state.feedback(self.session, self.modality, now)
+            previous = self.feedback.get(rid)
+            if previous is None or previous.sequence < sample.sequence:
+                self.observe_client_delivery(state.feedback(self.session, self.modality, state.produced_at))
+            self.feedback[rid] = sample
+
     def publish(self):
         now = time.monotonic()
         est = self.capacity(now)
+        self.refresh_virtual_output(now)
         state = self.w.snapshot(est, now, native=self.config["arm"] == "fcfs")
         if self.config.get("capacity_only"):
             # Ablation: retain the same W/Gamma gate but run native FCFS.
             state.update(mode="fcfs", reason="capacity_only")
-        state.update(buffer_conservativeness=self.buffer_conservativeness, schema_version=1, session=self.session, modality=self.modality,
+        state.update(buffer_source=self.buffer_source, buffer_conservativeness=self.buffer_conservativeness, schema_version=1, session=self.session, modality=self.modality,
                      clock_domain=self.clock_domain, written_at=now,
                      capacity_valid_until=est.valid_until if est else 0.,
                      feedback={rid: asdict(f) for rid, f in self.feedback.items()
@@ -206,7 +244,7 @@ class Gateway(PauseAdmission, AdmissionSafety):
 
     async def contract(self, request):
         return web.json_response(dict(session=self.session, modality=self.modality,
-                                      clock_domain=self.clock_domain, arm=self.config["arm"]))
+                                      clock_domain=self.clock_domain, arm=self.config["arm"], buffer_source=self.buffer_source))
 
     async def receive_feedback(self, request):
         try:
@@ -214,13 +252,15 @@ class Gateway(PauseAdmission, AdmissionSafety):
             rid = raw["request_id"]
             if rid not in self.w.requests or self.w.requests[rid].state == "finished":
                 return web.json_response({"error":"request not registered"}, status=409)
+            observations = self.client_observations if self.buffer_source == "server_virtual_output" else self.feedback
             f = ClientFeedback.parse(raw, now=time.monotonic(), session=self.session,
                     modality=self.modality, clock_domain=self.clock_domain,
-                    rate=self.w.requests[rid].rate, previous=self.feedback.get(rid))
+                    rate=self.w.requests[rid].rate, previous=observations.get(rid))
             if f.observed_at < self.registered_at[rid]:
                 raise ValueError("feedback predates request registration")
-            self.feedback[rid] = f
-            self.observe_client_delivery(f)
+            observations[rid] = f
+            if self.buffer_source == "client_consumption_buffer":
+                self.observe_client_delivery(f)
             self.event("client_feedback", **asdict(f))
             return web.json_response({"accepted":True})
         except (ValueError, KeyError, TypeError) as e:
@@ -276,6 +316,11 @@ class Gateway(PauseAdmission, AdmissionSafety):
                 async for data in sse_events(upstream.content):
                     units, _ = decoder.event(data)
                     if units:
+                        if self.modality == 'audio' and self.buffer_source == 'server_virtual_output':
+                            now = time.monotonic()
+                            if rid not in self.virtual_output:
+                                self.virtual_output[rid] = VirtualOutput(rid, rate, now, now)
+                            self.virtual_output[rid].produce(units, now)
                         self.window_units += units
                         self.event("server_output", request_id=rid, units=units,
                                    cumulative_units=decoder.units, modality=self.modality)
@@ -308,7 +353,7 @@ class Gateway(PauseAdmission, AdmissionSafety):
     def finish_request(self, rid):
         """Retire all control state after generation or transport termination."""
         self.w.complete(rid)
-        for states in (self.feedback, self.delivery_history, self.ready,
+        for states in (self.feedback, self.client_observations, self.virtual_output, self.delivery_history, self.ready,
                        self.registered_at, self.pause_acks, self.accepted_pause_leases):
             states.pop(rid, None)
         coordinator = getattr(self, 'coordinator', None)

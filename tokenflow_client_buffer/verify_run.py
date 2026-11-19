@@ -69,12 +69,14 @@ def verify(case, trace):
             if abs(actual-e['demand'])>1e-7:errors.append('W demand mismatch')
             if e['mode']=='buffer' and (e['gamma'] is None or actual>e['gamma']+1e-7):
                 errors.append('buffer mode above capacity')
+    gateway_cfg = json.loads((case/'gateway_config.json').read_text()) if (case/'gateway_config.json').exists() else {}
+    expected_source = gateway_cfg.get('buffer_source', 'client_consumption_buffer')
     pauses=[]
     fallback_releases=[]
     pending={}
     for e in events:
         if e['event']=='client_buffer_pause':
-            if e.get('inventory_source')!='client_consumption_buffer':errors.append('nonclient pause credit')
+            if e.get('inventory_source') != expected_source:errors.append('unexpected pause credit source')
             if e['coverage_s']<=0:errors.append('active pause without positive client credit')
             pending[e['request_id']]=e
         elif e['event']=='client_buffer_fallback_release':

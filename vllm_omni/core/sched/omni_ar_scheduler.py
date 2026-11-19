@@ -1099,6 +1099,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         output_token_ids = getattr(request, "_output_token_ids", [])
                     output_len = len(output_token_ids)
                     if new_token_ids:
+                        if self._client_buffer_adapter is not None:
+                            self._client_buffer_adapter.record_final_text(request, len(new_token_ids))
                         for token_id in new_token_ids:
                             emit_stage_event(
                                 "stage_token_output",

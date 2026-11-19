@@ -201,7 +201,7 @@ class PauseAdmission:
                     self.pause_acks[rid] = dict(epoch=epoch, state='paused')
                     self.event('pause_admission_released', request_id=rid, epoch=epoch,
                                resume_by=resume_by, coverage_s=coverage,
-                               inventory_source='client_consumption_buffer',
+                               inventory_source=self.config.get('buffer_source', 'client_consumption_buffer'),
                                demand_before=before, demand_after=self.w.demand)
             except (ValueError, TypeError, KeyError):
                 continue

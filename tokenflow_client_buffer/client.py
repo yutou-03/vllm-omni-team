@@ -64,7 +64,7 @@ async def consume_request(row, *, session, endpoint, contract, output, special, 
             if now - last_feedback >= feedback_interval or buffer.completed_at is not None:
                 raw = buffer.feedback(now, request_id=rid, session=contract["session"],
                         modality=contract["modality"], clock_domain=clock_domain())
-                if not buffer.eos:
+                if not buffer.eos and contract.get('buffer_source') != 'server_virtual_output':
                     feedback_started = time.monotonic()
                     try:
                         async with session.post(endpoint + "/feedback", json=raw, timeout=ClientTimeout(total=2)) as reply:

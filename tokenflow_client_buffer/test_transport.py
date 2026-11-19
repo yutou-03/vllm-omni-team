@@ -18,7 +18,7 @@ from tokenflow_client_buffer.stream import clock_domain
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
-    async def run_modality(self, modality, legacy_startup_s=None):
+    async def run_modality(self, modality, legacy_startup_s=None, source="client_consumption_buffer"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "tokenizer_config.json").write_text('{"added_tokens_decoder":{}}')
@@ -53,12 +53,13 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             port1 = site1._server.sockets[0].getsockname()[1]
             now = time.monotonic()
             (root / 'capacity.json').write_text(json.dumps(asdict(CapacityEstimate(100,now,now+60,modality,'test','test'))))
-            g = Gateway(dict(modality=modality,session='test-session',model=str(root),
+            g = Gateway(dict(buffer_source=source,modality=modality,session='test-session',model=str(root),
                 snapshot_path=str(root/'snapshot.json'),gateway_log=str(root/'gateway.jsonl'),
                 capacity_path=str(root/'capacity.json'),arm='buffer',upstream=f'http://127.0.0.1:{port1}'))
             app = web.Application()
             app.router.add_post('/v1/chat/completions',g.stream)
             app.router.add_post('/feedback',g.receive_feedback)
+            app.router.add_get('/contract',g.contract)
             app.on_startup.append(g.startup)
             app.on_cleanup.append(g.cleanup)
             runner2 = web.AppRunner(app)
@@ -74,8 +75,11 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 row['startup_s'] = legacy_startup_s
             try:
                 async with ClientSession() as session:
+                    async with session.get(f"http://127.0.0.1:{port2}/contract") as response:
+                        contract = await response.json()
+                    self.assertEqual(contract["buffer_source"], source)
                     result=await consume_request(row,session=session,endpoint=f'http://127.0.0.1:{port2}',
-                        contract=dict(session='test-session',modality=modality,clock_domain=clock_domain()),
+                        contract=contract,
                         output=root,special=[],origin=time.monotonic(),timeout=5)
                 self.assertEqual(result['status'],'success',result.get('error'))
                 self.assertEqual(result['remaining_queue'],0)
@@ -94,13 +98,16 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(result['buffer']['consumed'], result['received_units'])
                 accepted = [json.loads(line) for line in (root/'gateway.jsonl').read_text().splitlines()
                             if json.loads(line)['event'] == 'client_feedback']
-                self.assertTrue(any(e['request_id'] == 'r' for e in accepted))
+                self.assertEqual(any(e['request_id'] == 'r' for e in accepted), source == 'client_consumption_buffer')
                 self.assertEqual(result['content_sha256'],next(json.loads(line)['content_sha256']
                     for line in (root/'gateway.jsonl').read_text().splitlines()
                     if json.loads(line)['event']=='generation_complete'))
             finally:
                 await runner2.cleanup()
                 await runner1.cleanup()
+
+    async def test_virtual_pcm_stream_runs_without_feedback_posts(self):
+        await self.run_modality("audio", source="server_virtual_output")
 
     def test_capacity_only_ablation_preserves_gate_with_fcfs_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
