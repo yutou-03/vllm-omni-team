@@ -44,6 +44,9 @@ class CandidatePriority:
              guard, safe_victims, budget, quota_protocol, eligible_return):
         adapter = self.adapter
         snapshot = self.snapshot
+        # An incumbent waiting for its first PCM already owns a slot. Keep it
+        # running and consider relieving its decode contention after filling slots.
+        incumbents = list(chosen)
         selected = {r.request_id for r in chosen + returns}
         admitted = (snapshot.get('members', {}).keys() | snapshot.get('paused_members', {}).keys()
                     | set(snapshot.get('buffer_reclaimed_ids', ())))
@@ -100,4 +103,28 @@ class CandidatePriority:
             else:
                 chosen.append(r)
             budget += cost
-        return bool(candidates)
+        pcm_yield = False
+        if adapter.config['modality'] == 'audio' and adapter.first_output_refill and donors:
+            progress = snapshot.get('startup_feedback', snapshot.get('feedback', {}))
+            assigned = {pause.beneficiary for pause in (*adapter.pauses.values(), *new_pauses.values())}
+            first_pcm = [r for r in incumbents if r in chosen and r.num_output_tokens > 0
+                         and adapter.source_id(r) in snapshot.get('members', {})
+                         and adapter.source_id(r) not in assigned
+                         and not progress.get(adapter.source_id(r), {}).get('started', False)]
+            if first_pcm:
+                receiver = min(first_pcm, key=lambda r: (-self.score(r), adapter.order(r)))
+                donor = donors[-1]
+                if donor is not receiver and self.score(receiver) > self.score(donor):
+                    source = adapter.source_id(receiver)
+                    chosen.remove(donor)
+                    # Both streams are already admitted. This yield only reduces
+                    # compute contention; it creates no admission credit.
+                    new_pauses[donor.request_id] = PausedRequest(
+                        self.now, self.now + self.cover[donor.request_id] - guard, guard,
+                        releases_quota=False, beneficiary=source)
+                    adapter.last_opportunistic_pause = self.now
+                    adapter.emit('client_buffer_priority_exchange', stage_id=adapter.stage,
+                                 request_id=donor.request_id, beneficiary=source, action='first_pcm',
+                                 beneficiary_score=self.score(receiver), donor_score=self.score(donor))
+                    pcm_yield = True
+        return bool(candidates) or pcm_yield

@@ -80,6 +80,8 @@ class ClientBufferScheduler:
         self.last_opportunistic_pause = float('-inf')
         self.last_scheduled_ids = set()
         self.native_execution_seen = set()
+        self.unacknowledged_starts = {}
+        self.queued_start_costs = {}
         self.last_selected = set()
         self.decision_counts = Counter()
         self.last_log = 0.0
@@ -273,6 +275,62 @@ class ClientBufferScheduler:
         return ExecutionDecision(running=tuple(chosen), blocked_waiting=frozenset(blocked),
                                  sort_restored=False)
 
+    def _fund_reclaimed(self, snapshot, requests, fresh):
+        """Charge first execution once, even across steps sharing a gateway snapshot."""
+        native = snapshot.get('native_fcfs_ids', ())
+        reclaimed = snapshot.get('buffer_reclaimed_ids', ())
+        queued = set(native) | set(reclaimed)
+        if fresh:
+            self.unacknowledged_starts = {k:v for k,v in self.unacknowledged_starts.items()
+                                          if k in queued}
+        self.queued_start_costs = {}
+        if not queued:
+            return snapshot
+
+        resource = 'audio' if self.config['modality'] == 'audio' else 'thinker'
+        rates = snapshot.get('startup_members', {})
+        vectors = snapshot.get('queued_resource_costs', {})
+        route_rate = 'sched_audio_consume_rate' if resource == 'audio' else 'sched_text_consume_rate_tps'
+        for req in requests:
+            source = self.source_id(req)
+            if source in queued:
+                rate = rates.get(source, {}).get('rate', self.metadata(req).get(route_rate))
+                if rate is not None:
+                    self.queued_start_costs[source] = vectors.get(source, {resource: rate})
+        if not reclaimed:
+            return snapshot  # Native fallback owns execution admission.
+
+        limits = snapshot.get('resource_admission_gamma', {resource: snapshot.get('admission_gamma')
+                                                          or snapshot.get('gamma')})
+        demand = snapshot.get('resource_demand', {resource: snapshot.get('demand', 0.)})
+        valid_limits = snapshot.get('resource_gamma', limits)
+        remaining = {k:v-demand.get(k, 0.) for k,v in limits.items()
+                     if v is not None and valid_limits.get(k) is not None}
+        allowed = set(self.unacknowledged_starts).intersection(reclaimed)
+        for source in allowed:
+            for key, value in vectors.get(source, self.unacknowledged_starts[source]).items():
+                if key in remaining:
+                    remaining[key] -= value
+        head = snapshot.get('admission_waiter')
+        for source in reclaimed:  # Published in gateway arrival order.
+            if source in allowed or source not in self.queued_start_costs or not fresh:
+                continue
+            cost = self.queued_start_costs[source]
+            if any(v > 0 and k not in remaining for k,v in cost.items()):
+                continue
+            deficits = {k:v-remaining[k] for k,v in cost.items()
+                        if v > 0 and v > remaining[k] + 1e-9}
+            if deficits:
+                if head is None:
+                    head = dict(request_id=source, modality=self.config['modality'],
+                                resource_deficit=deficits)
+                continue
+            allowed.add(source)
+            for key, value in cost.items():
+                if key in remaining:
+                    remaining[key] -= value
+        return dict(snapshot, buffer_reclaimed_ids=list(allowed), admission_waiter=head)
+
     @contextmanager
     def scheduling_context(self):
         snapshot, fallback = self.read_snapshot()
@@ -287,7 +345,11 @@ class ClientBufferScheduler:
             # Requests sent after the last control snapshot still fail closed.
             # Unmanaged audio through the text stage remains native.
             known = set(gate_snapshot.get('registered_ids', ()))
-            for r in list(self.scheduler.running) + self._waiting_requests():
+            requests = list(self.scheduler.running) + self._waiting_requests()
+            gate_snapshot = self._fund_reclaimed(gate_snapshot, requests, fresh=bool(snapshot) and not fallback)
+            if snapshot and gate_snapshot is not snapshot:
+                snapshot = gate_snapshot
+            for r in requests:
                 if self.metadata(r).get('sched_request_path') == self.config['modality']:
                     known.add(self.source_id(r))
             gate_snapshot = dict(gate_snapshot, registered_ids=list(known))
@@ -925,6 +987,13 @@ class ClientBufferScheduler:
         if len(output.num_scheduled_tokens) > self.cap:
             raise RuntimeError("client-buffer execution cap exceeded")
         self.last_scheduled_ids = set(output.num_scheduled_tokens)
+        if self.queued_start_costs:
+            for rid, count in output.num_scheduled_tokens.items():
+                request = self.scheduler.requests.get(rid)
+                if count > 0 and request is not None:
+                    source = self.source_id(request)
+                    if source in self.queued_start_costs:
+                        self.unacknowledged_starts[source] = self.queued_start_costs[source]
         for old, new, chose_new in self.ranked_choices:
             self.emit('client_buffer_recovery_rank_result', stage_id=self.stage, request_id=old,
                       newcomer=new, chose_new=chose_new, old_executed=old in self.last_scheduled_ids,

@@ -29,6 +29,50 @@ class AudioFirstOutputTests(unittest.TestCase):
     pause=fixtures.PolicyCadenceTests.pause
     step=fixtures.PolicyCadenceTests.step
 
+    def test_paper_running_before_pcm_gets_safe_compute_yield(self):
+        self.add('donor', running=True, coverage=12., executed=True)
+        self.add('receiver', running=True, executed=True)
+        self.add('protected', running=True, coverage=.2, executed=True)
+        self.adapter.active_ids=set(self.members)
+        self.quota=True
+        self.write(recovery_ranking='paper', registered_at={'receiver':5.})
+        self.assertEqual(self.step(write=False)[0], {'receiver','protected'})
+        self.assertFalse(self.adapter.pauses['donor'].releases_quota)
+        self.assertEqual(self.adapter.pauses['donor'].beneficiary,'receiver')
+        self.assertTrue(any(e=='client_buffer_priority_exchange' and d['action']=='first_pcm'
+                            for e,d in self.events))
+        self.now+=.5
+        self.credit('receiver',.1)
+        self.credit('donor',11.5)
+        self.credit('protected',.2)
+        self.write(recovery_ranking='paper')
+        self.assertEqual(self.step(write=False)[0], set(self.members))
+        self.assertFalse(self.adapter.pauses)
+
+    def test_reclaimed_work_cannot_reuse_unacknowledged_capacity(self):
+        self.add('old',running=True,coverage=.1,executed=True)
+        for name in ('one','two','three'):
+            self.add(name); self.members.pop(name)
+        self.adapter.active_ids={'old'}
+        new=['one','two','three']
+        def snapshot(gamma):
+            self.write(gamma=gamma,native_fcfs_admission=False,buffer_reclaimed_ids=new,
+                       registered_ids=list(self.s.requests),recovery_ranking='paper',
+                       startup_members={k:dict(rate=1.) for k in self.s.requests})
+        snapshot(1.1)
+        self.assertEqual(self.step(write=False)[0],{'old'})
+        self.now+=.1
+        snapshot(1.1)
+        self.assertEqual(self.step(write=False)[0],{'old'})
+        snapshot(2.1)
+        self.assertEqual(self.step(write=False)[0],{'old','one'})
+        self.now+=.1
+        self.assertEqual(self.step(write=False)[0],{'old','one'})
+        self.members.pop('old');self.s.running.remove(self.s.requests.pop('old'))
+        self.members['one']=dict(rate=1.);new.remove('one')
+        snapshot(2.1)
+        self.assertEqual(self.step(write=False)[0],{'one','two'})
+
     def test_vacancy_starts_audio_before_next_policy_tick(self):
         self.add('owner',running=True,coverage=.1,executed=True)
         self.adapter.active_ids={'owner'};self.step()

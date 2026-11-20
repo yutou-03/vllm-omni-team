@@ -63,11 +63,14 @@ class OutputGateway(Gateway):
         # and execution identities do not. Never resubmit or bulk-admit.
         state['native_fcfs_ids'] = queued if state['mode'] == 'fcfs' else []
         state['buffer_reclaimed_ids'] = queued if state['mode'] == 'buffer' else []
+        if queued:
+            state['queued_resource_costs'] = {rid:book.costs(self.modality, self.w.requests[rid])
+                                              for rid in queued}
         atomic_json(self.snapshot,state)
         status=(state['mode'],state['reason'],state['demand'],state['gamma'],state['waiting'])
         if status!=self.last_status or now-self.last_publish>1.:
             self.event('working_set',**{k:v for k,v in state.items()
-                if k not in ('feedback','startup_members','startup_feedback','registered_at','signed_buffer_s')})
+                if k not in ('feedback','startup_members','startup_feedback','registered_at','signed_buffer_s','queued_resource_costs')})
             self.last_status,self.last_publish=status,now
 
 
